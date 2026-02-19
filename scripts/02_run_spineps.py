@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-SPINEPS Segmentation Pipeline - Refactored
+SPINEPS Segmentation Pipeline
 
-Converts DICOM → NIfTI (nested by study/series, sagittal T2w only via CSV),
-then runs SPINEPS segmentation.
+Runs SPINEPS on pre-converted NIfTI files.
+Uses series CSV to identify the correct sagittal T2w series per study.
 
-NIfTI layout:
+NIfTI layout expected (from 01_dicom_to_nifti.py):
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
 
 Usage:
     python 02_run_spineps.py \
-        --input_dir  data/raw/train_images \
+        --nifti_dir  results/nifti \
         --series_csv data/raw/train_series_descriptions.csv \
         --output_dir results/spineps \
-        --valid_ids  data/valid_ids.npy \
         --mode trial
 """
 
@@ -42,7 +41,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Series descriptions considered sagittal T2w (priority order)
 SAGITTAL_T2_PATTERNS = [
     'Sagittal T2/STIR',
     'Sagittal T2',
@@ -66,10 +64,7 @@ def load_series_csv(csv_path: Path) -> pd.DataFrame:
 
 
 def get_sagittal_t2_series(series_df: pd.DataFrame, study_id: str) -> str | None:
-    """
-    Return the series_id (as str) of the best sagittal T2w series for a study.
-    Returns None if none found.
-    """
+    """Return series_id (str) of best sagittal T2w series, or None."""
     if series_df is None:
         return None
     try:
@@ -86,76 +81,10 @@ def get_sagittal_t2_series(series_df: pd.DataFrame, study_id: str) -> str | None
 
 
 # ============================================================================
-# DICOM → NIFTI  (nested: nifti_dir/{study_id}/{series_id}/sub-*_acq-sag_T2w.nii.gz)
-# ============================================================================
-
-def convert_dicom_to_nifti(
-    dicom_dir: Path,
-    nifti_study_dir: Path,
-    study_id: str,
-    series_id: str,
-) -> Path | None:
-    """
-    Convert a single DICOM series to NIfTI.
-    Output: nifti_study_dir/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
-    """
-    out_dir = nifti_study_dir / series_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    bids_base = f"sub-{study_id}_acq-sag_T2w"
-    expected  = out_dir / f"{bids_base}.nii.gz"
-
-    if expected.exists():
-        logger.info(f"  NIfTI already exists, skipping conversion")
-        return expected
-
-    cmd = [
-        'dcm2niix',
-        '-z', 'y',       # gzip
-        '-f', bids_base,
-        '-o', str(out_dir),
-        '-m', 'y',        # merge slices
-        '-b', 'n',        # no BIDS sidecar (we don't need it)
-        str(dicom_dir),
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=120
-        )
-        if result.returncode != 0:
-            logger.error(f"  dcm2niix failed:\n{result.stderr}")
-            return None
-
-        if not expected.exists():
-            # dcm2niix sometimes appends extra suffixes — grab first match
-            candidates = sorted(out_dir.glob(f"{bids_base}*.nii.gz"))
-            if not candidates:
-                logger.error("  dcm2niix produced no NIfTI output")
-                return None
-            shutil.move(str(candidates[0]), str(expected))
-
-        logger.info(f"  ✓ NIfTI written: {expected.relative_to(expected.parents[3])}")
-        return expected
-
-    except subprocess.TimeoutExpired:
-        logger.error("  dcm2niix timed out")
-        return None
-    except Exception as e:
-        logger.error(f"  dcm2niix error: {e}")
-        return None
-
-
-# ============================================================================
 # CENTROID COMPUTATION
 # ============================================================================
 
-def compute_all_centroids(
-    instance_mask_path: Path,
-    semantic_mask_path: Path,
-    ctd_path: Path,
-) -> dict:
+def compute_all_centroids(instance_mask_path, semantic_mask_path, ctd_path):
     if not HAS_NIBABEL:
         return {}
     try:
@@ -170,7 +99,7 @@ def compute_all_centroids(
 
         counts = {'vertebrae': 0, 'discs': 0, 'endplates': 0, 'subregions': 0}
 
-        for label in np.unique(instance_data)[1:]:          # skip 0
+        for label in np.unique(instance_data)[1:]:
             ls = str(label)
             if ls in ctd_data[1]:
                 continue
@@ -206,11 +135,7 @@ def compute_all_centroids(
 # UNCERTAINTY MAP
 # ============================================================================
 
-def compute_uncertainty_from_softmax(
-    derivatives_dir: Path,
-    study_id: str,
-    seg_dir: Path,
-) -> bool:
+def compute_uncertainty_from_softmax(derivatives_dir, study_id, seg_dir):
     if not HAS_NIBABEL:
         return False
     try:
@@ -242,7 +167,7 @@ def compute_uncertainty_from_softmax(
 # SPINEPS
 # ============================================================================
 
-def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict | None:
+def run_spineps(nifti_path, seg_dir, study_id):
     import os
     seg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -278,22 +203,20 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict | None:
         logger.error(f"  SPINEPS non-zero exit:\n{result.stderr}")
         return None
 
-    # Outputs land in derivatives_seg/ next to the NIfTI
     derivatives_base = nifti_path.parent / "derivatives_seg"
     if not derivatives_base.exists():
         logger.error(f"  derivatives_seg not found at: {derivatives_base}")
         return None
 
-    def find_file(exact: str, glob: str) -> Path | None:
+    def find_file(exact, glob_pat):
         f = derivatives_base / exact
         if f.exists():
             return f
-        hits = list(derivatives_base.glob(glob))
+        hits = list(derivatives_base.glob(glob_pat))
         return hits[0] if hits else None
 
     outputs = {}
 
-    # Instance mask
     f = find_file(f"sub-{study_id}_acq-sag_mod-T2w_seg-vert_msk.nii.gz", "**/*_seg-vert_msk.nii.gz")
     if f:
         dest = seg_dir / f"{study_id}_seg-vert_msk.nii.gz"
@@ -303,7 +226,6 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict | None:
     else:
         logger.warning("  ⚠ Instance mask not found")
 
-    # Semantic mask
     f = find_file(f"sub-{study_id}_acq-sag_mod-T2w_seg-spine_msk.nii.gz", "**/*_seg-spine_msk.nii.gz")
     if f:
         dest = seg_dir / f"{study_id}_seg-spine_msk.nii.gz"
@@ -311,7 +233,6 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict | None:
         outputs['semantic_mask'] = dest
         logger.info("  ✓ Semantic mask")
 
-    # Sub-region mask
     f = find_file(f"sub-{study_id}_acq-sag_mod-T2w_seg-subreg_msk.nii.gz", "**/*_seg-subreg_msk.nii.gz")
     if f:
         dest = seg_dir / f"{study_id}_seg-subreg_msk.nii.gz"
@@ -319,7 +240,6 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict | None:
         outputs['subreg_mask'] = dest
         logger.info("  ✓ Sub-region mask")
 
-    # Centroids JSON
     f = find_file(f"sub-{study_id}_acq-sag_mod-T2w_ctd.json", "**/*_ctd.json")
     if f:
         dest = seg_dir / f"{study_id}_ctd.json"
@@ -328,19 +248,14 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict | None:
         logger.info("  ✓ Centroids JSON")
 
         if 'instance_mask' in outputs and 'semantic_mask' in outputs:
-            counts = compute_all_centroids(
-                outputs['instance_mask'], outputs['semantic_mask'], dest
-            )
+            counts = compute_all_centroids(outputs['instance_mask'], outputs['semantic_mask'], dest)
             if counts:
                 total = sum(counts.values())
-                logger.info(
-                    f"  ✓ Added {total} centroids: "
-                    f"{counts['discs']} discs, "
-                    f"{counts['endplates']} endplates, "
-                    f"{counts['subregions']} subregions"
-                )
+                logger.info(f"  ✓ Added {total} centroids: "
+                            f"{counts['discs']} discs, "
+                            f"{counts['endplates']} endplates, "
+                            f"{counts['subregions']} subregions")
 
-    # Uncertainty map
     if 'semantic_mask' in outputs:
         if compute_uncertainty_from_softmax(derivatives_base, study_id, seg_dir):
             outputs['uncertainty_map'] = seg_dir / f"{study_id}_unc.nii.gz"
@@ -356,21 +271,19 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict | None:
 # PROGRESS TRACKING
 # ============================================================================
 
-def load_progress(progress_file: Path) -> dict:
+def load_progress(progress_file):
     if progress_file.exists():
         try:
             with open(progress_file) as f:
                 p = json.load(f)
-            logger.info(
-                f"Resuming: {len(p['success'])} done, {len(p['failed'])} failed"
-            )
+            logger.info(f"Resuming: {len(p['success'])} done, {len(p['failed'])} failed")
             return p
         except Exception as e:
             logger.warning(f"Could not load progress: {e} — starting fresh")
     return {'processed': [], 'success': [], 'failed': []}
 
 
-def save_progress(progress_file: Path, progress: dict):
+def save_progress(progress_file, progress):
     try:
         tmp = progress_file.with_suffix('.json.tmp')
         with open(tmp, 'w') as f:
@@ -380,19 +293,18 @@ def save_progress(progress_file: Path, progress: dict):
         logger.warning(f"Could not save progress: {e}")
 
 
-def mark_failed(progress: dict, study_id: str):
+def mark_failed(progress, study_id):
     if study_id not in progress['processed']:
         progress['processed'].append(study_id)
     if study_id not in progress['failed']:
         progress['failed'].append(study_id)
 
 
-def mark_success(progress: dict, study_id: str):
+def mark_success(progress, study_id):
     if study_id not in progress['processed']:
         progress['processed'].append(study_id)
     if study_id not in progress['success']:
         progress['success'].append(study_id)
-    # Remove from failed if retrying
     if study_id in progress['failed']:
         progress['failed'].remove(study_id)
 
@@ -401,7 +313,7 @@ def mark_success(progress: dict, study_id: str):
 # METADATA
 # ============================================================================
 
-def save_metadata(study_id: str, outputs: dict, metadata_dir: Path):
+def save_metadata(study_id, outputs, metadata_dir):
     metadata_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         'study_id':  study_id,
@@ -418,29 +330,32 @@ def save_metadata(study_id: str, outputs: dict, metadata_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description='SPINEPS Segmentation Pipeline')
-    parser.add_argument('--input_dir',  required=True,
-                        help='Root DICOM directory (study_id/series_id/...)')
+    parser.add_argument('--nifti_dir',  required=True,
+                        help='Root NIfTI directory ({study_id}/{series_id}/sub-*_acq-sag_T2w.nii.gz)')
     parser.add_argument('--series_csv', required=True,
-                        help='CSV with study_id, series_id, series_description columns')
+                        help='CSV with study_id, series_id, series_description')
     parser.add_argument('--output_dir', required=True,
                         help='Root output directory')
     parser.add_argument('--valid_ids',  default=None,
                         help='Optional .npy file of study IDs to process')
     parser.add_argument('--limit',      type=int, default=None)
     parser.add_argument('--mode',       choices=['trial', 'debug', 'prod'], default='prod')
-    parser.add_argument('--retry-failed', action='store_true',
-                        help='Retry previously failed studies')
+    parser.add_argument('--retry-failed', action='store_true')
     args = parser.parse_args()
 
-    input_dir    = Path(args.input_dir)
-    output_dir   = Path(args.output_dir)
-    nifti_dir    = output_dir / 'nifti'          # nested: nifti/{study_id}/{series_id}/
-    seg_dir      = output_dir / 'segmentations'
-    metadata_dir = output_dir / 'metadata'
+    nifti_dir     = Path(args.nifti_dir)
+    output_dir    = Path(args.output_dir)
+    seg_dir       = output_dir / 'segmentations'
+    metadata_dir  = output_dir / 'metadata'
     progress_file = output_dir / 'progress.json'
 
-    for d in [nifti_dir, seg_dir, metadata_dir]:
+    for d in [seg_dir, metadata_dir]:
         d.mkdir(parents=True, exist_ok=True)
+
+    series_df = load_series_csv(Path(args.series_csv))
+    if series_df is None:
+        logger.error("Cannot proceed without series CSV")
+        return 1
 
     progress = load_progress(progress_file)
     skip_ids = (
@@ -449,16 +364,9 @@ def main():
         else set(progress['processed'])
     )
 
-    # Load CSV — mandatory
-    series_df = load_series_csv(Path(args.series_csv))
-    if series_df is None:
-        logger.error("Cannot proceed without series CSV")
-        return 1
+    # Study dirs are the top-level subdirs of nifti_dir
+    study_dirs = sorted([d for d in nifti_dir.iterdir() if d.is_dir()])
 
-    # Enumerate study directories
-    study_dirs = sorted([d for d in input_dir.iterdir() if d.is_dir()])
-
-    # Filter to valid_ids if provided
     if args.valid_ids:
         try:
             valid_ids = set(str(x) for x in np.load(args.valid_ids))
@@ -468,7 +376,6 @@ def main():
             logger.error(f"Failed to load valid_ids: {e}")
             return 1
 
-    # Apply mode limits
     if args.mode == 'debug':
         study_dirs = study_dirs[:1]
     elif args.mode == 'trial':
@@ -476,16 +383,15 @@ def main():
     elif args.limit:
         study_dirs = study_dirs[:args.limit]
 
-    # Filter already-processed
     study_dirs = [d for d in study_dirs if d.name not in skip_ids]
 
     logger.info("=" * 70)
     logger.info("SPINEPS SEGMENTATION PIPELINE")
     logger.info("=" * 70)
-    logger.info(f"Mode:          {args.mode}")
-    logger.info(f"To process:    {len(study_dirs)}")
-    logger.info(f"Output root:   {output_dir}")
-    logger.info(f"NIfTI layout:  nifti/{{study_id}}/{{series_id}}/sub-*_acq-sag_T2w.nii.gz")
+    logger.info(f"Mode:        {args.mode}")
+    logger.info(f"To process:  {len(study_dirs)}")
+    logger.info(f"NIfTI dir:   {nifti_dir}")
+    logger.info(f"Output root: {output_dir}")
     logger.info("=" * 70)
 
     success_count = len(progress['success'])
@@ -496,7 +402,7 @@ def main():
         logger.info(f"\n[{study_id}]")
 
         try:
-            # ── 1. Find the sagittal T2w series via CSV ──────────────────────
+            # Cross-reference CSV to get the sagittal T2w series_id
             series_id = get_sagittal_t2_series(series_df, study_id)
             if series_id is None:
                 logger.warning("  ✗ No sagittal T2w series found in CSV — skipping")
@@ -505,35 +411,20 @@ def main():
                 error_count += 1
                 continue
 
-            dicom_series_dir = study_dir / series_id
-            if not dicom_series_dir.exists():
-                logger.warning(f"  ✗ DICOM series dir not found: {dicom_series_dir}")
+            # Locate the NIfTI — must already exist from 01_dicom_to_nifti.py
+            nifti_path = study_dir / series_id / f"sub-{study_id}_acq-sag_T2w.nii.gz"
+            if not nifti_path.exists():
+                logger.warning(f"  ✗ NIfTI not found: {nifti_path}")
+                logger.warning(f"    Run 01_dicom_to_nifti.py first")
                 mark_failed(progress, study_id)
                 save_progress(progress_file, progress)
                 error_count += 1
                 continue
 
             logger.info(f"  Series: {series_id} (sagittal T2w)")
+            logger.info(f"  NIfTI:  {nifti_path}")
 
-            # ── 2. DICOM → NIfTI (nested layout) ─────────────────────────────
-            nifti_study_dir = nifti_dir / study_id
-            nifti_path = nifti_study_dir / series_id / f"sub-{study_id}_acq-sag_T2w.nii.gz"
-
-            if not nifti_path.exists():
-                logger.info("  Converting DICOM → NIfTI...")
-                nifti_path = convert_dicom_to_nifti(
-                    dicom_series_dir, nifti_study_dir, study_id, series_id
-                )
-                if nifti_path is None:
-                    logger.warning("  ✗ DICOM conversion failed")
-                    mark_failed(progress, study_id)
-                    save_progress(progress_file, progress)
-                    error_count += 1
-                    continue
-            else:
-                logger.info("  NIfTI already present, skipping conversion")
-
-            # ── 3. SPINEPS ────────────────────────────────────────────────────
+            # Run SPINEPS
             study_seg_dir = seg_dir / study_id
             outputs = run_spineps(nifti_path, study_seg_dir, study_id)
 

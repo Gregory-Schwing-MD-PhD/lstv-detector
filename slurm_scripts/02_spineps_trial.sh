@@ -41,7 +41,7 @@ unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # --- Paths ---
 PROJECT_DIR="$(pwd)"
-INPUT_DIR="${PROJECT_DIR}/data/raw/train_images"
+NIFTI_DIR="${PROJECT_DIR}/results/nifti"
 SERIES_CSV="${PROJECT_DIR}/data/raw/train_series_descriptions.csv"
 OUTPUT_DIR="${PROJECT_DIR}/results/spineps"
 MODELS_CACHE="${PROJECT_DIR}/models/spineps_cache"
@@ -64,7 +64,7 @@ fi
 
 singularity exec --nv \
     --bind "${PROJECT_DIR}":/work \
-    --bind "${INPUT_DIR}":/work/data/raw/train_images:ro \
+    --bind "${NIFTI_DIR}":/work/results/nifti \
     --bind "${OUTPUT_DIR}":/work/results/spineps \
     --bind "${MODELS_CACHE}":/app/models \
     --bind "${SPINEPS_PKG_MODELS}":/opt/conda/lib/python3.10/site-packages/spineps/models \
@@ -73,7 +73,7 @@ singularity exec --nv \
     --pwd /work \
     "$IMG_PATH" \
     python /work/scripts/02_run_spineps.py \
-        --input_dir  /work/data/raw/train_images \
+        --nifti_dir  /work/results/nifti \
         --series_csv /work/data/raw/train_series_descriptions.csv \
         --output_dir /work/results/spineps \
         --mode       "$MODE" \

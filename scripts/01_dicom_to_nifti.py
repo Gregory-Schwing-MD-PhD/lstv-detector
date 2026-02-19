@@ -3,10 +3,11 @@
 DICOM to NIfTI Converter
 
 Converts DICOM studies to NIfTI format using dcm2niix.
-Selects sagittal T2w series via the series descriptions CSV.
+Converts both sagittal T2w and axial T2 series via the series descriptions CSV.
 
 NIfTI output layout:
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
+  results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-ax_T2w.nii.gz
 
 Usage:
     python 01_dicom_to_nifti.py \
@@ -40,6 +41,13 @@ SAGITTAL_T2_PATTERNS = [
     'Sag T2',
 ]
 
+AXIAL_T2_PATTERNS = [
+    'Axial T2',
+    'AXIAL T2',
+    'Ax T2',
+    'AX T2',
+]
+
 
 # ============================================================================
 # SERIES SELECTION
@@ -55,11 +63,11 @@ def load_series_csv(csv_path: Path) -> pd.DataFrame | None:
         return None
 
 
-def get_sagittal_t2_series(series_df: pd.DataFrame, study_id: str) -> str | None:
-    """Return series_id (str) of best sagittal T2w series, or None."""
+def get_series_id(series_df: pd.DataFrame, study_id: str, patterns: list) -> str | None:
+    """Return series_id (str) matching the first pattern found, or None."""
     try:
         study_rows = series_df[series_df['study_id'] == int(study_id)]
-        for pattern in SAGITTAL_T2_PATTERNS:
+        for pattern in patterns:
             match = study_rows[
                 study_rows['series_description'].str.contains(pattern, case=False, na=False)
             ]
@@ -74,15 +82,13 @@ def get_sagittal_t2_series(series_df: pd.DataFrame, study_id: str) -> str | None
 # DICOM -> NIFTI
 # ============================================================================
 
-def convert_dicom_to_nifti(dicom_dir: Path, out_dir: Path, study_id: str) -> Path | None:
+def convert_dicom_to_nifti(dicom_dir: Path, out_dir: Path, bids_base: str) -> Path | None:
     """Convert a DICOM series to NIfTI using dcm2niix."""
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    bids_base = f"sub-{study_id}_acq-sag_T2w"
-    expected  = out_dir / f"{bids_base}.nii.gz"
+    expected = out_dir / f"{bids_base}.nii.gz"
 
     if expected.exists():
-        logger.info("  NIfTI already exists, skipping conversion")
+        logger.info(f"  NIfTI already exists, skipping: {expected.name}")
         return expected
 
     cmd = [
@@ -122,7 +128,7 @@ def convert_dicom_to_nifti(dicom_dir: Path, out_dir: Path, study_id: str) -> Pat
         logger.error("  dcm2niix timed out (>120s)")
         return None
     except FileNotFoundError:
-        logger.error("  dcm2niix not found on PATH")
+        logger.error("  dcm2niix not found at /usr/bin/dcm2niix")
         return None
     except Exception as e:
         logger.error(f"  dcm2niix error: {e}")
@@ -159,13 +165,12 @@ def save_progress(progress_file: Path, progress: dict):
 # METADATA
 # ============================================================================
 
-def save_metadata(study_id: str, series_id: str, nifti_path: Path, metadata_dir: Path):
+def save_metadata(study_id: str, conversions: dict, metadata_dir: Path):
     metadata_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
-        'study_id':   study_id,
-        'series_id':  series_id,
-        'nifti_path': str(nifti_path),
-        'timestamp':  pd.Timestamp.now().isoformat(),
+        'study_id':    study_id,
+        'conversions': conversions,
+        'timestamp':   pd.Timestamp.now().isoformat(),
     }
     with open(metadata_dir / f"{study_id}_conversion.json", 'w') as f:
         json.dump(metadata, f, indent=2)
@@ -177,7 +182,7 @@ def save_metadata(study_id: str, series_id: str, nifti_path: Path, metadata_dir:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='DICOM -> NIfTI conversion (sagittal T2w only)'
+        description='DICOM -> NIfTI conversion (sagittal T2w + axial T2)'
     )
     parser.add_argument('--input_dir',  required=True,
                         help='Root DICOM directory (study_id/series_id/...)')
@@ -204,6 +209,10 @@ def main():
     already_processed = set(progress['processed'])
 
     study_dirs = sorted([d for d in input_dir.iterdir() if d.is_dir()])
+
+    # Filter already-processed BEFORE applying mode limits
+    study_dirs = [d for d in study_dirs if d.name not in already_processed]
+
     if args.mode == 'debug':
         study_dirs = study_dirs[:1]
     elif args.mode == 'trial':
@@ -211,70 +220,90 @@ def main():
     elif args.limit:
         study_dirs = study_dirs[:args.limit]
 
-    remaining = [d for d in study_dirs if d.name not in already_processed]
-
     logger.info("=" * 70)
-    logger.info("DICOM -> NIFTI CONVERSION  (sagittal T2w)")
+    logger.info("DICOM -> NIFTI CONVERSION  (sagittal T2w + axial T2)")
     logger.info("=" * 70)
-    logger.info(f"Mode:         {args.mode}")
-    logger.info(f"Total:        {len(study_dirs)}")
-    logger.info(f"Already done: {len(study_dirs) - len(remaining)}")
-    logger.info(f"To process:   {len(remaining)}")
-    logger.info(f"Output:       {output_dir}")
-    logger.info(f"Layout:       {'{study_id}'}/{'{series_id}'}/sub-{'{study_id}'}_acq-sag_T2w.nii.gz")
+    logger.info(f"Mode:       {args.mode}")
+    logger.info(f"To process: {len(study_dirs)}")
+    logger.info(f"Output:     {output_dir}")
+    logger.info(f"Layout:     {{study_id}}/{{series_id}}/sub-{{study_id}}_acq-[sag|ax]_T2w.nii.gz")
     logger.info("=" * 70)
 
     success_count = len(progress['success'])
     error_count   = len(progress['failed'])
 
-    for study_dir in tqdm(remaining, desc="Converting"):
+    for study_dir in tqdm(study_dirs, desc="Converting"):
         study_id = study_dir.name
         logger.info(f"\n[{study_id}]")
+        conversions = {}
+        any_success = False
 
         try:
-            series_id = get_sagittal_t2_series(series_df, study_id)
-            if series_id is None:
-                logger.warning("  No sagittal T2w series found in CSV")
+            # ── Sagittal T2w ─────────────────────────────────────────────────
+            sag_series_id = get_series_id(series_df, study_id, SAGITTAL_T2_PATTERNS)
+            if sag_series_id is None:
+                logger.warning("  ⚠ No sagittal T2w series in CSV")
+            else:
+                dicom_dir = study_dir / sag_series_id
+                if not dicom_dir.exists():
+                    logger.warning(f"  ⚠ Sagittal DICOM dir not found: {dicom_dir}")
+                else:
+                    out_dir    = output_dir / study_id / sag_series_id
+                    bids_base  = f"sub-{study_id}_acq-sag_T2w"
+                    nifti_path = convert_dicom_to_nifti(dicom_dir, out_dir, bids_base)
+                    if nifti_path:
+                        conversions['sagittal_t2'] = {
+                            'series_id':  sag_series_id,
+                            'nifti_path': str(nifti_path),
+                        }
+                        any_success = True
+                    else:
+                        logger.warning("  ⚠ Sagittal conversion failed")
+
+            # ── Axial T2 ─────────────────────────────────────────────────────
+            ax_series_id = get_series_id(series_df, study_id, AXIAL_T2_PATTERNS)
+            if ax_series_id is None:
+                logger.warning("  ⚠ No axial T2 series in CSV")
+            else:
+                dicom_dir = study_dir / ax_series_id
+                if not dicom_dir.exists():
+                    logger.warning(f"  ⚠ Axial DICOM dir not found: {dicom_dir}")
+                else:
+                    out_dir    = output_dir / study_id / ax_series_id
+                    bids_base  = f"sub-{study_id}_acq-ax_T2w"
+                    nifti_path = convert_dicom_to_nifti(dicom_dir, out_dir, bids_base)
+                    if nifti_path:
+                        conversions['axial_t2'] = {
+                            'series_id':  ax_series_id,
+                            'nifti_path': str(nifti_path),
+                        }
+                        any_success = True
+                    else:
+                        logger.warning("  ⚠ Axial conversion failed")
+
+            # ── Progress ──────────────────────────────────────────────────────
+            if conversions:
+                save_metadata(study_id, conversions, metadata_dir)
+
+            if any_success:
+                progress['processed'].append(study_id)
+                progress['success'].append(study_id)
+                save_progress(progress_file, progress)
+                success_count += 1
+                logger.info(f"  ✓ Done ({list(conversions.keys())})")
+            else:
+                logger.warning("  ✗ No series converted")
                 progress['processed'].append(study_id)
                 progress['failed'].append(study_id)
                 save_progress(progress_file, progress)
                 error_count += 1
-                continue
-
-            dicom_series_dir = study_dir / series_id
-            if not dicom_series_dir.exists():
-                logger.warning(f"  DICOM series dir not found: {dicom_series_dir}")
-                progress['processed'].append(study_id)
-                progress['failed'].append(study_id)
-                save_progress(progress_file, progress)
-                error_count += 1
-                continue
-
-            logger.info(f"  Series: {series_id}")
-
-            out_dir    = output_dir / study_id / series_id
-            nifti_path = convert_dicom_to_nifti(dicom_series_dir, out_dir, study_id)
-
-            if nifti_path is None:
-                logger.warning("  Conversion failed")
-                progress['processed'].append(study_id)
-                progress['failed'].append(study_id)
-                save_progress(progress_file, progress)
-                error_count += 1
-                continue
-
-            save_metadata(study_id, series_id, nifti_path, metadata_dir)
-            progress['processed'].append(study_id)
-            progress['success'].append(study_id)
-            save_progress(progress_file, progress)
-            success_count += 1
 
         except KeyboardInterrupt:
             logger.warning("\nInterrupted -- progress saved")
             save_progress(progress_file, progress)
             break
         except Exception as e:
-            logger.error(f"  Unexpected error: {e}")
+            logger.error(f"  ✗ Unexpected error: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             progress['processed'].append(study_id)
@@ -290,7 +319,8 @@ def main():
     logger.info(f"Total:   {success_count + error_count}")
     if progress['failed']:
         logger.info(f"Failed IDs: {progress['failed']}")
-    logger.info("\nNext step: sbatch slurm_scripts/02_spineps.sh")
+    logger.info(f"\nNIfTI files: {output_dir}/{{study_id}}/{{series_id}}/sub-*_acq-[sag|ax]_T2w.nii.gz")
+    logger.info("Next step: sbatch slurm_scripts/02_spineps.sh")
 
     return 0 if error_count == 0 else 1
 
