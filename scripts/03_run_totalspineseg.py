@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-TotalSpineSeg Wrapper
+TotalSpineSeg Wrapper - FULL VERSION
 
-Runs TotalSegmentator on sagittal T2w and axial T2 NIfTI files.
+Runs TotalSpineSeg (not raw TotalSegmentator) on sagittal T2w and axial T2 NIfTI files.
 Uses series CSV to find the correct series per study.
+
+TotalSpineSeg outputs individual vertebra labels (L1-L5/L6, Sacrum) and disc labels,
+which are essential for LSTV detection.
 
 NIfTI layout expected (from 01_dicom_to_nifti.py):
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
@@ -82,27 +85,37 @@ def get_series_id(series_df: pd.DataFrame, study_id: str, patterns: list) -> str
 
 
 # ============================================================================
-# TOTALSEGMENTATOR
+# TOTALSPINESEG (PROPER)
 # ============================================================================
 
-def run_totalseg(nifti_path: Path, output_path: Path, study_id: str, acq: str) -> Path | None:
+def run_totalspineseg(nifti_path: Path, study_output_dir: Path, study_id: str, acq: str) -> bool:
     """
-    Run TotalSegmentator on one NIfTI.
+    Run TotalSpineSeg (full pipeline) on one NIfTI.
+    
     acq: 'sagittal' or 'axial'
+    
+    TotalSpineSeg outputs:
+    - step1_output/: Individual vertebra labels (L1-L5, Sacrum, etc.)
+    - step1_levels/: Single voxel markers at each disc level
+    - step1_cord/: Spinal cord segmentation
+    - step1_canal/: Spinal canal segmentation
+    
+    Returns True if successful, False otherwise.
     """
-    temp_dir = output_path.parent / f"temp_{study_id}_{acq}"
-
+    temp_output = study_output_dir / f"temp_{acq}"
+    final_dir = study_output_dir / acq
+    final_dir.mkdir(parents=True, exist_ok=True)
+    
     try:
+        # Use full totalspineseg command
         cmd = [
-            'TotalSegmentator',
-            '-i', str(nifti_path),
-            '-o', str(temp_dir),
-            '--task', 'total',
-            '--fast',
-            '--ml',
+            'totalspineseg',
+            str(nifti_path),
+            str(temp_output),
+            '--step1',  # Step 1 gives vertebra labels + landmarks
         ]
 
-        logger.info(f"  Running TotalSegmentator ({acq})...")
+        logger.info(f"  Running TotalSpineSeg ({acq})...")
         sys.stdout.flush()
         
         result = subprocess.run(
@@ -110,57 +123,80 @@ def run_totalseg(nifti_path: Path, output_path: Path, study_id: str, acq: str) -
             stdout=None,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=600,
+            timeout=900,  # 15 min timeout
         )
         sys.stdout.flush()
 
         if result.returncode != 0:
-            logger.error(f"  TotalSegmentator failed:\n{result.stderr}")
-            return None
+            logger.error(f"  TotalSpineSeg failed:\n{result.stderr}")
+            return False
 
-        # With --ml flag, TotalSegmentator creates: temp_dir.nii (NOT .nii.gz!)
-        seg_file = temp_dir.parent / f"{temp_dir.name}.nii"
+        # Check for step1_output (has individual labels)
+        step1_output_dir = temp_output / 'step1_output'
+        if not step1_output_dir.exists():
+            logger.error(f"  step1_output not found: {step1_output_dir}")
+            return False
         
-        if not seg_file.exists():
-            # Try with .nii.gz extension as fallback
-            seg_file_gz = temp_dir.parent / f"{temp_dir.name}.nii.gz"
-            if seg_file_gz.exists():
-                seg_file = seg_file_gz
-            else:
-                logger.error(f"  Output not found: {seg_file}")
-                logger.error(f"  Also checked: {seg_file_gz}")
-                return None
-
-        shutil.move(str(seg_file), str(output_path))
-        logger.info(f"  ✓ Saved: {output_path.name}")
+        # Find the output file
+        output_files = list(step1_output_dir.glob("*.nii.gz"))
+        if not output_files:
+            logger.error(f"  No output files in {step1_output_dir}")
+            return False
         
-        # Clean up temp directory if it exists
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
+        # Copy step1_output (individual vertebra labels)
+        labeled_output = final_dir / f"{study_id}_{acq}_labeled.nii.gz"
+        shutil.copy(output_files[0], labeled_output)
+        logger.info(f"  ✓ Labeled vertebrae: {labeled_output.name}")
         
-        return output_path
+        # Copy step1_levels (disc level markers) if exists
+        step1_levels_dir = temp_output / 'step1_levels'
+        if step1_levels_dir.exists():
+            level_files = list(step1_levels_dir.glob("*.nii.gz"))
+            if level_files:
+                levels_output = final_dir / f"{study_id}_{acq}_levels.nii.gz"
+                shutil.copy(level_files[0], levels_output)
+                logger.info(f"  ✓ Disc levels: {levels_output.name}")
+        
+        # Copy step1_cord (spinal cord segmentation) if exists
+        step1_cord_dir = temp_output / 'step1_cord'
+        if step1_cord_dir.exists():
+            cord_files = list(step1_cord_dir.glob("*.nii.gz"))
+            if cord_files:
+                cord_output = final_dir / f"{study_id}_{acq}_cord.nii.gz"
+                shutil.copy(cord_files[0], cord_output)
+                logger.info(f"  ✓ Spinal cord: {cord_output.name}")
+        
+        # Copy step1_canal (spinal canal segmentation) if exists
+        step1_canal_dir = temp_output / 'step1_canal'
+        if step1_canal_dir.exists():
+            canal_files = list(step1_canal_dir.glob("*.nii.gz"))
+            if canal_files:
+                canal_output = final_dir / f"{study_id}_{acq}_canal.nii.gz"
+                shutil.copy(canal_files[0], canal_output)
+                logger.info(f"  ✓ Spinal canal: {canal_output.name}")
+        
+        # Clean up temp directory
+        if temp_output.exists():
+            shutil.rmtree(temp_output)
+        
+        return True
 
     except subprocess.TimeoutExpired:
-        logger.error("  TotalSegmentator timed out (>600s)")
+        logger.error("  TotalSpineSeg timed out (>15min)")
         sys.stdout.flush()
-        return None
+        return False
     except Exception as e:
         logger.error(f"  Error: {e}")
         logger.debug(traceback.format_exc())
         sys.stdout.flush()
-        return None
+        return False
     finally:
-        # Final cleanup
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-        # Also clean up temp .nii/.nii.gz files if move failed
-        for ext in ['.nii', '.nii.gz']:
-            temp_file = temp_dir.parent / f"{temp_dir.name}{ext}"
-            if temp_file.exists() and temp_file != output_path:
-                try:
-                    temp_file.unlink()
-                except:
-                    pass
+        # Cleanup temp directory if it exists
+        if temp_output.exists():
+            try:
+                shutil.rmtree(temp_output)
+            except:
+                pass
 
 
 # ============================================================================
@@ -264,12 +300,18 @@ def main():
     study_dirs = [d for d in study_dirs if d.name not in skip_ids]
 
     logger.info("=" * 70)
-    logger.info("TOTALSPINESEG SEGMENTATION")
+    logger.info("TOTALSPINESEG SEGMENTATION (Full Pipeline)")
     logger.info("=" * 70)
     logger.info(f"Mode:        {args.mode}")
     logger.info(f"To process:  {len(study_dirs)}")
     logger.info(f"NIfTI dir:   {nifti_dir}")
     logger.info(f"Output:      {output_dir}")
+    logger.info("")
+    logger.info("TotalSpineSeg outputs per study:")
+    logger.info("  • {acq}_labeled.nii.gz  - Individual vertebra labels")
+    logger.info("  • {acq}_levels.nii.gz   - Disc level markers")
+    logger.info("  • {acq}_cord.nii.gz     - Spinal cord segmentation")
+    logger.info("  • {acq}_canal.nii.gz    - Spinal canal segmentation")
     logger.info("=" * 70)
     sys.stdout.flush()
 
@@ -304,8 +346,7 @@ def main():
                 
                 if nifti_path:
                     logger.info(f"  Series (sag): {sag_series_id}")
-                    sag_output = study_output_dir / f"{study_id}_sagittal_vertebrae.nii.gz"
-                    result = run_totalseg(nifti_path, sag_output, study_id, 'sagittal')
+                    result = run_totalspineseg(nifti_path, study_output_dir, study_id, 'sagittal')
                     if result:
                         any_success = True
 
@@ -327,8 +368,7 @@ def main():
                 
                 if nifti_path:
                     logger.info(f"  Series (ax):  {ax_series_id}")
-                    ax_output = study_output_dir / f"{study_id}_axial_vertebrae.nii.gz"
-                    result = run_totalseg(nifti_path, ax_output, study_id, 'axial')
+                    result = run_totalspineseg(nifti_path, study_output_dir, study_id, 'axial')
                     if result:
                         any_success = True
 
@@ -369,11 +409,14 @@ def main():
         logger.info(f"Failed IDs: {progress['failed']}")
     logger.info(f"Progress: {progress_file}")
     logger.info("")
-    logger.info("Outputs per study (under {study_id}/):")
-    logger.info("  • {study_id}_sagittal_vertebrae.nii.gz")
-    logger.info("  • {study_id}_axial_vertebrae.nii.gz")
+    logger.info("Output structure per study:")
+    logger.info(f"  {output_dir}/{{study_id}}/sagittal/")
+    logger.info("    ├── {study_id}_sagittal_labeled.nii.gz  (Individual vertebra labels)")
+    logger.info("    ├── {study_id}_sagittal_levels.nii.gz   (Disc level markers)")
+    logger.info("    ├── {study_id}_sagittal_cord.nii.gz     (Spinal cord)")
+    logger.info("    └── {study_id}_sagittal_canal.nii.gz    (Spinal canal)")
     logger.info("")
-    logger.info("Next: sbatch slurm_scripts/04_detect_lstv.sh")
+    logger.info("Next: sbatch slurm_scripts/04_lstv_detection.sh")
     sys.stdout.flush()
 
     return 0 if error_count == 0 else 1

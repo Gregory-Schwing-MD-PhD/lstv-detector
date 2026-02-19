@@ -19,7 +19,7 @@ MODE=${MODE:-prod}
 RETRY_FAILED=${RETRY_FAILED:-false}
 
 echo "================================================================"
-echo "TOTALSPINESEG SEGMENTATION"
+echo "TOTALSPINESEG SEGMENTATION (Full Pipeline)"
 echo "Mode: $MODE"
 if [[ "$RETRY_FAILED" == "true" ]]; then
     echo "Retry Failed: YES"
@@ -44,14 +44,17 @@ PROJECT_DIR="$(pwd)"
 NIFTI_DIR="${PROJECT_DIR}/results/nifti"
 SERIES_CSV="${PROJECT_DIR}/data/raw/train_series_descriptions.csv"
 OUTPUT_DIR="${PROJECT_DIR}/results/totalspineseg"
+MODELS_DIR="${PROJECT_DIR}/models/totalspineseg_models"
 
-mkdir -p logs "$OUTPUT_DIR"
+mkdir -p logs "$OUTPUT_DIR" "$MODELS_DIR"
 
 # --- Container ---
-CONTAINER="docker://wasserth/totalsegmentator:2.12.0"
-IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/totalsegmentator.sif"
+# NOTE: Build this with: docker build -f Dockerfile.totalspineseg -t go2432/totalspineseg:latest .
+CONTAINER="docker://go2432/totalspineseg:latest"
+IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/totalspineseg.sif"
 
 if [[ ! -f "$IMG_PATH" ]]; then
+    echo "Pulling TotalSpineSeg container (first time only)..."
     singularity pull "$IMG_PATH" "$CONTAINER"
 fi
 
@@ -65,9 +68,11 @@ singularity exec --nv \
     --bind "${PROJECT_DIR}":/work \
     --bind "${NIFTI_DIR}":/work/results/nifti \
     --bind "${OUTPUT_DIR}":/work/results/totalspineseg \
+    --bind "${MODELS_DIR}":/app/models \
+    --env TOTALSPINESEG_DATA=/app/models \
     --pwd /work \
     "$IMG_PATH" \
-    python /work/scripts/03_run_totalspineseg.py \
+    python3 /work/scripts/03_run_totalspineseg.py \
         --nifti_dir  /work/results/nifti \
         --series_csv /work/data/raw/train_series_descriptions.csv \
         --output_dir /work/results/totalspineseg \
