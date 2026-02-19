@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Clone TotalSpineSeg repo
-RUN git clone https://github.com/neuropoly/totalspineseg.git /app/totalspineseg_source
+RUN git clone https://github.com/Gregory-Schwing-MD-PhD/totalspineseg.git /app/totalspineseg_source
 
 # 4. Install TotalSpineSeg with nnU-Net extras
 # We install without the [nnunetv2] bracket first, then pin nnunetv2 explicitly
