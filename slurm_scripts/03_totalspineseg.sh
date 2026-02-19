@@ -38,8 +38,6 @@ which singularity || echo "WARNING: singularity not found"
 export XDG_RUNTIME_DIR="${HOME}/xdr"
 export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
 
-# Use /wsu/tmp for Singularity sandbox extraction — /tmp on compute nodes is too
-# small for the ~10GB torch/CUDA unpack. Unique subfolder per job avoids collisions.
 SCRATCH_DIR="/wsu/tmp/${USER}/totalspineseg_${SLURM_JOB_ID}"
 mkdir -p "$SCRATCH_DIR"
 export SINGULARITY_TMPDIR="$SCRATCH_DIR"
@@ -59,12 +57,16 @@ SERIES_CSV="${PROJECT_DIR}/data/raw/train_series_descriptions.csv"
 OUTPUT_DIR="${PROJECT_DIR}/results/totalspineseg"
 MODELS_DIR="${PROJECT_DIR}/models/totalspineseg_models"
 
-mkdir -p logs "$OUTPUT_DIR" "$MODELS_DIR"
+# Writable host copy of the nnUNetTrainer directory.
+# auglab.add_trainer() copies nnUNetTrainerDAExt.py into the nnunetv2 trainer
+# directory at runtime. Singularity containers are read-only so this fails.
+# Same pattern as spineps binding its models dir: extract the full directory
+# from the container to a writable host path once, then bind it back in.
+NNUNET_TRAINER_DIR="${PROJECT_DIR}/models/nnunetv2_trainer"
+
+mkdir -p logs "$OUTPUT_DIR" "$MODELS_DIR" "$NNUNET_TRAINER_DIR"
 
 # --- Container ---
-# NOTE: Do NOT bind-mount anything over /opt/conda/lib/python3.10/site-packages/nnunetv2/
-# Doing so overwrites the installed Python packages inside the container and causes
-# ModuleNotFoundError for nnUNetTrainer and other nnunetv2 modules.
 CONTAINER="docker://go2432/totalspineseg:latest"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/totalspineseg.sif"
 
@@ -73,17 +75,28 @@ if [[ ! -f "$IMG_PATH" ]]; then
     singularity pull "$IMG_PATH" "$CONTAINER"
 fi
 
+# Extract nnUNetTrainer directory from container if not already done.
+# Only runs once — subsequent jobs reuse the extracted directory.
+if [[ -z "$(ls -A $NNUNET_TRAINER_DIR 2>/dev/null)" ]]; then
+    echo "Extracting nnUNetTrainer directory from container (one-time setup)..."
+    singularity exec "$IMG_PATH" \
+        cp -r /opt/conda/lib/python3.10/site-packages/nnunetv2/training/nnUNetTrainer/. \
+        "$NNUNET_TRAINER_DIR/"
+    echo "Extracted $(ls $NNUNET_TRAINER_DIR | wc -l) files"
+fi
+
 # --- Run ---
 RETRY_ARG=""
 if [[ "$RETRY_FAILED" == "true" ]]; then
     RETRY_ARG="--retry-failed"
 fi
 
-singularity exec --nv --writable-tmpfs \
+singularity exec --nv \
     --bind "${PROJECT_DIR}":/work \
     --bind "${NIFTI_DIR}":/work/results/nifti \
     --bind "${OUTPUT_DIR}":/work/results/totalspineseg \
     --bind "${MODELS_DIR}":/app/models \
+    --bind "${NNUNET_TRAINER_DIR}":/opt/conda/lib/python3.10/site-packages/nnunetv2/training/nnUNetTrainer \
     --env TOTALSPINESEG_DATA=/app/models \
     --env PYTHONUNBUFFERED=1 \
     --pwd /work \
@@ -99,6 +112,6 @@ echo "================================================================"
 echo "TotalSpineSeg complete | End: $(date)"
 echo "================================================================"
 
-# Cleanup scratch space so others can use it
+# Cleanup scratch space
 rm -rf "$SCRATCH_DIR"
 echo "Scratch cleanup complete."
