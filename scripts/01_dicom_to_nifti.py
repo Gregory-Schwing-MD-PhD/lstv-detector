@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-DICOM to NIfTI Converter
+DICOM to NIfTI Converter - Pure Python Implementation
 
-Converts DICOM studies to NIfTI format for downstream segmentation.
-Selects best sagittal T2 and axial T2 series per study.
+Converts DICOM studies to NIfTI format using pydicom + nibabel.
+No external dependencies (dcm2niix not required).
 
 Usage:
     python 01_dicom_to_nifti.py \
@@ -15,13 +15,19 @@ Usage:
 
 import argparse
 import json
-import subprocess
-import shutil
 import sys
 from pathlib import Path
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 import logging
+
+try:
+    import pydicom
+    import nibabel as nib
+    HAS_DICOM = True
+except ImportError:
+    HAS_DICOM = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,10 +92,87 @@ def select_best_series(study_dir: Path, series_df: pd.DataFrame, study_id: str,
         return None
 
 
+def load_dicom_series(dicom_dir: Path) -> tuple:
+    """
+    Load all DICOM files from a directory and sort by instance number.
+    
+    Returns:
+        (slices, affine, header_info) or (None, None, None) on error
+    """
+    if not HAS_DICOM:
+        logger.error("pydicom not available")
+        return None, None, None
+    
+    try:
+        # Find all DICOM files
+        dcm_files = list(dicom_dir.glob("*.dcm"))
+        if not dcm_files:
+            # Try without extension
+            dcm_files = [f for f in dicom_dir.iterdir() if f.is_file()]
+        
+        if not dcm_files:
+            return None, None, None
+        
+        # Load all slices
+        slices = []
+        for dcm_file in dcm_files:
+            try:
+                ds = pydicom.dcmread(str(dcm_file), force=True)
+                if hasattr(ds, 'pixel_array'):
+                    slices.append(ds)
+            except Exception:
+                continue
+        
+        if not slices:
+            return None, None, None
+        
+        # Sort by instance number or position
+        slices.sort(key=lambda x: float(x.InstanceNumber) if hasattr(x, 'InstanceNumber') else 0)
+        
+        # Get first slice for metadata
+        ref_ds = slices[0]
+        
+        # Build 3D volume
+        volume = np.stack([s.pixel_array.astype(np.float32) for s in slices], axis=-1)
+        
+        # Get voxel spacing
+        pixel_spacing = ref_ds.PixelSpacing if hasattr(ref_ds, 'PixelSpacing') else [1.0, 1.0]
+        slice_thickness = ref_ds.SliceThickness if hasattr(ref_ds, 'SliceThickness') else 1.0
+        
+        # Build affine matrix
+        # This is simplified - for production use dcm2niix or more sophisticated conversion
+        affine = np.eye(4)
+        affine[0, 0] = float(pixel_spacing[1])  # Column spacing
+        affine[1, 1] = float(pixel_spacing[0])  # Row spacing
+        affine[2, 2] = float(slice_thickness)
+        
+        # Try to get position from ImagePositionPatient
+        if hasattr(ref_ds, 'ImagePositionPatient'):
+            pos = ref_ds.ImagePositionPatient
+            affine[0, 3] = float(pos[0])
+            affine[1, 3] = float(pos[1])
+            affine[2, 3] = float(pos[2])
+        
+        header_info = {
+            'StudyInstanceUID': str(ref_ds.StudyInstanceUID) if hasattr(ref_ds, 'StudyInstanceUID') else '',
+            'SeriesInstanceUID': str(ref_ds.SeriesInstanceUID) if hasattr(ref_ds, 'SeriesInstanceUID') else '',
+            'SeriesDescription': str(ref_ds.SeriesDescription) if hasattr(ref_ds, 'SeriesDescription') else '',
+            'n_slices': len(slices),
+            'pixel_spacing': pixel_spacing,
+            'slice_thickness': slice_thickness
+        }
+        
+        return volume, affine, header_info
+    
+    except Exception as e:
+        logger.error(f"Error loading DICOM series: {e}")
+        return None, None, None
+
+
 def convert_dicom_to_nifti(dicom_dir: Path, output_path: Path, 
                            series_type: str) -> Path:
     """
-    Convert DICOM series to NIfTI using dcm2niix.
+    Convert DICOM series to NIfTI using pydicom + nibabel.
     
     Args:
         series_type: 'sag_t2' or 'axial_t2' for naming
@@ -97,44 +180,22 @@ def convert_dicom_to_nifti(dicom_dir: Path, output_path: Path,
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Extract study_id from output_path
-        study_id = output_path.stem.split('_')[0]
-        bids_base = f"{study_id}_{series_type}"
+        # Load DICOM series
+        volume, affine, header_info = load_dicom_series(dicom_dir)
         
-        cmd = [
-            'dcm2niix',
-            '-z', 'y',
-            '-f', bids_base,
-            '-o', str(output_path.parent),
-            '-m', 'y',
-            '-b', 'y',  # Save JSON sidecar
-            str(dicom_dir)
-        ]
-        
-        result = subprocess.run(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            text=True, 
-            timeout=120
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"dcm2niix failed: {result.stderr}")
+        if volume is None:
+            logger.error(f"Failed to load DICOM series from {dicom_dir}")
             return None
         
-        expected = output_path.parent / f"{bids_base}.nii.gz"
-        if not expected.exists():
-            # Handle dcm2niix suffixes
-            files = sorted(output_path.parent.glob(f"{bids_base}*.nii.gz"))
-            if not files:
-                return None
-            if files[0] != expected:
-                if expected.exists():
-                    expected.unlink()
-                shutil.move(str(files[0]), str(expected))
+        # Create NIfTI image
+        nii = nib.Nifti1Image(volume, affine)
         
-        return expected
+        # Save
+        nib.save(nii, output_path)
+        
+        logger.info(f"  ✓ Converted: {volume.shape} → {output_path.name}")
+        
+        return output_path
     
     except Exception as e:
         logger.error(f"DICOM conversion failed: {e}")
@@ -192,6 +253,11 @@ def main():
                        default='prod')
     
     args = parser.parse_args()
+    
+    if not HAS_DICOM:
+        logger.error("pydicom and/or nibabel not installed!")
+        logger.error("Install with: pip install pydicom nibabel")
+        return 1
     
     # Setup paths
     input_dir = Path(args.input_dir)
@@ -254,7 +320,6 @@ def main():
                         'series_id': sag_series.name,
                         'nifti_path': str(sag_nifti)
                     }
-                    logger.info(f"  ✓ Sagittal T2 converted")
             else:
                 logger.warning(f"  ⚠ No sagittal T2 series found")
             
@@ -274,7 +339,6 @@ def main():
                         'series_id': axial_series.name,
                         'nifti_path': str(axial_nifti)
                     }
-                    logger.info(f"  ✓ Axial T2 converted")
             else:
                 logger.warning(f"  ⚠ No axial T2 series found")
             
