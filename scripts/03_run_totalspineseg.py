@@ -91,7 +91,6 @@ def run_totalseg(nifti_path: Path, output_path: Path, study_id: str, acq: str) -
     acq: 'sagittal' or 'axial'
     """
     temp_dir = output_path.parent / f"temp_{study_id}_{acq}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         cmd = [
@@ -119,13 +118,26 @@ def run_totalseg(nifti_path: Path, output_path: Path, study_id: str, acq: str) -
             logger.error(f"  TotalSegmentator failed:\n{result.stderr}")
             return None
 
-        seg_file = temp_dir / 'segmentations.nii.gz'
+        # With --ml flag, TotalSegmentator creates: temp_dir.nii (NOT .nii.gz!)
+        seg_file = temp_dir.parent / f"{temp_dir.name}.nii"
+        
         if not seg_file.exists():
-            logger.error(f"  Output not found: {seg_file}")
-            return None
+            # Try with .nii.gz extension as fallback
+            seg_file_gz = temp_dir.parent / f"{temp_dir.name}.nii.gz"
+            if seg_file_gz.exists():
+                seg_file = seg_file_gz
+            else:
+                logger.error(f"  Output not found: {seg_file}")
+                logger.error(f"  Also checked: {seg_file_gz}")
+                return None
 
         shutil.move(str(seg_file), str(output_path))
         logger.info(f"  ✓ Saved: {output_path.name}")
+        
+        # Clean up temp directory if it exists
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        
         return output_path
 
     except subprocess.TimeoutExpired:
@@ -138,8 +150,17 @@ def run_totalseg(nifti_path: Path, output_path: Path, study_id: str, acq: str) -
         sys.stdout.flush()
         return None
     finally:
+        # Final cleanup
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
+        # Also clean up temp .nii/.nii.gz files if move failed
+        for ext in ['.nii', '.nii.gz']:
+            temp_file = temp_dir.parent / f"{temp_dir.name}{ext}"
+            if temp_file.exists() and temp_file != output_path:
+                try:
+                    temp_file.unlink()
+                except:
+                    pass
 
 
 # ============================================================================
