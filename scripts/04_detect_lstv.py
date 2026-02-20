@@ -407,14 +407,24 @@ def classify_study(study_id: str,
         logger.warning(f"  [{study_id}] Sacrum label (26) not found in spine mask")
 
     # Target vertebra: L6 if VERIDAH found it, else L5
-    unique_vert = np.unique(vert_data)
+    unique_vert = sorted(np.unique(vert_data[vert_data > 0]).tolist())
+    logger.info(f"  [{study_id}] VERIDAH instance labels present: {unique_vert}")
+
+    VERIDAH_NAMES = {20:'L1',21:'L2',22:'L3',23:'L4',24:'L5',25:'L6',26:'Sacrum(inst)'}
+    named = [VERIDAH_NAMES.get(l, str(l)) for l in unique_vert]
+    logger.info(f"  [{study_id}] VERIDAH named: {named}")
+
     has_l6   = L6_LABEL in unique_vert
     tv_label = L6_LABEL if has_l6 else L5_LABEL
     tv_name  = 'L6' if has_l6 else 'L5'
 
     tv_z_range = get_tv_z_range(vert_data, tv_label)
     if tv_z_range is None:
-        out['errors'].append(f'TV label {tv_name} (VERIDAH={tv_label}) not found')
+        msg = (f'TV label {tv_name} (VERIDAH={tv_label}) not found in instance mask. '
+               f'Labels present: {unique_vert} ({named}). '
+               f'VERIDAH may have failed to label this study or used non-standard labels.')
+        logger.error(f"  [{study_id}] ✗ {msg}")
+        out['errors'].append(msg)
         return out
 
     out['details'] = {
