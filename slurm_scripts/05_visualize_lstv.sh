@@ -35,8 +35,6 @@ unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # --- Paths ---
 PROJECT_DIR="$(pwd)"
-NIFTI_DIR="${PROJECT_DIR}/results/nifti"
-REGISTERED_DIR="${PROJECT_DIR}/results/registered"
 LSTV_DIR="${PROJECT_DIR}/results/lstv_detection"
 OUTPUT_DIR="${PROJECT_DIR}/results/lstv_viz"
 
@@ -76,11 +74,9 @@ singularity exec \
     --pwd /work \
     "$IMG_PATH" \
     python3 -u /work/scripts/05_visualize_overlay.py \
-        --registered_dir  /work/results/registered \
-        --nifti_dir       /work/results/nifti \
-        --spineps_dir     /work/results/spineps \
-        --totalspine_dir  /work/results/totalspineseg \
-        --output_dir      /work/results/lstv_viz \
+        --spineps_dir /work/results/spineps \
+        --nifti_dir   /work/results/nifti \
+        --output_dir  /work/results/lstv_viz \
         ${STUDY_ID_ARG} \
         ${LSTV_JSON_ARG}
 

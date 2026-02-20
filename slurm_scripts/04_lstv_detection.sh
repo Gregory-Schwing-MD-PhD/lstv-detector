@@ -36,7 +36,6 @@ unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # --- Paths ---
 PROJECT_DIR="$(pwd)"
-REGISTERED_DIR="${PROJECT_DIR}/results/registered"
 OUTPUT_DIR="${PROJECT_DIR}/results/lstv_detection"
 
 mkdir -p logs "$OUTPUT_DIR"
@@ -63,9 +62,9 @@ singularity exec \
     --pwd /work \
     "$IMG_PATH" \
     python /work/scripts/04_detect_lstv.py \
-        --registered_dir /work/results/registered \
-        --output_dir     /work/results/lstv_detection \
-        --mode           "$MODE" \
+        --spineps_dir /work/results/spineps \
+        --output_dir  /work/results/lstv_detection \
+        --mode        "$MODE" \
         $EXTRA_ARGS
 
 echo "================================================================"
