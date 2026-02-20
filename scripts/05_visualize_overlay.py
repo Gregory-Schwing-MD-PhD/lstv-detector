@@ -376,20 +376,69 @@ def best_x_for_tp_height(tp_l5_3d: np.ndarray,
 # SLICE SELECTION: min distance TP ↔ sacrum  (Type II/III)
 # ============================================================================
 
+def min_dist_3d_tp_sacrum(tp_mask:     np.ndarray,
+                           sacrum_mask: np.ndarray,
+                           vox_mm:      np.ndarray) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    True 3-D Euclidean minimum distance between any TP voxel and any sacrum
+    voxel, in physical mm.
+
+    Uses distance_transform_edt on the sacrum mask (efficient O(N) algorithm),
+    then finds the TP voxel that sits closest to the sacrum surface.
+
+    Returns
+    -------
+    dist_mm        : float — minimum distance in mm (inf if either mask empty)
+    tp_vox         : np.ndarray shape (3,) — index of closest TP voxel, or None
+    sac_vox        : np.ndarray shape (3,) — index of nearest sacrum voxel, or None
+    """
+    if not tp_mask.any() or not sacrum_mask.any():
+        return float('inf'), None, None
+
+    # EDT of the complement gives distance-to-sacrum at every voxel
+    dist_to_sac = distance_transform_edt(~sacrum_mask, sampling=vox_mm)
+
+    # Find the TP voxel with minimum distance to sacrum
+    dist_at_tp  = np.where(tp_mask, dist_to_sac, np.inf)
+    flat_idx    = int(np.argmin(dist_at_tp))
+    tp_vox      = np.array(np.unravel_index(flat_idx, tp_mask.shape))
+    dist_mm     = float(dist_to_sac[tuple(tp_vox)])
+
+    # Find the nearest sacrum voxel by brute-force among sacrum candidates
+    # close in z (within ±20 slices of tp_vox[2]) for efficiency
+    z_lo = max(0, int(tp_vox[2]) - 20)
+    z_hi = min(sacrum_mask.shape[2], int(tp_vox[2]) + 20)
+    sac_sub  = sacrum_mask[:, :, z_lo:z_hi]
+    if sac_sub.any():
+        sac_coords = np.array(np.where(sac_sub))          # (3, N)
+        sac_coords[2] += z_lo                              # restore global z
+        tp_phys    = tp_vox * vox_mm
+        sac_phys   = sac_coords.T * vox_mm                # (N, 3)
+        d2         = ((sac_phys - tp_phys) ** 2).sum(axis=1)
+        best_sac   = int(np.argmin(d2))
+        sac_vox    = sac_coords[:, best_sac]
+    else:
+        # fallback: global search
+        sac_coords = np.array(np.where(sacrum_mask))
+        tp_phys    = tp_vox * vox_mm
+        sac_phys   = sac_coords.T * vox_mm
+        d2         = ((sac_phys - tp_phys) ** 2).sum(axis=1)
+        sac_vox    = sac_coords[:, int(np.argmin(d2))]
+
+    return dist_mm, tp_vox, sac_vox
+
+
 def min_dist_z_for_tp_sacrum(tp_mask:     np.ndarray,
                                sacrum_mask: np.ndarray,
                                vox_mm:      np.ndarray) -> Tuple[int, float]:
-    if not tp_mask.any() or not sacrum_mask.any():
+    """
+    Legacy wrapper — returns (axial_z_of_closest_tp_voxel, dist_mm).
+    Kept so call-sites that only need the axial z still work.
+    """
+    dist_mm, tp_vox, _ = min_dist_3d_tp_sacrum(tp_mask, sacrum_mask, vox_mm)
+    if tp_vox is None:
         return 0, float('inf')
-    dist  = distance_transform_edt(~sacrum_mask, sampling=vox_mm)
-    nz    = tp_mask.shape[2]
-    per_z = np.full(nz, np.inf)
-    for z in range(nz):
-        sl = tp_mask[:, :, z]
-        if sl.any():
-            per_z[z] = dist[:, :, z][sl].min()
-    z_best = int(np.argmin(per_z))
-    return z_best, float(per_z[z_best])
+    return int(tp_vox[2]), dist_mm
 
 
 # ============================================================================
@@ -840,22 +889,47 @@ def visualize_study(
 
     sacrum_ax = (tss_labels == SACRUM_LABEL) if tss_labels is not None else zeros
 
-    # ── Min-dist z per side ───────────────────────────────────────────────────
-    z_md_L, dist_L = min_dist_z_for_tp_sacrum(tp_left_ax,  sacrum_ax, vox_ax)
-    z_md_R, dist_R = min_dist_z_for_tp_sacrum(tp_right_ax, sacrum_ax, vox_ax)
+    # ── Min-dist: true 3D Euclidean in sagittal space (highest res, no resample artifacts)
+    # Uses the already-isolated L5-only TP blobs and TSS sacrum mask, both in sag space.
+    # This is computed BEFORE the axial masks below so dist_L/dist_R are sag-space values.
+    sac_sag_for_dist = ((orig_tss_sag == SACRUM_LABEL)
+                        if orig_tss_sag is not None else None)
+
+    # We need the L5 sag masks early — isolate them here temporarily so we can compute
+    # distances; we'll re-use them again after the axial mask block.
+    _tp_l5_left_sag_early  = isolate_l5_tp_sag(orig_spineps, orig_tss_sag, TP_LEFT_LABEL,  tv_label)
+    _tp_l5_right_sag_early = isolate_l5_tp_sag(orig_spineps, orig_tss_sag, TP_RIGHT_LABEL, tv_label)
+
+    if sac_sag_for_dist is not None:
+        dist_L, tp_vox_L, _ = min_dist_3d_tp_sacrum(_tp_l5_left_sag_early,  sac_sag_for_dist, vox_sag)
+        dist_R, tp_vox_R, _ = min_dist_3d_tp_sacrum(_tp_l5_right_sag_early, sac_sag_for_dist, vox_sag)
+    else:
+        # Fallback: axial-space EDT if sagittal sacrum unavailable
+        dist_L, tp_vox_L = float('inf'), None
+        dist_R, tp_vox_R = float('inf'), None
+
+    # Convert sagittal TP voxel z to axial z for [1,2] slice selection
+    def _sag_tp_z_to_ax(tp_vox):
+        if tp_vox is None or sag_nii is None:
+            return None
+        return sag_z_to_ax_z(sag_nii, ax_bg_nii, int(tp_vox[2]))
+
+    z_md_L = _sag_tp_z_to_ax(tp_vox_L) if tp_vox_L is not None else ax_bg.shape[2] // 2
+    z_md_R = _sag_tp_z_to_ax(tp_vox_R) if tp_vox_R is not None else ax_bg.shape[2] // 2
+    if z_md_L is None: z_md_L = ax_bg.shape[2] // 2
+    if z_md_R is None: z_md_R = ax_bg.shape[2] // 2
+
     if np.isfinite(dist_L) or np.isfinite(dist_R):
         z_md_combined = z_md_L if dist_L <= dist_R else z_md_R
     else:
         z_md_combined = z_tv
 
     logger.info(f"  [{study_id}] z_tv={z_tv}  "
-                f"z_md_L={z_md_L}({dist_L:.1f}mm)  z_md_R={z_md_R}({dist_R:.1f}mm)")
+                f"z_md_L={z_md_L}({dist_L:.1f}mm sag-3D)  z_md_R={z_md_R}({dist_R:.1f}mm sag-3D)")
 
-    # ── Isolate L5-only TP blobs in sagittal space ───────────────────────────
-    tp_l5_left_sag  = isolate_l5_tp_sag(orig_spineps, orig_tss_sag,
-                                          TP_LEFT_LABEL,  tv_label)
-    tp_l5_right_sag = isolate_l5_tp_sag(orig_spineps, orig_tss_sag,
-                                          TP_RIGHT_LABEL, tv_label)
+    # ── Isolate L5-only TP blobs in sagittal space (reuse early computation) ─
+    tp_l5_left_sag  = _tp_l5_left_sag_early
+    tp_l5_right_sag = _tp_l5_right_sag_early
 
     logger.info(f"  [{study_id}] L5-left voxels={tp_l5_left_sag.sum()}  "
                 f"L5-right voxels={tp_l5_right_sag.sum()}")
