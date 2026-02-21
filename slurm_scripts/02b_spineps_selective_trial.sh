@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
+#SBATCH --mem=32G
 #SBATCH --gres=gpu:1
 #SBATCH --time=2:00:00
 #SBATCH --job-name=spineps_selective
@@ -34,10 +34,9 @@ unset JAVA_HOME
 which singularity || echo "WARNING: singularity not found"
 export XDG_RUNTIME_DIR="${HOME}/xdr"
 export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
-MODELS_CACHE="${PWD}/models/spineps_cache"
 SPINEPS_PKG_MODELS="${PWD}/models/spineps_pkg_models"
 mkdir -p "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR" \
-         "$MODELS_CACHE" "$SPINEPS_PKG_MODELS"
+         "$SPINEPS_PKG_MODELS"
 export NXF_SINGULARITY_HOME_MOUNT=true
 unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
@@ -78,7 +77,7 @@ singularity exec --nv \
     --bind "${PROJECT_DIR}":/work \
     --bind "${NIFTI_DIR}":/work/results/nifti \
     --bind "${SPINEPS_DIR}":/work/results/spineps \
-    --bind "${MODELS_CACHE}":/app/models \
+    --bind "${MODELS_DIR}":/app/models \
     --bind "${SPINEPS_PKG_MODELS}":/opt/conda/lib/python3.10/site-packages/spineps/models \
     --env SPINEPS_SEGMENTOR_MODELS=/app/models \
     --env SPINEPS_ENVIRONMENT_DIR=/app/models \
