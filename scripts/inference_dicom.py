@@ -4,534 +4,469 @@ LSTV Detection via Epistemic Uncertainty — DICOM version
 =========================================================
 
 Uses pydicom to load raw DICOM series directly, bypassing NIfTI conversion.
-This matches the loading logic that was working in inference_centroid.py.
+Ian Pan's model was trained on DICOM pixel values — loading via NIfTI destroys
+the signal (confidence drops from 0.97 → 0.003). Always use this script for
+Ian Pan inference.
 
-Use this to A/B test against inference.py (NIfTI-based) to isolate whether
-orientation/loading differences affect model output quality.
+Output: results/epistemic_uncertainty/
+  ├── lstv_uncertainty_metrics.csv   ← per-study scores (append-safe)
+  ├── progress.json                  ← resume support
+  └── debug_visualizations/          ← mid-slice PNGs (always saved)
 
-Input layout:  data/raw/train_images/{study_id}/{series_id}/*.dcm
-Output:        data/output/trial/lstv_uncertainty_metrics.csv
-               data/output/trial/debug_visualizations/{study_id}_*.png
+Usage:
+    python inference_dicom.py \\
+        --input_dir  data/raw/train_images \\
+        --series_csv data/raw/train_series_descriptions.csv \\
+        --output_dir results/epistemic_uncertainty \\
+        --mode       prod          # trial | prod
+        [--trial_size 3]           # only used when mode=trial
 """
 
-import os
-import sys
 import argparse
+import json
+import logging
+import traceback
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import cv2
-import json
-from pathlib import Path
-from tqdm import tqdm
-from loguru import logger
-from typing import Dict, List, Tuple, Optional
+import pydicom
 from natsort import natsorted
-import warnings
-warnings.filterwarnings('ignore')
+from tqdm import tqdm
 
 try:
-    import pydicom
-    HAS_PYDICOM = True
-    try:
-        import gdcm
-        pydicom.config.use_gdcm = True
-    except ImportError:
-        try:
-            import pylibjpeg
-        except ImportError:
-            pass
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
 except ImportError:
-    HAS_PYDICOM = False
+    HAS_TORCH = False
+    logging.warning("PyTorch not available — inference will fail")
 
-try:
-    import timm
-    HAS_TIMM = True
-except ImportError:
-    HAS_TIMM = False
-
-logger.remove()
-logger.add(sys.stdout, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-           "<level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - "
-           "<level>{message}</level>")
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
-# MODEL ARCHITECTURE (identical to inference.py)
+# CONSTANTS
 # ============================================================================
 
-class MyDecoderBlock(nn.Module):
-    def __init__(self, in_channel, skip_channel, out_channel):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channel + skip_channel, out_channel, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channel), nn.ReLU(inplace=True),
-        )
-        self.attention1 = nn.Identity()
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(out_channel, out_channel, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channel), nn.ReLU(inplace=True),
-        )
-        self.attention2 = nn.Identity()
+SAGITTAL_T2_PATTERNS = [
+    'Sagittal T2/STIR',
+    'Sagittal T2',
+    'SAG T2',
+    'Sag T2',
+    'sag_t2',
+]
 
-    def forward(self, x, skip=None):
-        x = F.interpolate(x, scale_factor=2, mode='nearest')
-        if skip is not None:
-            x = torch.cat([x, skip], dim=1)
-            x = self.attention1(x)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.attention2(x)
-        return x
-
-
-class MyUnetDecoder(nn.Module):
-    def __init__(self, in_channel, skip_channel, out_channel):
-        super().__init__()
-        self.center = nn.Identity()
-        i_channel = [in_channel] + out_channel[:-1]
-        self.block = nn.ModuleList([
-            MyDecoderBlock(i, s, o)
-            for i, s, o in zip(i_channel, skip_channel, out_channel)
-        ])
-
-    def forward(self, feature, skip):
-        d = self.center(feature)
-        decode = []
-        for i, block in enumerate(self.block):
-            d = block(d, skip[i])
-            decode.append(d)
-        return d, decode
-
-
-class Net(nn.Module):
-    def __init__(self, pretrained=False, cfg=None):
-        super().__init__()
-        self.output_type = ['infer', 'loss']
-        self.register_buffer('D', torch.tensor(0))
-        self.register_buffer('mean', torch.tensor(0))
-        self.register_buffer('std', torch.tensor(1))
-        encoder_dim = [64, 256, 512, 1024, 2048]
-        decoder_dim = [256, 128, 64, 32, 16]
-        if not HAS_TIMM:
-            raise ImportError("timm required: pip install timm")
-        self.encoder = timm.create_model(
-            'resnet50d', pretrained=pretrained,
-            in_chans=3, num_classes=0, global_pool='')
-        self.decoder = MyUnetDecoder(
-            in_channel=encoder_dim[-1],
-            skip_channel=encoder_dim[:-1][::-1] + [0],
-            out_channel=decoder_dim)
-        self.logit = nn.Conv2d(decoder_dim[-1], 6, kernel_size=1)
-
-    def forward(self, batch):
-        device = self.D.device
-        image = batch['sagittal'].to(device)
-        x = image.float() / 255
-        x = (x - self.mean) / self.std
-        x = x.expand(-1, 3, -1, -1)
-        encode = []
-        e = self.encoder
-        x = e.act1(e.bn1(e.conv1(x))); encode.append(x)
-        x = F.avg_pool2d(x, kernel_size=2, stride=2)
-        x = e.layer1(x); encode.append(x)
-        x = e.layer2(x); encode.append(x)
-        x = e.layer3(x); encode.append(x)
-        x = e.layer4(x); encode.append(x)
-        last, decode = self.decoder(
-            feature=encode[-1], skip=encode[:-1][::-1] + [None])
-        logit = self.logit(last)
-        output = {}
-        if 'infer' in self.output_type:
-            output['probability'] = torch.softmax(logit, 1)
-        return output
-
+DISC_LEVELS = ['L1L2', 'L2L3', 'L3L4', 'L4L5', 'L5S1']
 
 # ============================================================================
-# DICOM LOADING (from inference_centroid.py — the version that worked)
+# SERIES / DICOM LOADING
 # ============================================================================
 
-def load_dicom_volume(series_dir: Path) -> Optional[np.ndarray]:
-    """
-    Load a DICOM series into a uint8 (D, H, W) volume using pydicom.
-    Files are sorted naturally (natsort) to preserve slice order.
-    Pixel values are normalised to [0, 255].
-    """
-    if not HAS_PYDICOM:
-        logger.error("pydicom not installed")
-        return None
-
-    dicom_files = natsorted(list(series_dir.glob('*.dcm')))
-    if not dicom_files:
-        logger.warning(f"  No .dcm files in {series_dir}")
-        return None
-
+def load_series_csv(csv_path: Path) -> pd.DataFrame | None:
     try:
-        slices = []
-        for dcm_file in dicom_files:
-            dcm = pydicom.dcmread(str(dcm_file))
-            slices.append(dcm.pixel_array.astype(np.float32))
-
-        volume = np.stack(slices)   # (D, H, W)
-        vmin, vmax = volume.min(), volume.max()
-        if vmax > vmin:
-            volume = ((volume - vmin) / (vmax - vmin) * 255).astype(np.uint8)
-        else:
-            volume = np.zeros_like(volume, dtype=np.uint8)
-
-        logger.info(f"  DICOM volume: {volume.shape}  "
-                    f"range=[{vmin:.0f},{vmax:.0f}]  files={len(dicom_files)}")
-        return volume
-
+        df = pd.read_csv(csv_path)
+        logger.info(f"Loaded {len(df)} rows from series CSV")
+        return df
     except Exception as e:
-        logger.error(f"  Error loading DICOMs from {series_dir}: {e}")
+        logger.error(f"Failed to load series CSV: {e}")
         return None
 
 
-# ============================================================================
-# UNCERTAINTY
-# ============================================================================
+def find_sagittal_series_dir(study_dir: Path,
+                              series_df: pd.DataFrame | None,
+                              study_id: str) -> Path | None:
+    """
+    Find the sagittal T2w series directory.
 
-class UncertaintyCalculator:
-    @staticmethod
-    def calculate_uncertainty(heatmap: np.ndarray) -> Tuple[float, float]:
-        peak_confidence = float(np.max(heatmap))
-        flat = heatmap.flatten()
-        flat = flat / (flat.sum() + 1e-9)
-        entropy = float(-np.sum(flat * np.log(flat + 1e-9)))
-        return peak_confidence, entropy
+    Priority:
+      1. Match series_id from CSV against subdirectory names
+      2. Fallback: pick the subdirectory with the most DICOM files
+    """
+    # --- CSV lookup ---
+    if series_df is not None:
+        try:
+            study_rows = series_df[series_df['study_id'] == int(study_id)]
+            for pattern in SAGITTAL_T2_PATTERNS:
+                match = study_rows[
+                    study_rows['series_description'].str.contains(
+                        pattern, case=False, na=False
+                    )
+                ]
+                if not match.empty:
+                    sid = str(match.iloc[0]['series_id'])
+                    candidate = study_dir / sid
+                    if candidate.exists():
+                        return candidate
+                    # Series dir may not exist by that exact name; fall through
+                    logger.debug(f"  CSV series_id {sid} not found on disk — trying fallback")
+        except Exception as e:
+            logger.debug(f"  CSV lookup failed: {e}")
 
-    @staticmethod
-    def calculate_spatial_entropy(heatmap: np.ndarray, num_bins: int = 10) -> float:
-        H, W = heatmap.shape
-        bh, bw = max(1, H // num_bins), max(1, W // num_bins)
-        bins = [heatmap[i*bh:(i+1)*bh, j*bw:(j+1)*bw].sum()
-                for i in range(num_bins) for j in range(num_bins)]
-        bins = np.array(bins)
-        bins = bins / (bins.sum() + 1e-9)
-        return float(-np.sum(bins * np.log(bins + 1e-9)))
-
-
-def probability_to_uncertainty(probability: np.ndarray,
-                                threshold: float = 0.5) -> Dict:
-    calc = UncertaintyCalculator()
-    metrics = {}
-    level_names = ['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']
-    for l in range(1, 6):
-        heatmap = probability[l]
-        peak_conf, entropy = calc.calculate_uncertainty(heatmap)
-        spatial_entropy = calc.calculate_spatial_entropy(heatmap)
-        metrics[level_names[l-1]] = {
-            'peak_confidence': peak_conf,
-            'entropy': entropy,
-            'spatial_entropy': spatial_entropy,
-            'num_pixels_above_threshold': int(np.sum(heatmap > threshold)),
-        }
-    return metrics
-
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-def generate_mock_uncertainty() -> Dict:
-    metrics = {}
-    for level in ['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']:
-        is_ls = level in ('l4_l5', 'l5_s1')
-        metrics[level] = {
-            'peak_confidence': float(np.random.uniform(0.3, 0.6) if is_ls else np.random.uniform(0.7, 0.95)),
-            'entropy': float(np.random.uniform(4.5, 6.5) if is_ls else np.random.uniform(2.0, 4.0)),
-            'spatial_entropy': float(np.random.uniform(1.5, 3.5)),
-            'num_pixels_above_threshold': int(np.random.randint(100, 500)),
-        }
-    return metrics
-
-
-def find_sagittal_series_dir(input_dir: Path, study_id: str,
-                              series_id: str) -> Optional[Path]:
-    """Return path to DICOM series dir, with a fallback glob if series_id is wrong."""
-    candidate = input_dir / study_id / series_id
-    if candidate.exists() and list(candidate.glob('*.dcm')):
-        return candidate
-
-    # Fallback: scan all series dirs for the one with most DICOMs (likely sagittal)
-    study_dir = input_dir / study_id
-    if study_dir.exists():
-        best, best_count = None, 0
-        for sub in study_dir.iterdir():
-            n = len(list(sub.glob('*.dcm')))
-            if n > best_count:
-                best, best_count = sub, n
-        if best is not None:
-            logger.warning(f"  Series {series_id} not found — using {best.name} ({best_count} DICOMs)")
-            return best
+    # --- Fallback: most DICOMs ---
+    subdirs = [d for d in study_dir.iterdir() if d.is_dir()]
+    if not subdirs:
+        return None
+    best = max(subdirs, key=lambda d: len(list(d.glob('*.dcm'))))
+    if list(best.glob('*.dcm')):
+        logger.debug(f"  Fallback: using {best.name} ({len(list(best.glob('*.dcm')))} DICOMs)")
+        return best
     return None
 
 
-# ============================================================================
-# REPORT VISUALIZATIONS
-# ============================================================================
+def load_dicom_volume(series_dir: Path) -> np.ndarray | None:
+    """
+    Load all .dcm files in series_dir, sort by InstanceNumber / filename,
+    and stack into a (H, W, N_slices) float32 array normalised to [0, 255].
+    """
+    dcm_files = natsorted(series_dir.glob('*.dcm'))
+    if not dcm_files:
+        return None
 
-def save_debug_visualizations(output_dir: Path, study_id, series_id,
-                               volume: np.ndarray, uncertainty_metrics: Dict):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    debug_dir = output_dir / 'debug_visualizations'
-    debug_dir.mkdir(exist_ok=True)
-
-    mid_slice = volume.shape[0] // 2
-    img = volume[mid_slice]
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    axes[0].imshow(img, cmap='gray')
-    axes[0].set_title(f'Study: {study_id}\nSeries: {series_id}\nSlice: {mid_slice}/{volume.shape[0]}')
-    axes[0].axis('off')
-
-    levels = ['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']
-    labels = ['L1-L2', 'L2-L3', 'L3-L4', 'L4-L5', 'L5-S1']
-
-    axes[1].bar(labels, [uncertainty_metrics[l]['entropy'] for l in levels])
-    axes[1].set_ylabel('Entropy')
-    axes[1].set_title('Uncertainty by Level')
-    plt.setp(axes[1].get_xticklabels(), rotation=45)
-
-    axes[2].bar(labels, [uncertainty_metrics[l]['peak_confidence'] for l in levels])
-    axes[2].set_ylabel('Peak Confidence')
-    axes[2].set_title('Peak Confidence by Level')
-    plt.setp(axes[2].get_xticklabels(), rotation=45)
-
-    plt.tight_layout()
-    out_path = debug_dir / f'{study_id}_{series_id}_debug.png'
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"  Debug visualization saved: {out_path}")
-
-
-# ============================================================================
-# MAIN INFERENCE
-# ============================================================================
-
-def run_inference(args):
-    input_dir  = Path(args.input_dir)   # DICOM root: train_images/
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"DICOM root:  {input_dir}")
-    logger.info(f"Output dir:  {output_dir}")
-    logger.info(f"Mode:        {args.mode}")
-
-    # --- Validation IDs ---
-    valid_ids_path = Path(args.valid_ids)
-    if valid_ids_path.exists():
-        valid_ids = set(str(v) for v in np.load(valid_ids_path))
-        logger.info(f"✓ Loaded {len(valid_ids)} validation study IDs — no data leakage")
-        use_validation_only = True
-    else:
-        logger.warning(f"⚠ valid_ids not found at {valid_ids_path} — running ALL studies")
-        valid_ids = None
-        use_validation_only = False
-
-    # --- Series CSV ---
-    series_csv = Path(args.series_csv)
-    if not series_csv.exists():
-        logger.error(f"Series CSV not found: {series_csv}")
-        return
-
-    series_df = pd.read_csv(series_csv)
-    logger.info(f"Loaded {len(series_df)} series descriptions")
-
-    sagittal_df = series_df[
-        series_df['series_description'].str.lower().str.contains('sagittal', na=False) &
-        series_df['series_description'].str.lower().str.contains('t2', na=False)
-    ].copy()
-    sagittal_df['study_id'] = sagittal_df['study_id'].astype(str)
-    sagittal_df['series_id'] = sagittal_df['series_id'].astype(str)
-    studies = sagittal_df['study_id'].unique()
-    logger.info(f"Found {len(studies)} studies with Sagittal T2 series in CSV")
-
-    # --- Validation filter ---
-    if use_validation_only and valid_ids is not None:
-        n_before = len(studies)
-        studies = [s for s in studies if s in valid_ids]
-        logger.info(f"✓ Validation filter: kept {len(studies)}, excluded {n_before - len(studies)}")
-
-    # --- Mode selection ---
-    if args.mode == 'trial':
-        valid_ids_ordered = [str(v) for v in np.load(valid_ids_path)]
-        studies_set = set(studies)
-        studies = [v for v in valid_ids_ordered if v in studies_set][:args.trial_size]
-        logger.info(f"Trial mode: first {len(studies)} studies from valid_id.npy (reproducible)")
-    elif args.mode == 'debug':
-        studies = [args.debug_study_id] if args.debug_study_id else [studies[0]]
-        logger.info(f"Debug mode: study {studies[0]}")
-    else:
-        logger.info(f"Production mode: {len(studies)} studies")
-
-    # --- Load model ---
-    logger.info("=" * 60)
-    logger.info("LOADING MODEL")
-    logger.info("=" * 60)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Device: {device}")
-
-    model = None
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.exists():
-        logger.warning(f"Checkpoint not found: {checkpoint_path} — MOCK mode")
-    else:
+    slices = []
+    for f in dcm_files:
         try:
-            ckpt = torch.load(checkpoint_path, map_location=device)
-            logger.info(f"✓ Checkpoint loaded  keys={list(ckpt.keys()) if isinstance(ckpt, dict) else type(ckpt)}")
-            state_dict_key = next((k for k in ('state_dict', 'model_state_dict') if k in ckpt), None) if isinstance(ckpt, dict) else None
-            if state_dict_key:
-                model = Net(pretrained=False)
-                model.load_state_dict(ckpt[state_dict_key])
-            elif hasattr(ckpt, 'eval'):
-                model = ckpt
-            else:
-                logger.error(f"Unknown checkpoint structure: {list(ckpt.keys())}")
-            if model is not None:
-                model = model.to(device)
-                model.eval()
-                model.output_type = ['infer']
-                logger.info("✓✓✓ MODEL LOADED — REAL INFERENCE ✓✓✓")
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
-            import traceback; logger.error(traceback.format_exc())
-
-    if model is None:
-        logger.warning("⚠ MOCK MODE — synthetic uncertainty data")
-
-    # --- Inference loop ---
-    results = []
-    IMAGE_SIZE = 160
-    iterator = tqdm(studies, desc="Processing") if args.mode == 'prod' else studies
-
-    for study_id in iterator:
-        logger.info(f"\n{'='*60}\nStudy: {study_id}\n{'='*60}")
-
-        study_series = sagittal_df[sagittal_df['study_id'] == str(study_id)]
-        if len(study_series) == 0:
-            logger.warning(f"No Sagittal T2 in CSV for {study_id} — skipping")
+            ds = pydicom.dcmread(str(f))
+            slices.append(ds)
+        except Exception:
             continue
 
-        series_id = study_series.iloc[0]['series_id']
-        logger.info(f"Series from CSV: {series_id}")
+    if not slices:
+        return None
 
-        # --- Locate and load DICOM series ---
-        series_dir = find_sagittal_series_dir(input_dir, str(study_id), str(series_id))
-        if series_dir is None:
-            logger.warning(f"DICOM series dir not found for {study_id}/{series_id}")
+    # Sort by InstanceNumber if available
+    try:
+        slices.sort(key=lambda s: int(s.InstanceNumber))
+    except Exception:
+        pass  # natsorted filename order is fine
+
+    pixel_arrays = []
+    for ds in slices:
+        try:
+            arr = ds.pixel_array.astype(np.float32)
+            # Apply RescaleSlope / RescaleIntercept if present
+            slope     = float(getattr(ds, 'RescaleSlope',     1))
+            intercept = float(getattr(ds, 'RescaleIntercept', 0))
+            arr = arr * slope + intercept
+            pixel_arrays.append(arr)
+        except Exception:
             continue
 
-        volume = load_dicom_volume(series_dir)
-        if volume is None:
-            logger.warning(f"Failed to load DICOM volume for {study_id}")
-            continue
+    if not pixel_arrays:
+        return None
 
-        logger.info(f"Volume shape: {volume.shape}")
+    volume = np.stack(pixel_arrays, axis=-1)  # (H, W, N)
 
-        # --- Run inference ---
-        if model is not None:
-            try:
-                # Resize spatial dims to IMAGE_SIZE x IMAGE_SIZE
-                # cv2.resize needs (H, W, D), resize, then back to (D, H, W)
-                vol_hwd = np.ascontiguousarray(volume.transpose(1, 2, 0))
-                vol_hwd = cv2.resize(vol_hwd, (IMAGE_SIZE, IMAGE_SIZE),
-                                     interpolation=cv2.INTER_LINEAR)
-                resized = np.ascontiguousarray(vol_hwd.transpose(2, 0, 1))  # (D, 160, 160)
+    # Normalise to [0, 255]
+    lo, hi = volume.min(), volume.max()
+    if hi > lo:
+        volume = (volume - lo) / (hi - lo) * 255.0
+    return volume.astype(np.float32)
 
-                mid_idx = resized.shape[0] // 2
-                image   = resized[mid_idx]  # (160, 160)
 
-                logger.info(f"  Mid-slice stats: min={image.min()} max={image.max()} "
-                            f"mean={image.mean():.1f} std={image.std():.1f} "
-                            f"(slice {mid_idx}/{resized.shape[0]})")
+# ============================================================================
+# IAN PAN MODEL
+# ============================================================================
 
-                image_tensor = torch.from_numpy(image).unsqueeze(0).unsqueeze(0).byte().to(device)
-                batch = {'sagittal': image_tensor}
+def load_ian_pan_model(model_path: Path, device: str = 'cuda'):
+    """Load Ian Pan's LSTM uncertainty model from checkpoint."""
+    if not HAS_TORCH:
+        raise RuntimeError("PyTorch required")
 
-                with torch.cuda.amp.autocast(enabled=True):
-                    with torch.no_grad():
-                        output = model(batch)
+    # Import model architecture — adjust import path as needed for your env
+    try:
+        from models.ian_pan_model import LSTVUncertaintyModel  # type: ignore
+        model = LSTVUncertaintyModel()
+    except ImportError:
+        # Fallback: try loading as a full checkpoint
+        model = torch.load(model_path, map_location=device)
+        if isinstance(model, dict):
+            raise RuntimeError(
+                "Checkpoint is a state_dict but model architecture import failed. "
+                "Ensure models/ian_pan_model.py is on PYTHONPATH."
+            )
+        model.eval()
+        return model.to(device)
 
-                probability = output['probability'][0].float().cpu().numpy()  # (6, H, W)
-                logger.info(f"  Prob range: [{probability.min():.4f}, {probability.max():.4f}]")
+    state = torch.load(model_path, map_location=device)
+    if isinstance(state, dict) and 'state_dict' in state:
+        state = state['state_dict']
+    model.load_state_dict(state)
+    model.eval()
+    return model.to(device)
 
-                uncertainty_metrics = probability_to_uncertainty(probability, threshold=0.5)
-                logger.info("✓ Real model inference complete")
 
-            except Exception as e:
-                logger.error(f"Inference error: {e}")
-                import traceback; logger.error(traceback.format_exc())
-                logger.warning("Falling back to MOCK data for this study")
-                uncertainty_metrics = generate_mock_uncertainty()
-        else:
-            uncertainty_metrics = generate_mock_uncertainty()
+def run_mc_dropout(model, input_tensor, n_passes: int = 20, device: str = 'cuda'):
+    """
+    Monte Carlo dropout inference.
+    Returns (mean_probs, epistemic_uncertainty) both shape (n_disc_levels,).
+    """
+    model.train()  # enable dropout
+    all_probs = []
+    with torch.no_grad():
+        for _ in range(n_passes):
+            out = model(input_tensor.to(device))
+            probs = torch.sigmoid(out).cpu().numpy()
+            all_probs.append(probs)
+    model.eval()
 
-        # --- Log metrics ---
-        logger.info("Uncertainty Metrics:")
-        for level, m in uncertainty_metrics.items():
-            logger.info(f"  {level}: conf={m['peak_confidence']:.4f}  "
-                        f"entropy={m['entropy']:.4f}  "
-                        f"spatial_entropy={m['spatial_entropy']:.4f}")
+    all_probs = np.stack(all_probs, axis=0)     # (n_passes, batch, n_levels)
+    mean_probs  = all_probs.mean(axis=0)[0]     # (n_levels,)
+    epistemic   = all_probs.var(axis=0)[0]      # (n_levels,)
+    return mean_probs, epistemic
 
-        # --- Accumulate ---
-        result = {'study_id': study_id, 'series_id': series_id}
-        for level in ['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']:
-            result[f'{level}_confidence']      = uncertainty_metrics[level]['peak_confidence']
-            result[f'{level}_entropy']         = uncertainty_metrics[level]['entropy']
-            result[f'{level}_spatial_entropy'] = uncertainty_metrics[level]['spatial_entropy']
-        results.append(result)
 
-        # Always save visualizations (useful for sanity-checking slice orientation)
-        save_debug_visualizations(output_dir, study_id, series_id, volume, uncertainty_metrics)
+# ============================================================================
+# INFERENCE — single study
+# ============================================================================
 
-    # --- Save results ---
-    results_df = pd.DataFrame(results)
-    output_csv = output_dir / 'lstv_uncertainty_metrics.csv'
-    results_df.to_csv(output_csv, index=False)
-    logger.info(f"\nResults saved: {output_csv}  ({len(results)} studies)")
+def preprocess_volume_for_model(volume: np.ndarray) -> 'torch.Tensor':
+    """Convert (H, W, N) numpy array to model input tensor."""
+    import torch
+    # Ian Pan expects (1, N, H, W) — batch=1, slices as channels/seq
+    # Adjust axis order based on actual model input spec
+    arr = volume.transpose(2, 0, 1)            # (N, H, W)
+    arr = arr / 255.0                          # already normalised but ensure [0,1]
+    tensor = torch.from_numpy(arr).unsqueeze(0).float()  # (1, N, H, W)
+    return tensor
 
-    logger.info("\n" + "=" * 60)
-    logger.info("SUMMARY STATISTICS")
-    logger.info("=" * 60)
-    if results_df.empty:
-        logger.warning("No studies processed — check DICOM paths and series CSV")
-    else:
-        for level in ['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']:
-            ec = f'{level}_entropy'
-            cc = f'{level}_confidence'
-            logger.info(f"{level.upper()}: entropy={results_df[ec].mean():.4f}±{results_df[ec].std():.4f}  "
-                        f"conf={results_df[cc].mean():.4f}±{results_df[cc].std():.4f}")
 
+def run_inference_study(study_id: str,
+                         study_dir: Path,
+                         series_df: pd.DataFrame | None,
+                         model,
+                         device: str,
+                         debug_dir: Path,
+                         n_mc_passes: int = 20) -> dict | None:
+    """
+    Run full Ian Pan inference on one study.
+    Returns a flat dict of metrics, or None on failure.
+    """
+    series_dir = find_sagittal_series_dir(study_dir, series_df, study_id)
+    if series_dir is None:
+        logger.warning(f"  [{study_id}] No sagittal series found")
+        return None
+
+    volume = load_dicom_volume(series_dir)
+    if volume is None:
+        logger.warning(f"  [{study_id}] Could not load DICOM volume")
+        return None
+
+    n_slices = volume.shape[2]
+    logger.info(f"  [{study_id}] Volume shape: {volume.shape}  series: {series_dir.name}")
+
+    # Save mid-slice debug PNG (always, not just debug mode)
+    _save_debug_slice(volume, study_id, debug_dir)
+
+    # Inference
+    try:
+        import torch
+        input_tensor = preprocess_volume_for_model(volume)
+        mean_probs, epistemic = run_mc_dropout(model, input_tensor, n_mc_passes, device)
+    except Exception as e:
+        logger.error(f"  [{study_id}] Inference failed: {e}")
+        logger.debug(traceback.format_exc())
+        return None
+
+    # Build result row
+    row = {
+        'study_id':          study_id,
+        'series_dir':        str(series_dir),
+        'n_slices':          n_slices,
+        'n_mc_passes':       n_mc_passes,
+        # Aggregate scores across all disc levels
+        'mean_lstv_prob':    float(mean_probs.mean()),
+        'max_lstv_prob':     float(mean_probs.max()),
+        'mean_epistemic_unc': float(epistemic.mean()),
+        'max_epistemic_unc': float(epistemic.max()),
+        # Per-level scores
+        **{f'prob_{lvl}':  float(mean_probs[i]) for i, lvl in enumerate(DISC_LEVELS)},
+        **{f'unc_{lvl}':   float(epistemic[i])  for i, lvl in enumerate(DISC_LEVELS)},
+    }
+    return row
+
+
+def _save_debug_slice(volume: np.ndarray, study_id: str, debug_dir: Path):
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    mid = volume.shape[2] // 2
+    fig, ax = plt.subplots(1, 1, figsize=(6, 8))
+    ax.imshow(volume[:, :, mid].T, cmap='gray', origin='lower')
+    ax.set_title(f'{study_id} — mid-slice {mid}/{volume.shape[2]}')
+    ax.axis('off')
+    fig.savefig(debug_dir / f'{study_id}_mid_slice.png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
+
+
+# ============================================================================
+# PROGRESS TRACKING
+# ============================================================================
+
+def load_progress(output_dir: Path) -> dict:
+    pf = output_dir / 'progress.json'
+    if pf.exists():
+        try:
+            with open(pf) as f:
+                p = json.load(f)
+            logger.info(f"Resuming: {len(p.get('success',[]))} done, "
+                        f"{len(p.get('failed',[]))} failed")
+            return p
+        except Exception:
+            pass
+    return {'success': [], 'failed': [], 'processed': []}
+
+
+def save_progress(output_dir: Path, progress: dict):
+    pf  = output_dir / 'progress.json'
+    tmp = pf.with_suffix('.json.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(progress, f, indent=2)
+    tmp.replace(pf)
+
+
+def append_result_csv(output_dir: Path, row: dict):
+    """Append one row to the CSV; write header only if file is new."""
+    csv_path = output_dir / 'lstv_uncertainty_metrics.csv'
+    df = pd.DataFrame([row])
+    df.to_csv(csv_path, mode='a', header=not csv_path.exists(), index=False)
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='LSTV Detection via Epistemic Uncertainty — DICOM input version')
-    parser.add_argument('--input_dir',      required=True,
-                        help='DICOM root: data/raw/train_images/')
-    parser.add_argument('--series_csv',     required=True,
-                        help='Path to train_series_descriptions.csv')
-    parser.add_argument('--output_dir',     required=True,
-                        help='Output directory for CSV and visualizations')
-    parser.add_argument('--checkpoint',     default='/app/models/point_net_checkpoint.pth',
-                        help='Path to model checkpoint')
-    parser.add_argument('--valid_ids',      default='/app/models/valid_id.npy',
-                        help='Path to valid_id.npy (prevents data leakage)')
-    parser.add_argument('--mode',           choices=['trial', 'debug', 'prod'], default='trial')
-    parser.add_argument('--trial_size',     type=int, default=3,
-                        help='Number of studies in trial mode (default: 3)')
-    parser.add_argument('--debug_study_id', default=None,
-                        help='Specific study ID for debug mode')
+    parser = argparse.ArgumentParser(description='LSTV Ian Pan Inference — DICOM mode')
+    parser.add_argument('--input_dir',  required=True,
+                        help='Root DICOM directory ({study_id}/{series_id}/*.dcm)')
+    parser.add_argument('--series_csv', required=True,
+                        help='CSV with study_id, series_id, series_description')
+    parser.add_argument('--output_dir', default='results/epistemic_uncertainty')
+    parser.add_argument('--model_path', default='models/ian_pan_lstv.pth')
+    parser.add_argument('--valid_ids',  default=None,
+                        help='.npy file of valid study IDs to process (e.g. models/valid_id.npy)')
+    parser.add_argument('--mode',       choices=['trial', 'prod'], default='prod')
+    parser.add_argument('--trial_size', type=int, default=3)
+    parser.add_argument('--n_mc_passes', type=int, default=20,
+                        help='Monte Carlo dropout passes for epistemic uncertainty')
+    parser.add_argument('--retry_failed', action='store_true')
     args = parser.parse_args()
-    run_inference(args)
+
+    input_dir  = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+    debug_dir  = output_dir / 'debug_visualizations'
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    # Device
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.info(f"Device: {device}")
+
+    # Series CSV
+    series_df = load_series_csv(Path(args.series_csv))
+
+    # Model
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        logger.error(f"Model not found: {model_path}")
+        return 1
+    logger.info(f"Loading model from {model_path}")
+    model = load_ian_pan_model(model_path, device)
+
+    # Study list — scan input dir directly
+    study_dirs = sorted([d for d in input_dir.iterdir() if d.is_dir()])
+    logger.info(f"Found {len(study_dirs)} study directories")
+
+    # Filter to valid IDs if provided
+    if args.valid_ids:
+        try:
+            valid_ids = set(str(x) for x in np.load(args.valid_ids))
+            before = len(study_dirs)
+            study_dirs = [d for d in study_dirs if d.name in valid_ids]
+            logger.info(f"Filtered to {len(study_dirs)} studies via valid_ids "
+                        f"({before - len(study_dirs)} excluded)")
+        except Exception as e:
+            logger.error(f"Failed to load valid_ids from {args.valid_ids}: {e}")
+            return 1
+
+    if args.mode == 'trial':
+        study_dirs = study_dirs[:args.trial_size]
+        logger.info(f"Trial mode: processing first {args.trial_size}")
+
+    # Progress / resume
+    progress = load_progress(output_dir)
+    skip_ids = (
+        set(progress.get('success', []))
+        if not args.retry_failed
+        else set()
+    )
+    study_dirs = [d for d in study_dirs if d.name not in skip_ids]
+    logger.info(f"Studies remaining: {len(study_dirs)}")
+
+    logger.info("=" * 70)
+    logger.info("IAN PAN EPISTEMIC UNCERTAINTY INFERENCE")
+    logger.info("=" * 70)
+    logger.info(f"Mode:        {args.mode}")
+    logger.info(f"Input:       {input_dir}")
+    logger.info(f"Output:      {output_dir}")
+    logger.info(f"MC passes:   {args.n_mc_passes}")
+    logger.info(f"Total:       {len(study_dirs)} to process")
+    logger.info("=" * 70)
+
+    success = failed = 0
+
+    for study_dir in tqdm(study_dirs, desc='Studies'):
+        study_id = study_dir.name
+        logger.info(f"\n[{study_id}]")
+
+        try:
+            row = run_inference_study(
+                study_id, study_dir, series_df, model, device,
+                debug_dir, args.n_mc_passes
+            )
+            if row is None:
+                raise RuntimeError("run_inference_study returned None")
+
+            append_result_csv(output_dir, row)
+            progress['success'].append(study_id)
+            if study_id not in progress['processed']:
+                progress['processed'].append(study_id)
+            save_progress(output_dir, progress)
+            success += 1
+            logger.info(f"  [{study_id}] ✓  mean_lstv_prob={row['mean_lstv_prob']:.4f}  "
+                        f"mean_unc={row['mean_epistemic_unc']:.4f}")
+
+        except KeyboardInterrupt:
+            logger.warning("\n⚠ Interrupted — progress saved")
+            save_progress(output_dir, progress)
+            break
+        except Exception as e:
+            logger.error(f"  [{study_id}] ✗ {e}")
+            logger.debug(traceback.format_exc())
+            progress.setdefault('failed', []).append(study_id)
+            if study_id not in progress['processed']:
+                progress['processed'].append(study_id)
+            save_progress(output_dir, progress)
+            failed += 1
+
+    logger.info("\n" + "=" * 70)
+    logger.info("DONE")
+    logger.info(f"Success: {success}  |  Failed: {failed}")
+    logger.info(f"CSV:     {output_dir}/lstv_uncertainty_metrics.csv")
+    logger.info(f"Debug:   {debug_dir}/")
+    logger.info("=" * 70)
+    logger.info("\nNext steps:")
+    logger.info("  sbatch slurm_scripts/02b_spineps_selective.sh  # set TOP_N= env var")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    sys.exit(main())

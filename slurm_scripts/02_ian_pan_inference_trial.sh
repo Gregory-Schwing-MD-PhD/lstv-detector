@@ -121,7 +121,7 @@ singularity exec \
     --bind "$(dirname $SERIES_CSV):/data/raw" \
     --pwd /work \
     "$IMG_PATH" \
-    python /work/src/generate_report.py \
+    python /work/scripts/generate_report.py \
         --csv        /data/output/lstv_uncertainty_metrics.csv \
         --output     /data/output/report.html \
         --data_dir   /data/input \
