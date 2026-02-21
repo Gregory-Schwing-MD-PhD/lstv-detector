@@ -25,47 +25,59 @@ echo "Job ID: $SLURM_JOB_ID | GPU: $CUDA_VISIBLE_DEVICES"
 echo "Start: $(date)"
 echo "================================================================"
 
+nvidia-smi
+
+# --- Singularity temp setup (matches working trial script) ---
+export SINGULARITY_TMPDIR="/tmp/${USER}_job_${SLURM_JOB_ID}"
+export XDG_RUNTIME_DIR="$SINGULARITY_TMPDIR/runtime"
+export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
+mkdir -p "$SINGULARITY_TMPDIR" "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR"
+trap 'rm -rf "$SINGULARITY_TMPDIR"' EXIT
+
 # --- Environment ---
 export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
 export PATH="${CONDA_PREFIX}/bin:$PATH"
 unset JAVA_HOME
-which singularity || echo "WARNING: singularity not found"
-export XDG_RUNTIME_DIR="${HOME}/xdr"
-export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
-mkdir -p "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR"
+which singularity
 export NXF_SINGULARITY_HOME_MOUNT=true
 unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # --- Paths ---
 PROJECT_DIR="$(pwd)"
-INPUT_DIR="${PROJECT_DIR}/data/raw/train_images"
+DICOM_DIR="${PROJECT_DIR}/data/raw/train_images"
 SERIES_CSV="${PROJECT_DIR}/data/raw/train_series_descriptions.csv"
 OUTPUT_DIR="${PROJECT_DIR}/results/epistemic_uncertainty"
-MODEL_PATH="${PROJECT_DIR}/models/ian_pan_lstv.pth"
+MODELS_DIR="${PROJECT_DIR}/models"
 
 mkdir -p logs "$OUTPUT_DIR"
 
 # --- Preflight ---
-if [[ ! -f "$MODEL_PATH" ]]; then
-    echo "ERROR: Ian Pan model not found at $MODEL_PATH"
+if [[ ! -d "$DICOM_DIR" ]]; then
+    echo "ERROR: DICOM directory not found: $DICOM_DIR"
     exit 1
 fi
 
-if [[ ! -d "$INPUT_DIR" ]]; then
-    echo "ERROR: DICOM input dir not found: $INPUT_DIR"
+if [[ ! -f "${MODELS_DIR}/valid_id.npy" ]]; then
+    echo "ERROR: valid_id.npy not found at ${MODELS_DIR}/valid_id.npy"
     exit 1
 fi
 
-N_STUDIES=$(ls -d "${INPUT_DIR}"/*/ 2>/dev/null | wc -l)
-echo "Studies found in input dir: $N_STUDIES"
+if [[ ! -f "${MODELS_DIR}/point_net_checkpoint.pth" ]]; then
+    echo "ERROR: point_net_checkpoint.pth not found at ${MODELS_DIR}/point_net_checkpoint.pth"
+    exit 1
+fi
 
-# --- Container ---
-CONTAINER="docker://go2432/spineps-segmentation:latest"
-IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/spineps-segmentation.sif"
+N_STUDIES=$(ls -d "${DICOM_DIR}"/*/ 2>/dev/null | wc -l)
+echo "Studies found in DICOM dir: $N_STUDIES"
+
+# --- Container (same one that worked in trial) ---
+CONTAINER="docker://go2432/lstv-uncertainty:latest"
+IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/lstv-uncertainty.sif"
 if [[ ! -f "$IMG_PATH" ]]; then
     echo "Pulling container..."
     singularity pull "$IMG_PATH" "$CONTAINER"
 fi
+echo "Container ready: $IMG_PATH"
 
 # --- Args ---
 RETRY_ARG=""
@@ -73,29 +85,37 @@ if [[ "$RETRY_FAILED" == "true" ]]; then
     RETRY_ARG="--retry_failed"
 fi
 
+echo "================================================================"
+echo "Starting inference"
+echo "DICOM root: $DICOM_DIR"
+echo "Output:     $OUTPUT_DIR"
+echo "================================================================"
+
 # --- Run ---
 singularity exec --nv \
-    --bind "${PROJECT_DIR}":/work \
-    --bind "${INPUT_DIR}":/data/input \
-    --bind "${OUTPUT_DIR}":/data/output \
-    --bind "$(dirname $SERIES_CSV)":/data/raw \
-    --bind "${PROJECT_DIR}/models":/app/models \
-    --env PYTHONUNBUFFERED=1 \
+    --bind "${PROJECT_DIR}:/work" \
+    --bind "${DICOM_DIR}:/data/input" \
+    --bind "${OUTPUT_DIR}:/data/output" \
+    --bind "${MODELS_DIR}:/app/models" \
+    --bind "$(dirname $SERIES_CSV):/data/raw" \
     --pwd /work \
     "$IMG_PATH" \
     python /work/scripts/inference_dicom.py \
-        --input_dir   /data/input \
-        --series_csv  /data/raw/train_series_descriptions.csv \
-        --output_dir  /data/output \
-        --model_path  /app/models/ian_pan_lstv.pth \
-        --mode        "$MODE" \
-        --valid_ids   /app/models/valid_id.npy \
-        --n_mc_passes 20 \
+        --input_dir  /data/input \
+        --series_csv /data/raw/train_series_descriptions.csv \
+        --output_dir /data/output \
+        --checkpoint /app/models/point_net_checkpoint.pth \
+        --valid_ids  /app/models/valid_id.npy \
+        --mode       "$MODE" \
+        --trial_size "${TRIAL_SIZE:-3}" \
         $RETRY_ARG
 
 echo "================================================================"
 echo "Inference complete | End: $(date)"
 echo "Output: $OUTPUT_DIR"
 echo ""
-echo "Next: set TOP_N and run sbatch slurm_scripts/02b_spineps_selective.sh"
+echo "CSV:    ${OUTPUT_DIR}/lstv_uncertainty_metrics.csv"
+echo "Debug:  ${OUTPUT_DIR}/debug_visualizations/"
+echo ""
+echo "Next: TOP_N=10 sbatch slurm_scripts/02b_spineps_selective.sh"
 echo "================================================================"
