@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-06_visualize_3d_v2.py  —  Interactive 3D Spine Viewer (Morphometrics-JSON Edition)
+06_visualize_3d.py  —  Interactive 3D Spine Viewer (Morphometrics-JSON Edition)
 ===================================================================================
 Reads pre-computed morphometrics from 05_morphometrics.py JSON output.
 NO re-computation of measurements; this script only does:
@@ -8,6 +8,31 @@ NO re-computation of measurements; this script only does:
   2. Marching-cubes surface meshing
   3. 3D annotation placement (fixed: offset from volume, not at origin)
   4. HTML assembly
+
+STUDY SELECTION MODES
+---------------------
+  --study_id ID               single study
+  --all                       every study with SPINEPS segmentation
+  --rank_by morpho            rank by pathology burden score computed from
+                               --morphometrics_json  (preferred for pipeline use)
+  --rank_by <csv_column>      rank by a column in --uncertainty_csv
+                               (legacy mode — requires --uncertainty_csv + --top_n)
+
+  When using --rank_by morpho:
+    --top_n N           renders N most-pathologic studies  (default 5)
+    --top_normal N      renders N most-normal studies       (default 1)
+    --morphometrics_json PATH   required
+
+  Pathology scoring weights (see pathology_score.py):
+    Canal absolute stenosis +3 | relative +1
+    Cord severe MSCC +4 | moderate +3 | mild +1
+    DHI severe per level +2 | moderate +1
+    Spondylolisthesis per level +2
+    Vertebral wedge fracture +2 | intervention threshold +3
+    Baastrup contact +2 | risk +1
+    Facet tropism grade 2 +2 | grade 1 +1
+    LFT severe +2 | hypertrophy +1
+    Castellvi III/IV +2 | I/II +1
 
 KEY CHANGE from v1:
   All morphometric values come from --morphometrics_json (output of 05_morphometrics.py).
@@ -47,6 +72,8 @@ from morphometrics_engine import (
     LUMBAR_PAIRS, CANAL_SHAPE,
     load_study_masks, run_all_morphometrics,
 )
+
+from pathology_score import compute_pathology_score, select_studies_by_morpho
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -329,11 +356,6 @@ def castellvi_contact_traces(tp_L, tp_R, sac_iso, origin_mm,
     return traces
 
 def cord_compression_traces(cord_profile: Optional[dict], cord_iso, origin_mm):
-    """
-    Highlight flagged cord compression zones directly on the cord mesh.
-    Places coloured spheres at each flagged Z slice (offset so they don't
-    obscure the cord mesh — shifted +2mm in X).
-    """
     if cord_profile is None or not cord_iso.any(): return []
     traces = []
     slices = cord_profile.get('slices', [])
@@ -365,13 +387,8 @@ def build_metrics_panel_html(metrics: dict,
                               dist_L: float, dist_R: float,
                               castellvi: str, cls_L: str, cls_R: str,
                               tv_name: str,
-                              uncertainty_row: Optional[dict]) -> str:
-    """
-    Returns an HTML string for the right-side metrics panel.
-    Colour coding: green=ok, orange=warning, red=critical — matching the
-    existing header badges.
-    """
-
+                              uncertainty_row: Optional[dict],
+                              pathology_score: Optional[float] = None) -> str:
     def row(label: str, value: str, css_cls: str = 'ok') -> str:
         return (f'<div class="pr">'
                 f'<span class="pk">{label}</span>'
@@ -381,13 +398,14 @@ def build_metrics_panel_html(metrics: dict,
     def section(title: str) -> str:
         return f'<div class="ps">{title}</div>'
 
-    def val_cls(v, crit_fn, warn_fn=None) -> str:
-        if v is None: return 'pm'
-        if crit_fn(v): return 'cr'
-        if warn_fn and warn_fn(v): return 'wn'
-        return 'ok'
-
     lines = []
+
+    # ── Pathology burden score ─────────────────────────────────────────────────
+    if pathology_score is not None:
+        score_cls = ('cr' if pathology_score >= 8 else
+                     'wn' if pathology_score >= 3 else 'ok')
+        lines.append(section('Pathology Burden'))
+        lines.append(row('Score', f'{pathology_score:.0f}', score_cls))
 
     # ── LSTV ──────────────────────────────────────────────────────────────────
     lines.append(section('LSTV'))
@@ -537,13 +555,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
                     lstv_result: Optional[dict] = None,
                     morphometrics: Optional[dict] = None,
                     uncertainty_row: Optional[dict] = None):
-    """
-    Build interactive 3D figure for one study.
-
-    morphometrics: dict (pre-computed by 05_morphometrics.py) or None.
-                   If None, falls back to inline computation.
-    """
-    # ── Load masks for mesh generation ───────────────────────────────────────
     seg_dir    = spineps_dir / 'segmentations' / study_id
     spine_path = seg_dir / f"{study_id}_seg-spine_msk.nii.gz"
     vert_path  = seg_dir / f"{study_id}_seg-vert_msk.nii.gz"
@@ -571,7 +582,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
     vert_labels = set(np.unique(vert_iso).tolist())-{0}
     tss_labels  = (set(np.unique(tss_iso).tolist())-{0} if tss_iso is not None else set())
 
-    # ── Morphometrics: use pre-computed or fall back ──────────────────────────
     if morphometrics is None:
         logger.info(f"  [{study_id}] No pre-computed morphometrics — computing inline")
         from morphometrics_engine import MaskSet as _MS
@@ -585,13 +595,11 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
     else:
         metrics = morphometrics
 
-    # ── Origin ────────────────────────────────────────────────────────────────
     col_mask  = vert_iso > 0
     origin_mm = (_centroid(col_mask)
                  if col_mask.any()
                  else np.array(sp_iso.shape,float)/2.0*ISO_MM)
 
-    # ── Sacrum ────────────────────────────────────────────────────────────────
     if tss_iso is not None and (tss_iso==TSS_SACRUM).any():
         sac_iso = (tss_iso==TSS_SACRUM)
     elif (sp_iso==SP_SACRUM).any():
@@ -599,7 +607,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
     else:
         sac_iso = np.zeros(sp_iso.shape, bool)
 
-    # ── Transitional vertebra ─────────────────────────────────────────────────
     tv_label, tv_name = None, 'N/A'
     for cand in VERIDAH_LUMBAR_LABELS:
         if cand in vert_labels:
@@ -610,7 +617,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
         det_tv = lstv_result.get('details',{}).get('tv_name')
         if det_tv: tv_name = det_tv
 
-    # ── TP masks ──────────────────────────────────────────────────────────────
     tp_L_full = (sp_iso==SP_TP_L); tp_R_full = (sp_iso==SP_TP_R)
     if tv_label is not None:
         tv_zr = _z_range(vert_iso==tv_label)
@@ -629,17 +635,14 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
     span_L = _tp_h(tp_L); span_R = _tp_h(tp_R)
     dist_L = _min_dist(tp_L, sac_iso)[0]; dist_R = _min_dist(tp_R, sac_iso)[0]
 
-    # ── Castellvi from LSTV result ────────────────────────────────────────────
     castellvi = 'N/A'; cls_L = 'N/A'; cls_R = 'N/A'
     if lstv_result:
         castellvi = lstv_result.get('castellvi_type') or 'None'
         cls_L     = lstv_result.get('left',  {}).get('classification','N/A')
         cls_R     = lstv_result.get('right', {}).get('classification','N/A')
 
-    # ── Build traces ──────────────────────────────────────────────────────────
     traces = []
 
-    # 1. SPINEPS seg-spine_msk meshes
     for lbl, name, col, op, fh, max_sig in SPINE_LABELS:
         if lbl not in sp_labels: continue
         mask = (tp_L if lbl==SP_TP_L else tp_R if lbl==SP_TP_R else (sp_iso==lbl))
@@ -648,14 +651,12 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
         t = mask_to_mesh3d(mask, origin_mm, name, col, op, eff_sig, fh)
         if t: traces.append(t)
 
-    # 2. VERIDAH vertebrae
     all_vd = {**VERIDAH_CERVICAL, **VERIDAH_THORACIC, **VERIDAH_LUMBAR_MAP}
     for lbl,(name,col,op) in sorted(all_vd.items()):
         if lbl not in vert_labels: continue
         t = mask_to_mesh3d(vert_iso==lbl, origin_mm, name, col, op, smooth, True)
         if t: traces.append(t)
 
-    # 2b. VERIDAH IVD (100+X)
     for base, col in VERIDAH_IVD_COLOURS.items():
         ivd_lbl = VD_IVD_BASE+base
         if ivd_lbl not in vert_labels: continue
@@ -663,7 +664,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
         t = mask_to_mesh3d(vert_iso==ivd_lbl, origin_mm, name, col, 0.55, smooth, True)
         if t: traces.append(t)
 
-    # 2c. VERIDAH per-vertebra endplates (200+X)
     for base in VERIDAH_IVD_COLOURS:
         ep_lbl = VD_EP_BASE+base
         if ep_lbl not in vert_labels: continue
@@ -672,7 +672,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
                            VERIDAH_EP_COLOUR, 0.75, 0.6, False)
         if t: traces.append(t)
 
-    # 3. TotalSpineSeg meshes
     if show_tss and tss_iso is not None:
         for lbl, name, col, op in TSS_LABELS:
             if lbl not in tss_labels: continue
@@ -684,7 +683,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
     if not any(isinstance(tr, go.Mesh3d) for tr in traces):
         logger.error(f"[{study_id}] Zero meshes"); return None
 
-    # 4. 3D ruler annotations (attached to mesh)
     if tv_label is not None:
         traces += tv_plane_traces(vert_iso, tv_label, origin_mm, tv_name)
     traces += tp_height_ruler_traces(tp_L, origin_mm, '#ff3333', 'Left',  span_L)
@@ -694,7 +692,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
     traces += castellvi_contact_traces(tp_L,tp_R,sac_iso,origin_mm,
                                        cls_L,cls_R,dist_L,dist_R)
 
-    # 5. Cord compression sphere markers on cord mesh
     cord_iso = (sp_iso==SP_CORD) if SP_CORD in sp_labels else \
                ((tss_iso==TSS_CORD) if (tss_iso is not None and TSS_CORD in tss_labels)
                 else np.zeros(sp_iso.shape, bool))
@@ -702,7 +699,6 @@ def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
     if cord_iso.any():
         traces += cord_compression_traces(cp, cord_iso, origin_mm)
 
-    # ── Layout ────────────────────────────────────────────────────────────────
     ap_mm       = metrics.get('canal_ap_mm')
     ap_cls_name = metrics.get('canal_ap_class','N/A')
     trop        = metrics.get('facet_tropism_deg')
@@ -767,6 +763,7 @@ h1{{font-family:'Syne',sans-serif;font-size:.8rem;font-weight:700}}
 .bw{{background:#553300;color:#ffaa44;border:1px solid #ffaa44}}
 .be{{background:#330011;color:#ff4466;border:1px solid #ff4466}}
 .bc2{{background:#1a1a3a;color:#8888ff;border:1px solid #4444aa}}
+.bscore{{background:#1a1a3a;color:#ccccff;border:1px solid #5555cc;font-weight:700}}
 .tb{{display:flex;gap:5px;align-items:center;margin-left:auto}}
 .tb span{{font-size:.57rem;color:var(--mu);text-transform:uppercase}}
 button{{background:var(--bg);border:1px solid var(--bd);color:var(--tx);
@@ -777,18 +774,14 @@ button:hover{{background:var(--bd)}} button.on{{background:#3a86ff;border-color:
 .m{{display:flex;align-items:center;gap:3px;color:var(--mu)}}
 .v{{color:var(--tx);font-weight:600}} .ok{{color:#2dc653!important}}
 .wn{{color:#ff8800!important}} .cr{{color:#ff3333!important}}
-/* main body row — 3D viewer + right panel */
 .main-row{{display:flex;flex:1;min-height:0;overflow:hidden}}
-/* bottom legend strip */
 .lg{{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:3px 10px;
      border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.60rem}}
 .li{{display:flex;align-items:center;gap:3px;color:var(--mu)}}
 .sw{{width:9px;height:9px;border-radius:2px;flex-shrink:0}}
 .note{{font-size:.55rem;color:#444;margin-left:auto}}
-/* plotly container */
 #pl{{flex:1;min-width:0;min-height:0;overflow:hidden}}
 #pl .js-plotly-plot,#pl .plot-container{{height:100%!important}}
-/* ── RIGHT METRICS PANEL ── */
 #metrics-panel{{
   width:210px;flex-shrink:0;
   background:rgba(13,13,26,0.92);
@@ -801,7 +794,6 @@ button:hover{{background:var(--bd)}} button.on{{background:#3a86ff;border-color:
 #metrics-panel::-webkit-scrollbar{{width:4px}}
 #metrics-panel::-webkit-scrollbar-track{{background:var(--bg)}}
 #metrics-panel::-webkit-scrollbar-thumb{{background:#2a2a4a;border-radius:2px}}
-/* section header */
 .ps{{
   font-family:'Syne',sans-serif;font-size:.57rem;font-weight:700;
   color:#6666aa;text-transform:uppercase;letter-spacing:.06em;
@@ -809,7 +801,6 @@ button:hover{{background:var(--bd)}} button.on{{background:#3a86ff;border-color:
   border-top:1px solid #1a1a3a;
 }}
 .ps:first-child{{border-top:none;margin-top:0}}
-/* key/value row */
 .pr{{display:flex;justify-content:space-between;align-items:baseline;
      padding:1px 8px;gap:4px}}
 .pk{{color:#6666aa;white-space:nowrap;flex-shrink:0}}
@@ -827,6 +818,7 @@ button:hover{{background:var(--bd)}} button.on{{background:#3a86ff;border-color:
   <span class="b {cord_badge}">Cord:{cord_label}</span>
   <span class="b {ft_badge}">FT:{ft_label}</span>
   <span class="b {bstp_badge}">Baastrup:{bstp_label}</span>
+  <span class="b bscore">Score:{pathology_score}</span>
   {ian_badge}
   <div class="tb"><span>View</span>
     <button onclick="sv('oblique')"   id="b-oblique"   class="on">Oblique</button>
@@ -893,7 +885,8 @@ window.addEventListener('resize',()=>{{
 def save_html(fig, study_id: str, output_dir: Path,
               castellvi: str, tv_name: str, cls_L: str, cls_R: str,
               span_L: float, span_R: float, dist_L: float, dist_R: float,
-              metrics: dict, uncertainty_row: Optional[dict]) -> Path:
+              metrics: dict, uncertainty_row: Optional[dict],
+              pathology_score: Optional[float] = None) -> Path:
     from plotly.io import to_html
     plotly_div = to_html(fig, full_html=False, include_plotlyjs='cdn',
                          config=dict(responsive=True, displayModeBar=True,
@@ -924,7 +917,6 @@ def save_html(fig, study_id: str, output_dir: Path,
         if warn_fn and warn_fn(v): return 'wn'
         return 'ok'
 
-    # DHI summary row in the metric strip
     dhi_row = ''
     for _,_,up_n,lo_n in LUMBAR_PAIRS:
         d = metrics.get(f'{up_n}_{lo_n}_dhi_pct')
@@ -938,10 +930,11 @@ def save_html(fig, study_id: str, output_dir: Path,
         if not np.isnan(c):
             ian_badge = f'<span class="b bc2">Ian L5-S1:{c:.3f}</span>'
 
-    # Build the right-side HTML panel
+    score_disp = f'{pathology_score:.0f}' if pathology_score is not None else 'N/A'
+
     metrics_panel_html = build_metrics_panel_html(
         metrics, span_L, span_R, dist_L, dist_R,
-        castellvi, cls_L, cls_R, tv_name, uncertainty_row)
+        castellvi, cls_L, cls_R, tv_name, uncertainty_row, pathology_score)
 
     html = _HTML.format(
         study_id=study_id,
@@ -955,6 +948,7 @@ def save_html(fig, study_id: str, output_dir: Path,
                     'bw' if metrics.get('baastrup_risk') else 'bi'),
         bstp_label=('CONTACT' if metrics.get('baastrup_contact') else
                     'Risk' if metrics.get('baastrup_risk') else 'None'),
+        pathology_score=score_disp,
         ian_badge=ian_badge,
         span_L=_f(span_L), tpl_c=_hc(span_L),
         span_R=_f(span_R), tpr_c=_hc(span_R),
@@ -980,7 +974,8 @@ def save_html(fig, study_id: str, output_dir: Path,
 
 # ─── Study selection ──────────────────────────────────────────────────────────
 
-def select_studies(csv_path: Path, top_n: int, rank_by: str, valid_ids) -> list:
+def select_studies_legacy(csv_path: Path, top_n: int, rank_by: str, valid_ids) -> list:
+    """Original uncertainty-CSV-based selection (kept for backwards compatibility)."""
     df = pd.read_csv(csv_path)
     df['study_id'] = df['study_id'].astype(str)
     if valid_ids is not None: df = df[df['study_id'].isin(valid_ids)]
@@ -996,22 +991,56 @@ def select_studies(csv_path: Path, top_n: int, rank_by: str, valid_ids) -> list:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description='3D spine visualiser v2 (reads morphometrics JSON)')
+    ap = argparse.ArgumentParser(
+        description='3D spine visualiser — reads morphometrics JSON for selection + annotation',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Study selection modes:
+  --study_id ID               single study
+  --all                       all studies with SPINEPS segmentation
+  --rank_by morpho            rank by pathology burden score (requires --morphometrics_json)
+  --rank_by <csv_col>         rank by uncertainty CSV column (legacy, requires --uncertainty_csv)
+
+Morpho-mode examples:
+  # 5 most pathologic + 1 most normal (default)
+  --rank_by morpho --morphometrics_json results/morphometrics/morphometrics_all.json
+
+  # 10 most pathologic + 2 most normal
+  --rank_by morpho --top_n 10 --top_normal 2 --morphometrics_json ...
+
+  # Specific studies (ignores all selection flags)
+  --study_id 12345
+""")
     ap.add_argument('--spineps_dir',    required=True)
     ap.add_argument('--totalspine_dir', required=True)
     ap.add_argument('--output_dir',     required=True)
+
     grp = ap.add_mutually_exclusive_group()
-    grp.add_argument('--study_id', default=None)
-    grp.add_argument('--all',      action='store_true')
-    ap.add_argument('--uncertainty_csv', default=None)
-    ap.add_argument('--valid_ids',       default=None)
-    ap.add_argument('--top_n',  type=int, default=None)
-    ap.add_argument('--rank_by', default='l5_s1_confidence')
+    grp.add_argument('--study_id', default=None,
+        help='Single study ID to render')
+    grp.add_argument('--all', action='store_true',
+        help='Render every study with SPINEPS segmentation')
+
+    ap.add_argument('--rank_by', default='morpho',
+        help='morpho = pathology score from JSON; or a column name in --uncertainty_csv')
+    ap.add_argument('--top_n', type=int, default=5,
+        help='Number of most-pathologic studies (morpho mode) or top/bottom N (legacy mode)')
+    ap.add_argument('--top_normal', type=int, default=1,
+        help='Number of most-normal studies to render (morpho mode only)')
+
     ap.add_argument('--morphometrics_json', default=None,
-        help='Path to morphometrics_all.json from 05_morphometrics.py')
-    ap.add_argument('--lstv_json',  default=None)
-    ap.add_argument('--smooth', type=float, default=1.5)
-    ap.add_argument('--no_tss', action='store_true')
+        help='Path to morphometrics_all.json (required for --rank_by morpho)')
+    ap.add_argument('--lstv_json',  default=None,
+        help='Path to lstv_results.json for Castellvi annotation')
+    ap.add_argument('--uncertainty_csv', default=None,
+        help='Path to lstv_uncertainty_metrics.csv (legacy selection mode)')
+    ap.add_argument('--valid_ids', default=None,
+        help='Path to valid_id.npy (legacy selection mode)')
+
+    ap.add_argument('--smooth', type=float, default=1.5,
+        help='Gaussian smoothing sigma for marching cubes (default 1.5)')
+    ap.add_argument('--no_tss', action='store_true',
+        help='Skip TotalSpineSeg label rendering')
     args = ap.parse_args()
 
     spineps_dir    = Path(args.spineps_dir)
@@ -1020,26 +1049,30 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     seg_root = spineps_dir / 'segmentations'
 
-    # Load pre-computed morphometrics
+    # ── Load pre-computed morphometrics ───────────────────────────────────────
     morpho_by_id: Dict[str, dict] = {}
+    morpho_all: list = []
     if args.morphometrics_json:
         p = Path(args.morphometrics_json)
         if p.exists():
             with open(p) as f:
-                data = json.load(f)
-            morpho_by_id = {str(r.get('study_id','')): r for r in data
+                morpho_all = json.load(f)
+            morpho_by_id = {str(r.get('study_id','')): r for r in morpho_all
                             if not r.get('error')}
             logger.info(f"Loaded morphometrics for {len(morpho_by_id)} studies")
+        else:
+            logger.warning(f"morphometrics_json not found: {p}")
 
-    # Load LSTV results
+    # ── Load LSTV results ─────────────────────────────────────────────────────
     lstv_by_id: Dict[str, dict] = {}
     if args.lstv_json:
         p = Path(args.lstv_json)
         if p.exists():
             with open(p) as f:
                 lstv_by_id = {str(r['study_id']): r for r in json.load(f)}
+            logger.info(f"Loaded {len(lstv_by_id)} LSTV results")
 
-    # Load uncertainty
+    # ── Load uncertainty (legacy) ─────────────────────────────────────────────
     uncertainty_by_id: Dict[str, dict] = {}
     if args.uncertainty_csv:
         p = Path(args.uncertainty_csv)
@@ -1048,21 +1081,55 @@ def main():
             df['study_id'] = df['study_id'].astype(str)
             uncertainty_by_id = {r['study_id']:r for r in df.to_dict('records')}
 
-    # Study IDs
+    # ── Determine study IDs ───────────────────────────────────────────────────
+    score_by_id: Dict[str, float] = {}
+
     if args.study_id:
         study_ids = [args.study_id]
+        logger.info(f"Single-study mode: {args.study_id}")
+
     elif args.all:
         study_ids = sorted(d.name for d in seg_root.iterdir() if d.is_dir())
+        logger.info(f"ALL mode: {len(study_ids)} studies")
+
+    elif args.rank_by == 'morpho':
+        if not morpho_all:
+            ap.error("--rank_by morpho requires --morphometrics_json to be provided and non-empty")
+        pathologic_ids, normal_ids, score_by_id = select_studies_by_morpho(
+            morpho_all,
+            n_pathologic=args.top_n,
+            n_normal=args.top_normal,
+            lstv_by_id=lstv_by_id or None,
+        )
+        # Deduplicate: pathologic first, then normal (if not already included)
+        seen = set(pathologic_ids)
+        extra_normal = [s for s in normal_ids if s not in seen]
+        study_ids = pathologic_ids + extra_normal
+        # Filter to studies that actually have segmentation
+        study_ids = [s for s in study_ids if (seg_root/s).is_dir()]
+        logger.info(
+            f"Morpho selection: {len(pathologic_ids)} pathologic + "
+            f"{len(extra_normal)} normal = {len(study_ids)} studies")
+        if score_by_id:
+            logger.info("Pathology scores:")
+            for sid in study_ids:
+                s = score_by_id.get(sid, 0)
+                tag = '★ normal' if sid in normal_ids and sid not in pathologic_ids else ''
+                logger.info(f"  {sid}: {s:.0f}  {tag}")
+
     else:
+        # Legacy uncertainty-CSV mode
         if not args.uncertainty_csv or args.top_n is None:
-            ap.error("--uncertainty_csv + --top_n required unless --all/--study_id")
+            ap.error("--uncertainty_csv + --top_n required when --rank_by is not 'morpho'")
         valid_ids = None
         if args.valid_ids:
             valid_ids = set(str(x) for x in np.load(args.valid_ids))
-        study_ids = select_studies(Path(args.uncertainty_csv), args.top_n,
-                                   args.rank_by, valid_ids)
+        study_ids = select_studies_legacy(Path(args.uncertainty_csv), args.top_n,
+                                          args.rank_by, valid_ids)
         study_ids = [s for s in study_ids if (seg_root/s).is_dir()]
+        logger.info(f"Legacy selection: {len(study_ids)} studies by {args.rank_by}")
 
+    # ── Render ────────────────────────────────────────────────────────────────
     ok = 0
     for sid in study_ids:
         logger.info(f"\n[{sid}]")
@@ -1080,9 +1147,17 @@ def main():
             (fig, castellvi, tv_name, cls_L, cls_R,
              span_L, span_R, dist_L, dist_R, metrics) = out
 
+            pscore = score_by_id.get(sid)
+            if pscore is None and pre_morpho is not None:
+                # Compute on the fly if not already scored (e.g. single-study mode)
+                m = {**pre_morpho}
+                if sid in lstv_by_id:
+                    m['castellvi_type'] = lstv_by_id[sid].get('castellvi_type')
+                pscore = compute_pathology_score(m)
+
             save_html(fig, sid, output_dir, castellvi, tv_name, cls_L, cls_R,
                       span_L, span_R, dist_L, dist_R, metrics,
-                      uncertainty_by_id.get(sid))
+                      uncertainty_by_id.get(sid), pscore)
             ok += 1
         except Exception as e:
             logger.error(f"  [{sid}] Failed: {e}")

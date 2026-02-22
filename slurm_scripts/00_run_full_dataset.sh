@@ -16,31 +16,42 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 # LSTV FULL-DATASET PIPELINE — processes every study in valid_id.npy
 #
-# Step 0: Ian-Pan uncertainty inference   (GPU)
-# Step 1: DICOM → NIfTI conversion        (CPU)
-# Step 2: SPINEPS segmentation — ALL      (GPU, long)  ─┐ parallel
-# Step 3: TotalSpineSeg — ALL             (GPU, long)  ─┘ after NIfTI
-# Step 4: Morphometrics — ALL             (CPU)        after both GPU steps
-# Step 5: Dataset summary HTML report     (CPU, fast)  after morphometrics
+# Step 0: Ian-Pan uncertainty inference   (GPU)      [no dependencies]
+# Step 1: DICOM → NIfTI conversion        (CPU)      [no dependencies]
+# Step 2: SPINEPS segmentation — ALL      (GPU)      [after NIfTI]
+# Step 3: TotalSpineSeg — ALL             (GPU)      [after NIfTI, parallel with SPINEPS]
+# Step 4: LSTV detection — ALL            (CPU)      [after SPINEPS + TotalSpineSeg]
+# Step 5: Morphometrics — ALL             (CPU)      [after LSTV detection]
+# Step 6: 3D visualization — pathologic   (CPU)      [after morphometrics]  ─┐ parallel
+#          3D visualization — normal      (CPU)      [after morphometrics]  ─┘
+# Step 7: Dataset summary HTML report     (CPU)      [after morphometrics]
+#
+# 3D visualization targets:
+#   - Top N_VIZ_PATHOLOGIC most pathologic studies (ranked by pathology_burden)
+#   - Top 1 most normal study (ranked by normality_score)
 #
 # Skips studies that are already done at each stage (safe to re-run).
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+N_VIZ_PATHOLOGIC=5   # number of most-pathologic studies to render in 3D
+N_VIZ_NORMAL=1       # number of most-normal studies to render in 3D
+# Pathology score weights: canal stenosis, cord MSCC, DHI per level,
+# spondylolisthesis, vertebral wedge fracture, Baastrup, facet tropism,
+# LFT hypertrophy, Castellvi grade.  See scripts/pathology_score.py.
+# ─────────────────────────────────────────────────────────────────────────────
 
 echo "================================================================"
 echo "LSTV FULL-DATASET PIPELINE"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Start: $(date)"
+echo "3D viz: top $N_VIZ_PATHOLOGIC pathologic + $N_VIZ_NORMAL normal (by pathology burden score)"
 echo "================================================================"
 
 # --- Environment ---
 export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
 export PATH="${CONDA_PREFIX}/bin:$PATH"
 unset JAVA_HOME
-export XDG_RUNTIME_DIR="${HOME}/xdr"
-export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
-mkdir -p "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR"
-export NXF_SINGULARITY_HOME_MOUNT=true
-unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 PROJECT_DIR="$(pwd)"
 cd "$PROJECT_DIR"
@@ -72,8 +83,10 @@ echo "  Step 0: Ian-Pan inference (GPU, ~1-2h)         [no dependencies]"
 echo "  Step 1: DICOM → NIfTI (CPU, ~2-8h)             [no dependencies]"
 echo "  Step 2: SPINEPS — ALL $N_VALID studies (GPU)   [after NIfTI]"
 echo "  Step 3: TotalSpineSeg — ALL $N_VALID (GPU)     [after NIfTI, parallel with SPINEPS]"
-echo "  Step 4: Morphometrics — ALL $N_VALID (CPU)     [after SPINEPS + TotalSpineSeg]"
-echo "  Step 5: Dataset summary HTML report (CPU)       [after morphometrics]"
+echo "  Step 4: LSTV detection — ALL (CPU)              [after SPINEPS + TotalSpineSeg]"
+echo "  Step 5: Morphometrics — ALL $N_VALID (CPU)     [after LSTV detection]"
+echo "  Step 6: 3D viz — top $N_VIZ_PATHOLOGIC pathologic + $N_VIZ_NORMAL normal (CPU) [after morphometrics]"
+echo "  Step 7: Dataset summary HTML report (CPU)       [after morphometrics]"
 echo ""
 
 # ─── Step 0: Ian-Pan inference (no dependency — runs immediately) ─────────────
@@ -86,49 +99,7 @@ echo ""
 echo "Submitting: Step 1 — DICOM → NIfTI conversion"
 JOB1=$(sbatch --parsable \
     --job-name=dicom_nifti \
-    --time=8:00:00 \
-    --wrap="
-set -euo pipefail
-export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
-export PATH=\"\${CONDA_PREFIX}/bin:\$PATH\"
-unset JAVA_HOME
-export XDG_RUNTIME_DIR=\"\${HOME}/xdr\"
-export NXF_SINGULARITY_CACHEDIR=\"\${HOME}/singularity_cache\"
-mkdir -p \"\${XDG_RUNTIME_DIR}\" \"\${NXF_SINGULARITY_CACHEDIR}\"
-export NXF_SINGULARITY_HOME_MOUNT=true
-unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
-
-PROJECT_DIR=\"$(pwd)\"
-DATA_DIR=\"\${PROJECT_DIR}/data/raw/train_images\"
-SERIES_CSV=\"\${PROJECT_DIR}/data/raw/train_series_descriptions.csv\"
-OUTPUT_DIR=\"\${PROJECT_DIR}/results/nifti\"
-MODELS_DIR=\"\${PROJECT_DIR}/models\"
-mkdir -p logs \"\$OUTPUT_DIR\"
-
-IMG_PATH=\"\${NXF_SINGULARITY_CACHEDIR}/spineps-segmentation.sif\"
-if [[ ! -f \"\$IMG_PATH\" ]]; then
-    singularity pull \"\$IMG_PATH\" docker://go2432/spineps-segmentation:latest
-fi
-
-singularity exec \\
-    --bind \"\${PROJECT_DIR}:/work\" \\
-    --bind \"\${DATA_DIR}:/data/input\" \\
-    --bind \"\${OUTPUT_DIR}:/data/output\" \\
-    --bind \"\$(dirname \$SERIES_CSV):/data/raw\" \\
-    --bind \"\${MODELS_DIR}:/app/models\" \\
-    --env PYTHONUNBUFFERED=1 \\
-    --pwd /work \\
-    \"\$IMG_PATH\" \\
-    python /work/scripts/01_dicom_to_nifti.py \\
-        --input_dir  /data/input \\
-        --series_csv /data/raw/train_series_descriptions.csv \\
-        --output_dir /data/output \\
-        --valid_ids  /app/models/valid_id.npy \\
-        --mode prod
-" \
-    --output="logs/dicom_nifti_%j.out" \
-    --error="logs/dicom_nifti_%j.err" \
-    -q primary --cpus-per-task=4 --mem=16G)
+    slurm_scripts/01_dicom_to_nifti.sh)
 echo "  Job ID: $JOB1 (CPU, running in parallel with Ian-Pan)"
 
 # ─── Step 2: SPINEPS — ALL (depends on NIfTI) ────────────────────────────────
@@ -138,45 +109,8 @@ JOB2=$(sbatch --parsable \
     --job-name=spineps_all \
     --time=96:00:00 \
     --dependency=afterok:$JOB1 \
-    --wrap="
-set -euo pipefail
-export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
-export PATH=\"\${CONDA_PREFIX}/bin:\$PATH\"
-export XDG_RUNTIME_DIR=\"\${HOME}/xdr\"
-export NXF_SINGULARITY_CACHEDIR=\"\${HOME}/singularity_cache\"
-export NXF_SINGULARITY_HOME_MOUNT=true
-unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
-
-PROJECT_DIR=\"$(pwd)\"
-SPINEPS_PKG_MODELS=\"\${PROJECT_DIR}/models/spineps_pkg_models\"
-mkdir -p \"\$SPINEPS_PKG_MODELS\" logs
-
-IMG_PATH=\"\${NXF_SINGULARITY_CACHEDIR}/spineps-segmentation.sif\"
-if [[ ! -f \"\$IMG_PATH\" ]]; then
-    singularity pull \"\$IMG_PATH\" docker://go2432/spineps-segmentation:latest
-fi
-
-singularity exec --nv \\
-    --bind \"\${PROJECT_DIR}\":/work \\
-    --bind \"\${PROJECT_DIR}/results/nifti\":/work/results/nifti \\
-    --bind \"\${PROJECT_DIR}/results/spineps\":/work/results/spineps \\
-    --bind \"\${PROJECT_DIR}/models\":/app/models \\
-    --bind \"\${SPINEPS_PKG_MODELS}\":/opt/conda/lib/python3.10/site-packages/spineps/models \\
-    --env SPINEPS_SEGMENTOR_MODELS=/app/models \\
-    --env SPINEPS_ENVIRONMENT_DIR=/app/models \\
-    --env PYTHONUNBUFFERED=1 \\
-    --pwd /work \\
-    \"\$IMG_PATH\" \\
-    python /work/scripts/02b_spineps_selective.py \\
-        --nifti_dir    /work/results/nifti \\
-        --spineps_dir  /work/results/spineps \\
-        --series_csv   /work/data/raw/train_series_descriptions.csv \\
-        --valid_ids    /app/models/valid_id.npy \\
-        --all
-" \
-    --output="logs/spineps_all_%j.out" \
-    --error="logs/spineps_all_%j.err" \
-    -q gpu --gres=gpu:1 --cpus-per-task=4 --mem=32G)
+    --export=ALL,MODE=all \
+    slurm_scripts/02b_spineps_selective.sh)
 echo "  Job ID: $JOB2 (GPU, after NIfTI)"
 
 # ─── Step 3: TotalSpineSeg — ALL (depends on NIfTI, parallel with SPINEPS) ───
@@ -186,163 +120,66 @@ JOB3=$(sbatch --parsable \
     --job-name=tss_all \
     --time=96:00:00 \
     --dependency=afterok:$JOB1 \
-    --wrap="
-set -euo pipefail
-export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
-export PATH=\"\${CONDA_PREFIX}/bin:\$PATH\"
-export XDG_RUNTIME_DIR=\"\${HOME}/xdr\"
-export NXF_SINGULARITY_CACHEDIR=\"\${HOME}/singularity_cache\"
-export NXF_SINGULARITY_HOME_MOUNT=true
-unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
-
-PROJECT_DIR=\"$(pwd)\"
-SCRATCH_DIR=\"/wsu/tmp/\${USER}/tss_all_\${SLURM_JOB_ID}\"
-mkdir -p \"\$SCRATCH_DIR\" logs
-export SINGULARITY_TMPDIR=\"\$SCRATCH_DIR\"
-trap 'rm -rf \"\$SCRATCH_DIR\"' EXIT
-
-TOTALSPINESEG_MODELS=\"\${PROJECT_DIR}/models/totalspineseg_models\"
-NNUNET_TRAINER_DIR=\"\${PROJECT_DIR}/models/nnunetv2_trainer\"
-mkdir -p \"\$TOTALSPINESEG_MODELS\" \"\$NNUNET_TRAINER_DIR\"
-
-IMG_PATH=\"\${NXF_SINGULARITY_CACHEDIR}/totalspineseg.sif\"
-if [[ ! -f \"\$IMG_PATH\" ]]; then
-    singularity pull \"\$IMG_PATH\" docker://go2432/totalspineseg:latest
-fi
-
-if [[ -z \"\$(ls -A \$NNUNET_TRAINER_DIR 2>/dev/null)\" ]]; then
-    singularity exec \"\$IMG_PATH\" \\
-        cp -r /opt/conda/lib/python3.10/site-packages/nnunetv2/training/nnUNetTrainer/. \\
-        \"\$NNUNET_TRAINER_DIR/\"
-fi
-
-singularity exec --nv \\
-    --bind \"\${PROJECT_DIR}\":/work \\
-    --bind \"\${PROJECT_DIR}/results/nifti\":/work/results/nifti \\
-    --bind \"\${PROJECT_DIR}/results/totalspineseg\":/work/results/totalspineseg \\
-    --bind \"\${PROJECT_DIR}/models\":/app/models \\
-    --bind \"\${TOTALSPINESEG_MODELS}\":/app/totalspineseg_models \\
-    --bind \"\${NNUNET_TRAINER_DIR}\":/opt/conda/lib/python3.10/site-packages/nnunetv2/training/nnUNetTrainer \\
-    --env TOTALSPINESEG_DATA=/app/totalspineseg_models \\
-    --env PYTHONUNBUFFERED=1 \\
-    --pwd /work \\
-    \"\$IMG_PATH\" \\
-    python3 -u /work/scripts/03b_totalspineseg_selective.py \\
-        --nifti_dir   /work/results/nifti \\
-        --output_dir  /work/results/totalspineseg \\
-        --series_csv  /work/data/raw/train_series_descriptions.csv \\
-        --valid_ids   /app/models/valid_id.npy \\
-        --all
-" \
-    --output="logs/tss_all_%j.out" \
-    --error="logs/tss_all_%j.err" \
-    -q gpu --gres=gpu:1 --constraint=v100 --cpus-per-task=4 --mem=64G)
+    --export=ALL,MODE=all \
+    slurm_scripts/03b_totalspineseg_selective.sh)
 echo "  Job ID: $JOB3 (GPU, after NIfTI, parallel with SPINEPS)"
 
-# ─── Step 4: Morphometrics — ALL (depends on SPINEPS + TotalSpineSeg) ─────────
+# ─── Step 4: LSTV detection — ALL (depends on SPINEPS + TotalSpineSeg) ────────
 echo ""
-echo "Submitting: Step 4 — Morphometrics (ALL)"
+echo "Submitting: Step 4 — LSTV detection (ALL)"
 JOB4=$(sbatch --parsable \
-    --job-name=morpho_all \
-    --time=24:00:00 \
+    --job-name=lstv_detect_all \
+    --time=4:00:00 \
     --dependency=afterok:${JOB2}:${JOB3} \
-    --wrap="
-set -euo pipefail
-export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
-export PATH=\"\${CONDA_PREFIX}/bin:\$PATH\"
-export XDG_RUNTIME_DIR=\"\${HOME}/xdr\"
-export NXF_SINGULARITY_CACHEDIR=\"\${HOME}/singularity_cache\"
-export NXF_SINGULARITY_HOME_MOUNT=true
-unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
-
-PROJECT_DIR=\"$(pwd)\"
-mkdir -p logs results/morphometrics results/morphometrics/reports
-
-IMG_PATH=\"\${NXF_SINGULARITY_CACHEDIR}/spineps-preprocessing.sif\"
-if [[ ! -f \"\$IMG_PATH\" ]]; then
-    singularity pull \"\$IMG_PATH\" docker://go2432/spineps-preprocessing:latest
-fi
-
-EXTRA_ARGS=\"\"
-if [[ -f \"\${PROJECT_DIR}/results/lstv_detection/lstv_results.json\" ]]; then
-    EXTRA_ARGS=\"--lstv_json /work/results/lstv_detection/lstv_results.json\"
-fi
-
-singularity exec \\
-    --bind \"\${PROJECT_DIR}\":/work \\
-    --bind \"\${PROJECT_DIR}/models\":/app/models \\
-    --env PYTHONUNBUFFERED=1 \\
-    --pwd /work \\
-    \"\$IMG_PATH\" \\
-    python3 -u /work/scripts/05_morphometrics.py \\
-        --spineps_dir    /work/results/spineps \\
-        --totalspine_dir /work/results/totalspineseg \\
-        --output_dir     /work/results/morphometrics \\
-        --all \\
-        \$EXTRA_ARGS
-" \
-    --output="logs/morpho_all_%j.out" \
-    --error="logs/morpho_all_%j.err" \
-    -q primary --cpus-per-task=8 --mem=64G)
+    --export=ALL,ALL=true \
+    slurm_scripts/04_lstv_detection.sh)
 echo "  Job ID: $JOB4 (CPU, after SPINEPS + TotalSpineSeg)"
 
-# ─── Step 5: Dataset summary report (depends on morphometrics) ───────────────
+# ─── Step 5: Morphometrics — ALL (depends on LSTV detection) ──────────────────
+# LSTV results are fed in so reports get Castellvi annotations.
 echo ""
-echo "Submitting: Step 5 — Dataset summary HTML report"
+echo "Submitting: Step 5 — Morphometrics (ALL)"
 JOB5=$(sbatch --parsable \
+    --job-name=morpho_all \
+    --time=24:00:00 \
+    --dependency=afterok:${JOB4} \
+    --export=ALL,ALL=true \
+    slurm_scripts/05_morphometrics.sh)
+echo "  Job ID: $JOB5 (CPU, after LSTV detection)"
+
+# ─── Step 6: 3D visualization — pathologic + normal (depends on morphometrics) ─
+#
+# A single job using --rank_by morpho, which reads morphometrics_all.json and
+# computes a pathology burden score for every study, then renders:
+#   - top N_VIZ_PATHOLOGIC studies  (highest burden score)
+#   - top N_VIZ_NORMAL studies      (lowest burden score, score >= 0)
+#
+# The pathology score is a weighted sum across independent pathology domains
+# so the selected studies cover a range of pathology types rather than being
+# dominated by one extreme metric.  See scripts/pathology_score.py for weights.
+#
+# The morphometrics_all.json and lstv_results.json are passed so the renderer
+# annotates surfaces with Castellvi grade, measurement rulers, and the score.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "Submitting: Step 6 — 3D visualization (morpho-ranked: $N_VIZ_PATHOLOGIC pathologic + $N_VIZ_NORMAL normal)"
+JOB6=$(sbatch --parsable \
+    --job-name=viz3d_morpho \
+    --time=6:00:00 \
+    --dependency=afterok:${JOB5} \
+    --export=ALL,ALL=false,RANK_BY=morpho,TOP_N=${N_VIZ_PATHOLOGIC},TOP_NORMAL=${N_VIZ_NORMAL},SMOOTH=3,NO_TSS=false \
+    slurm_scripts/06_visualize_3d.sh)
+echo "  Job ID: $JOB6 (CPU, morpho-ranked selection)"
+
+# ─── Step 7: Dataset summary report (depends on morphometrics) ───────────────
+echo ""
+echo "Submitting: Step 7 — Dataset summary HTML report"
+JOB7=$(sbatch --parsable \
     --job-name=dataset_report \
     --time=1:00:00 \
-    --dependency=afterok:${JOB4} \
-    --wrap="
-set -euo pipefail
-export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
-export PATH=\"\${CONDA_PREFIX}/bin:\$PATH\"
-export XDG_RUNTIME_DIR=\"\${HOME}/xdr\"
-export NXF_SINGULARITY_CACHEDIR=\"\${HOME}/singularity_cache\"
-export NXF_SINGULARITY_HOME_MOUNT=true
-unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
-
-PROJECT_DIR=\"$(pwd)\"
-mkdir -p logs results
-
-IMG_PATH=\"\${NXF_SINGULARITY_CACHEDIR}/spineps-preprocessing.sif\"
-if [[ ! -f \"\$IMG_PATH\" ]]; then
-    singularity pull \"\$IMG_PATH\" docker://go2432/spineps-preprocessing:latest
-fi
-
-# LSTV summary report (if detection results exist)
-if [[ -f \"\${PROJECT_DIR}/results/lstv_detection/lstv_results.json\" ]]; then
-    echo 'Generating LSTV classification report...'
-    singularity exec \\
-        --bind \"\${PROJECT_DIR}\":/work \\
-        --env PYTHONUNBUFFERED=1 \\
-        --pwd /work \\
-        \"\$IMG_PATH\" \\
-        python3 -u /work/scripts/06_html_report.py \\
-            --lstv_json      /work/results/lstv_detection/lstv_results.json \\
-            --image_dir      /work/results/lstv_viz \\
-            --output_html    /work/results/lstv_report.html \\
-            --n_reps         3
-    echo 'LSTV report → results/lstv_report.html'
-fi
-
-# Dataset morphometrics summary report (always)
-singularity exec \\
-    --bind \"\${PROJECT_DIR}\":/work \\
-    --env PYTHONUNBUFFERED=1 \\
-    --pwd /work \\
-    \"\$IMG_PATH\" \\
-    python3 -u /work/scripts/06_html_report.py \\
-        --morphometrics_json /work/results/morphometrics/morphometrics_all.json \\
-        --output_html        /work/results/dataset_morphometrics_report.html \\
-        --morpho_only
-
-echo 'Morphometrics report → results/dataset_morphometrics_report.html'
-" \
-    --output="logs/dataset_report_%j.out" \
-    --error="logs/dataset_report_%j.err" \
-    -q primary --cpus-per-task=2 --mem=16G)
-echo "  Job ID: $JOB5 (CPU, after morphometrics)"
+    --dependency=afterok:${JOB5} \
+    slurm_scripts/06_html_report.sh)
+echo "  Job ID: $JOB7 (CPU, after morphometrics)"
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo ""
@@ -351,27 +188,42 @@ echo "ALL JOBS SUBMITTED"
 echo "================================================================"
 echo ""
 echo "Dependency chain:"
-echo "  $JOB0  Ian-Pan inference      (GPU)  ─── (informational, no blocking deps)"
-echo "  $JOB1  DICOM → NIfTI          (CPU)  ─── (runs immediately in parallel)"
-echo "    ├─→  $JOB2  SPINEPS ALL     (GPU)  ─── after NIfTI"
-echo "    └─→  $JOB3  TotalSpineSeg ALL (GPU) ─── after NIfTI"
+echo "  $JOB0  Ian-Pan inference        (GPU)  ─── (no blocking deps)"
+echo "  $JOB1  DICOM → NIfTI            (CPU)  ─── (runs immediately in parallel)"
+echo "    ├─→  $JOB2  SPINEPS ALL       (GPU)  ─── after NIfTI"
+echo "    └─→  $JOB3  TotalSpineSeg ALL (GPU)  ─── after NIfTI"
 echo "              ↓ (both GPU steps done)"
-echo "         $JOB4  Morphometrics ALL  (CPU)"
+echo "         $JOB4  LSTV Detection ALL (CPU)"
 echo "              ↓"
-echo "         $JOB5  Dataset report     (CPU)"
+echo "         $JOB5  Morphometrics ALL  (CPU)"
+echo "           ├──→ $JOB6   3D viz morpho-ranked (CPU, top $N_VIZ_PATHOLOGIC pathologic + $N_VIZ_NORMAL normal)"
+echo "           └──→ $JOB7   Dataset report    (CPU)"
 echo ""
 echo "Monitor:"
 echo "  squeue -u $USER"
 echo "  watch -n 60 squeue -u $USER"
 echo ""
+echo "Logs:"
+echo "  logs/lstv_full_dataset_${SLURM_JOB_ID}.out  ← this orchestrator"
+echo "  logs/dicom_nifti_${JOB1}.out"
+echo "  logs/spineps_all_${JOB2}.out"
+echo "  logs/totalspineseg_selective_${JOB3}.out"
+echo "  logs/lstv_detect_${JOB4}.out"
+echo "  logs/spine_morpho_${JOB5}.out"
+echo "  logs/lstv_3d_${JOB6}.out  ← morpho-ranked viz"
+echo "  logs/lstv_report_${JOB7}.out"
+echo ""
 echo "Expected runtime: 48-96h (depending on GPU queue)"
 echo ""
 echo "Final outputs:"
+echo "  results/lstv_detection/lstv_results.json"
 echo "  results/morphometrics/morphometrics_all.json"
 echo "  results/morphometrics/morphometrics_all.csv"
 echo "  results/morphometrics/morphometrics_summary.json"
-echo "  results/dataset_morphometrics_report.html  ← dataset summary"
-echo "  results/lstv_report.html                   ← LSTV classification (if available)"
+echo "  results/morphometrics/reports/*.html          ← per-study clinical reports"
+echo "  results/lstv_3d/                              ← 3D renders (pathologic + normal)"
+echo "  results/dataset_morphometrics_report.html     ← dataset summary"
+echo "  results/lstv_report.html                      ← LSTV classification"
 echo "================================================================"
 
 # ─── Wait and monitor ─────────────────────────────────────────────────────────
@@ -379,8 +231,8 @@ echo ""
 echo "Master job now monitoring progress..."
 echo ""
 
-ALL_JOBS=("$JOB0" "$JOB1" "$JOB2" "$JOB3" "$JOB4" "$JOB5")
-JOB_NAMES=("Ian-Pan" "DICOM-NIfTI" "SPINEPS-ALL" "TotalSpineSeg-ALL" "Morphometrics-ALL" "Dataset-Report")
+ALL_JOBS=("$JOB0" "$JOB1" "$JOB2" "$JOB3" "$JOB4" "$JOB5" "$JOB6" "$JOB7")
+JOB_NAMES=("Ian-Pan" "DICOM-NIfTI" "SPINEPS-ALL" "TotalSpineSeg-ALL" "LSTV-Detection" "Morphometrics-ALL" "3D-Viz-Morpho" "Dataset-Report")
 
 for i in "${!ALL_JOBS[@]}"; do
     job_id="${ALL_JOBS[$i]}"
@@ -411,6 +263,8 @@ echo "$(date)"
 echo "================================================================"
 echo ""
 echo "Key outputs:"
+echo "  results/lstv_detection/lstv_results.json"
 echo "  results/morphometrics/morphometrics_all.csv"
+echo "  results/lstv_3d/                    ← 3D renders"
 echo "  results/dataset_morphometrics_report.html"
-echo "  results/lstv_report.html  (if LSTV detection was run)"
+echo "  results/lstv_report.html"

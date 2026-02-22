@@ -14,13 +14,33 @@
 set -euo pipefail
 
 # ── Configuration — edit these to change behaviour ────────────────────────────
-STUDY_ID=""                # single study ID — leave empty to use ALL or TOP_N mode
-TOP_N=1                    # studies from each end — must match 02b + 03b + detect settings
-RANK_BY=l5_s1_confidence   # column to rank by — must match all upstream settings
-ALL=false                  # set to true to render every study with SPINEPS segmentation
-SMOOTH=3                   # Gaussian pre-smoothing sigma for marching cubes surfaces
-NO_TSS=false               # set to true to skip TotalSpineSeg label rendering
+STUDY_ID=""          # single study ID — leave empty to use ALL or RANK_BY mode
+RANK_BY=morpho       # "morpho"          → rank by pathology burden score from JSON
+                     # <csv_column>      → legacy: rank by uncertainty CSV column
+TOP_N=5              # most-pathologic studies to render (morpho mode)
+                     # OR top/bottom N by csv column (legacy mode)
+TOP_NORMAL=1         # most-normal studies to render (morpho mode only)
+ALL=false            # set to true to render every study with SPINEPS segmentation
+SMOOTH=3             # Gaussian pre-smoothing sigma for marching cubes surfaces
+NO_TSS=false         # set to true to skip TotalSpineSeg label rendering
 
+# ── Pathology burden scoring (RANK_BY=morpho) ─────────────────────────────────
+#
+# Weighted score computed per study from morphometrics_all.json:
+#   Canal absolute stenosis  +3  |  relative  +1
+#   Cord severe MSCC         +4  |  moderate  +3  |  mild  +1
+#   DHI severe (<50%)        +2/level  |  moderate (<70%)  +1/level
+#   Spondylolisthesis        +2/level (≥3mm translation)
+#   Vertebral wedge fracture +2/level (Ha/Hp <0.80), +3 if <0.75
+#   Baastrup contact         +2  |  risk zone  +1
+#   Facet tropism grade 2    +2  |  grade 1    +1
+#   LFT hypertrophy severe   +2  |  hypertrophy  +1
+#   Castellvi III/IV         +2  |  I/II         +1
+#
+# Studies are sorted descending → top TOP_N = most pathologic
+# Studies are sorted ascending  → top TOP_NORMAL = most normal (score ≥ 0)
+# See scripts/pathology_score.py for full implementation.
+#
 # ── Mask sources used in morphometrics ───────────────────────────────────────
 #
 # SPINEPS seg-spine_msk (ALL 14 labels rendered + used in morphometrics):
@@ -42,80 +62,13 @@ NO_TSS=false               # set to true to skip TotalSpineSeg label rendering
 #   1=cord  2=canal  (preferred over SPINEPS for canal AP/DSCA — full spine coverage)
 #   11-17=C1-C7    21-32=T1-T12    41-45=L1-L5    50=sacrum
 #   63-100=all discs (used for per-level canal AP sampling at disc midpoints)
-#   ⚠  TSS 26=vertebrae_T6  (NOT sacrum — different file from SPINEPS)
-#   ⚠  TSS 41-45=vertebra bodies  ≠  SPINEPS 41-48=sub-region structures
-#
-
-# ── Morphometric thresholds reference (informational — not editable here) ─────
-#
-# VERTEBRAL BODY (Genant/QM):
-#   Compression Hm/Ha or Hm/Hp < 0.80 → biconcave fracture
-#   Wedge       Ha/Hp              < 0.80 → anterior wedge fracture
-#   Crush       Hp/Ha              < 0.80 → posterior height loss
-#   Intervention threshold         < 0.75 → moderate/severe fracture
-#
-# DISC HEIGHT INDEX (DHI, Farfan method):
-#   DHI = (Ha+Hp)/(Ds+Di) × 100
-#   < 50% → Severe (Pfirrmann V equivalent, intervention threshold)
-#   < 70% → Moderate
-#   < 85% → Mild
-#
-# CENTRAL CANAL STENOSIS:
-#   DSCA: Normal >100mm²  Relative 75-100mm²  Absolute <70-75mm²
-#   AP:   Normal >12mm    Relative 10-12mm    Absolute <7-10mm
-#   Critical threshold (Indian population): 11.13mm
-#
-# LATERAL RECESS:
-#   LRD (Lateral Recess Depth) ≤ 3mm → stenosis
-#   Lateral Recess Height      ≤ 2mm → stenosis
-#
-# NEURAL FORAMINAL (Lee grade):
-#   Grade 0=Normal  Grade 1=Mild  Grade 2=Moderate  Grade 3=Severe (intervention)
-#   Volume norms: L1/L2~580mm³  L2/L3~700mm³  L3/L4~770mm³
-#                 L4/L5~800mm³  L5/S1~824mm³
-#
-# LIGAMENTUM FLAVUM:
-#   Normal LFT baseline:    3.5mm at L4-L5
-#   Hypertrophy threshold:  ≥ 4.0mm (varies by study)
-#   Significant encroachment: > 5mm
-#   LFA optimal canal stenosis predictor cutoff: 105.90mm²
-#
-# BAASTRUP DISEASE (Kissing Spine):
-#   Inter-spinous gap ≤ 0mm → contact (sclerosis/bursitis risk)
-#   Inter-spinous gap ≤ 2mm → Baastrup risk zone
-#   Incidence in symptomatic >80 yrs: 81%
-#
-# FACET TROPISM (Ko et al. grade):
-#   Grade 0: ≤ 7°    (normal asymmetry)
-#   Grade 1: 7–10°   (moderate — disc prolapse risk)
-#   Grade 2: ≥ 10°   (severe — spondylolisthesis risk)
-#   Literature thresholds vary: 7°, 8°, 10°
-#
-# SPONDYLOLISTHESIS:
-#   Sagittal translation ≥ 3mm → degenerative spondylolisthesis
-#   Normal: < 2–4mm
-#
-# CORD METRICS (cervical / thoracic):
-#   MSCC proxy: Cord AP / Canal AP  (normalized compression index)
-#   CSA: cord cross-sectional area in mm²
-#   K-line negative: anterior contact → surgical planning indicator
-#
-# PFIRRMANN GRADING (IVD, T2-weighted):
-#   Grade I   = Clear nucleus/annulus, hyperintense, normal height
-#   Grade III = Unclear distinction, intermediate signal
-#   Grade V   = Lost distinction, hypointense (black), collapsed
-#
-# MODIC CHANGE BURDEN (MCG / Modic-Udby):
-#   Grade A (Minor): < 25% vertebral body height/volume
-#   Grade B (Major): 25–50%
-#   Grade C (High):  > 50% — strongest disability predictor
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "================================================================"
 echo "LSTV 3D VISUALIZER + COMPREHENSIVE MORPHOMETRICS"
-echo "STUDY_ID=${STUDY_ID:-<selective/all>}  TOP_N=$TOP_N  RANK_BY=$RANK_BY"
-echo "ALL=$ALL  SMOOTH=$SMOOTH  NO_TSS=$NO_TSS"
+echo "STUDY_ID=${STUDY_ID:-<batch>}  RANK_BY=$RANK_BY  ALL=$ALL"
+echo "TOP_N=$TOP_N  TOP_NORMAL=$TOP_NORMAL  SMOOTH=$SMOOTH  NO_TSS=$NO_TSS"
 echo ""
 echo "Morphometrics: Vertebral QM · DHI · DSCA · Canal shape · LF ·"
 echo "               Spondylolisthesis · Baastrup · Facet tropism ·"
@@ -154,6 +107,13 @@ if [[ ! -d "${PROJECT_DIR}/results/totalspineseg" ]]; then
     exit 1
 fi
 
+if [[ "$RANK_BY" == "morpho" && ! -f "$MORPHO_JSON" ]]; then
+    echo "ERROR: RANK_BY=morpho requires morphometrics_all.json at:"
+    echo "  $MORPHO_JSON"
+    echo "Run 05_morphometrics.sh first"
+    exit 1
+fi
+
 # --- Container ---
 CONTAINER="docker://go2432/spineps-preprocessing:latest"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/spineps-preprocessing.sif"
@@ -173,11 +133,20 @@ elif [[ "$ALL" == "true" ]]; then
     SELECTION_ARGS+=( "--all" )
     echo "ALL mode: rendering every study with SPINEPS segmentations"
 
+elif [[ "$RANK_BY" == "morpho" ]]; then
+    SELECTION_ARGS+=(
+        "--rank_by"   "morpho"
+        "--top_n"     "$TOP_N"
+        "--top_normal" "$TOP_NORMAL"
+    )
+    echo "Morpho mode: top $TOP_N pathologic + $TOP_NORMAL normal (by pathology burden score)"
+    echo "Pathology score source: $MORPHO_JSON"
+
 else
-    # Selective mode — mirrors 05_visualize_lstv.sh exactly
+    # Legacy uncertainty-CSV mode
     if [[ ! -f "$UNCERTAINTY_CSV" ]]; then
         echo "ERROR: Uncertainty CSV not found: $UNCERTAINTY_CSV"
-        echo "Run 00_ian_pan_inference.sh first, or set ALL=true or STUDY_ID"
+        echo "Run 00_ian_pan_inference.sh first, or set RANK_BY=morpho"
         exit 1
     fi
     if [[ ! -f "${MODELS_DIR}/valid_id.npy" ]]; then
@@ -185,12 +154,12 @@ else
         exit 1
     fi
     SELECTION_ARGS+=(
-        "--uncertainty_csv" "/work/results/epistemic_uncertainty/lstv_uncertainty_metrics.csv"
-        "--valid_ids"       "/app/models/valid_id.npy"
-        "--top_n"           "$TOP_N"
-        "--rank_by"         "$RANK_BY"
+        "--rank_by"          "$RANK_BY"
+        "--top_n"            "$TOP_N"
+        "--uncertainty_csv"  "/work/results/epistemic_uncertainty/lstv_uncertainty_metrics.csv"
+        "--valid_ids"        "/app/models/valid_id.npy"
     )
-    echo "Selective mode: top/bottom $TOP_N by $RANK_BY"
+    echo "Legacy mode: top/bottom $TOP_N by $RANK_BY"
 fi
 
 # --- Optional rendering flags ---
@@ -202,18 +171,18 @@ fi
 # --- Morphometrics JSON ---
 if [[ -f "$MORPHO_JSON" ]]; then
     SELECTION_ARGS+=( "--morphometrics_json" "/work/results/morphometrics/morphometrics_all.json" )
-    echo "Pre-computed morphometrics found — loading from JSON."
+    echo "Pre-computed morphometrics found — loading from JSON"
 else
-    echo "WARNING: morphometrics_all.json not found. Computations will be done inline."
+    echo "WARNING: morphometrics_all.json not found — computations will be done inline"
 fi
 
 # --- Annotation from detection results ---
 if [[ -f "$LSTV_JSON" ]]; then
     SELECTION_ARGS+=( "--lstv_json" "/work/results/lstv_detection/lstv_results.json" )
-    echo "Detection results found — 3D measurements + Castellvi annotations enabled."
+    echo "Detection results found — Castellvi annotations + burden scoring enabled"
 else
-    echo "WARNING: lstv_results.json not found — run 04_lstv_detection.sh first."
-    echo "         3D measurement rulers will still be drawn from seg-spine_msk."
+    echo "WARNING: lstv_results.json not found — run 04_lstv_detection.sh first"
+    echo "         3D measurement rulers will still be drawn from seg-spine_msk"
 fi
 
 # --- Bind models dir only when valid_ids is needed ---
@@ -236,18 +205,10 @@ singularity exec \
         "${SELECTION_ARGS[@]}"
 
 echo "================================================================"
-echo "3D visualization + morphometric analysis complete"
-echo "HTMLs      → results/lstv_3d/"
+echo "3D visualization complete"
+echo "HTMLs → results/lstv_3d/"
 echo ""
-echo "Morphometric parameters computed per study:"
-echo "  Vertebral: Ha/Hm/Hp heights, Compression/Wedge/Crush ratios, Genant grade"
-echo "  Disc:      DHI (Farfan + Method 2), Pfirrmann reference thresholds"
-echo "  Canal:     AP diameter, DSCA (mm²), stenosis classification"
-echo "  Cord:      CSA (mm²), MSCC proxy, canal occupation ratio"
-echo "  LF:        LFT proxy, hypertrophy classification, LFA reference"
-echo "  Baastrup:  inter-spinous gaps, contact detection"
-echo "  Facet:     tropism angle, Ko grade (0/1/2)"
-echo "  Foramen:   elliptical cylinder volume, normative % comparison, Lee equivalent"
-echo "  Spondy:    sagittal translation per level vs 3mm threshold"
+echo "Each HTML includes a pathology burden score badge and right-side"
+echo "metrics panel with all flagged thresholds colour-coded."
 echo "End: $(date)"
 echo "================================================================"

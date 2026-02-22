@@ -14,15 +14,17 @@
 
 set -euo pipefail
 
-# ── Configuration — edit these two lines to change behaviour ─────────────────
-TOP_N=1                   # studies from each end (top 1 highest + bottom 1 lowest)
-RANK_BY=l5_s1_confidence  # column in lstv_uncertainty_metrics.csv to rank by
+# ── Configuration ─────────────────────────────────────────────────────────────
+# Set MODE to "all" to process every valid study, or "selective" for top/bottom N
+MODE=all                   # "all" or "selective"
+TOP_N=30                   # used only when MODE=selective
+RANK_BY=l5_s1_confidence   # used only when MODE=selective
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "================================================================"
-echo "TOTALSPINESEG SELECTIVE SEGMENTATION"
-echo "Top/Bottom N: $TOP_N"
-echo "Rank by:      $RANK_BY"
+echo "TOTALSPINESEG SEGMENTATION"
+echo "Mode:         $MODE"
+[[ "$MODE" == "selective" ]] && echo "Top/Bottom N: $TOP_N  |  Rank by: $RANK_BY"
 echo "Job ID:       $SLURM_JOB_ID | GPU: $CUDA_VISIBLE_DEVICES"
 echo "Start:        $(date)"
 echo "================================================================"
@@ -55,10 +57,14 @@ MODELS_DIR="${PROJECT_DIR}/models"
 TOTALSPINESEG_MODELS="${PROJECT_DIR}/models/totalspineseg_models"
 NNUNET_TRAINER_DIR="${PROJECT_DIR}/models/nnunetv2_trainer"
 
-mkdir -p logs "$OUTPUT_DIR" "$TOTALSPINESEG_MODELS" "$NNUNET_TRAINER_DIR"
+# Create ALL bind-mount targets before singularity exec (critical!)
+mkdir -p logs \
+         "$OUTPUT_DIR" \
+         "$TOTALSPINESEG_MODELS" \
+         "$NNUNET_TRAINER_DIR"
 
 # --- Preflight ---
-if [[ ! -f "$UNCERTAINTY_CSV" ]]; then
+if [[ "$MODE" == "selective" && ! -f "$UNCERTAINTY_CSV" ]]; then
     echo "ERROR: Uncertainty CSV not found: $UNCERTAINTY_CSV"
     echo "Run sbatch slurm_scripts/00_ian_pan_inference.sh first"
     exit 1
@@ -68,8 +74,6 @@ if [[ ! -f "${MODELS_DIR}/valid_id.npy" ]]; then
     echo "ERROR: valid_id.npy not found at ${MODELS_DIR}/valid_id.npy"
     exit 1
 fi
-
-echo "Studies in uncertainty CSV: $(( $(wc -l < "$UNCERTAINTY_CSV") - 1 ))"
 
 # --- Container ---
 CONTAINER="docker://go2432/totalspineseg:latest"
@@ -88,6 +92,27 @@ if [[ -z "$(ls -A $NNUNET_TRAINER_DIR 2>/dev/null)" ]]; then
     echo "Extracted $(ls $NNUNET_TRAINER_DIR | wc -l) files"
 fi
 
+# --- Build python args ---
+if [[ "$MODE" == "all" ]]; then
+    PYTHON_ARGS=(
+        --nifti_dir   /work/results/nifti
+        --output_dir  /work/results/totalspineseg
+        --series_csv  /work/data/raw/train_series_descriptions.csv
+        --valid_ids   /app/models/valid_id.npy
+        --all
+    )
+else
+    PYTHON_ARGS=(
+        --uncertainty_csv /work/results/epistemic_uncertainty/lstv_uncertainty_metrics.csv
+        --nifti_dir       /work/results/nifti
+        --output_dir      /work/results/totalspineseg
+        --series_csv      /work/data/raw/train_series_descriptions.csv
+        --valid_ids       /app/models/valid_id.npy
+        --top_n           "$TOP_N"
+        --rank_by         "$RANK_BY"
+    )
+fi
+
 # --- Run ---
 singularity exec --nv \
     --bind "${PROJECT_DIR}":/work \
@@ -100,18 +125,10 @@ singularity exec --nv \
     --env PYTHONUNBUFFERED=1 \
     --pwd /work \
     "$IMG_PATH" \
-    python3 -u /work/scripts/03b_totalspineseg_selective.py \
-        --uncertainty_csv /work/results/epistemic_uncertainty/lstv_uncertainty_metrics.csv \
-        --nifti_dir       /work/results/nifti \
-        --output_dir      /work/results/totalspineseg \
-        --series_csv      /work/data/raw/train_series_descriptions.csv \
-        --valid_ids       /app/models/valid_id.npy \
-        --top_n           "$TOP_N" \
-        --rank_by         "$RANK_BY"
+    python3 -u /work/scripts/03b_totalspineseg_selective.py "${PYTHON_ARGS[@]}"
 
 echo "================================================================"
-echo "Selective TotalSpineSeg complete | End: $(date)"
-echo "To segment more: edit TOP_N in this script and resubmit."
+echo "TotalSpineSeg complete | End: $(date)"
 echo "Already-done studies are skipped automatically."
 echo "================================================================"
 
