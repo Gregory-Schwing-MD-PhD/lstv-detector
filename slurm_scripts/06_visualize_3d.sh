@@ -18,15 +18,14 @@ STUDY_ID=""                # single study ID — leave empty to use ALL or TOP_N
 TOP_N=1                    # studies from each end — must match 02b + 03b + detect settings
 RANK_BY=l5_s1_confidence   # column to rank by — must match all upstream settings
 ALL=false                  # set to true to render every study with SPINEPS segmentation
-STEP=1                     # marching cubes subsampling step (1=full res, slower; 3=faster)
-SMOOTH=3                 # Gaussian pre-smoothing sigma for marching cubes surfaces
+SMOOTH=3                   # Gaussian pre-smoothing sigma for marching cubes surfaces
 NO_TSS=false               # set to true to skip TotalSpineSeg label rendering
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "================================================================"
 echo "LSTV 3D VISUALIZER (All Labels + 3D Measurements)"
 echo "STUDY_ID=${STUDY_ID:-<selective/all>}  TOP_N=$TOP_N  RANK_BY=$RANK_BY"
-echo "ALL=$ALL  STEP=$STEP  SMOOTH=$SMOOTH  NO_TSS=$NO_TSS"
+echo "ALL=$ALL  SMOOTH=$SMOOTH  NO_TSS=$NO_TSS"
 echo "Job: $SLURM_JOB_ID  |  Start: $(date)"
 echo "================================================================"
 
@@ -130,7 +129,6 @@ singularity exec \
         --spineps_dir    /work/results/spineps \
         --totalspine_dir /work/results/totalspineseg \
         --output_dir     /work/results/lstv_3d \
-        --step           "$STEP" \
         --smooth         "$SMOOTH" \
         "${SELECTION_ARGS[@]}"
 
