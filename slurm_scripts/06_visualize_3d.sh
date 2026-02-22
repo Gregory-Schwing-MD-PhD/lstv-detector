@@ -22,11 +22,43 @@ SMOOTH=3                   # Gaussian pre-smoothing sigma for marching cubes sur
 NO_TSS=false               # set to true to skip TotalSpineSeg label rendering
 
 # ── Morphometric output flags ─────────────────────────────────────────────────
-# Save all computed morphometrics (DHI, canal stenosis, facet tropism, vertebral
-# height ratios, spondylolisthesis, ligamentum flavum, Baastrup, foraminal volume,
-# cord CSA/MSCC) to a single CSV file at results/lstv_3d/morphometrics_all_studies.csv
-# This CSV can be used for downstream statistical analysis or ML feature extraction.
+# Save all computed morphometrics to results/lstv_3d/morphometrics_all_studies.csv
+# Computed parameters include:
+#   - DHI (Farfan method) + endplate-to-endplate distance per level
+#   - Canal AP + DSCA global and per-level (from TSS disc midpoints)
+#   - Vertebral height ratios Ha/Hm/Hp (using corpus_border mask when available)
+#   - Spondylolisthesis sagittal translation per level
+#   - Ligamentum flavum thickness proxy (arcus→canal distance)
+#   - Baastrup disease (spinous process gap)
+#   - Facet tropism Ko grade (sup articular PCA orientation)
+#   - Foraminal volume proxy (elliptical cylinder, Lee grade)
+#   - Spinal cord CSA + MSCC proxy
 SAVE_MORPHOMETRICS_CSV=true
+
+# ── Mask sources used in morphometrics ───────────────────────────────────────
+#
+# SPINEPS seg-spine_msk (ALL 14 labels rendered + used in morphometrics):
+#   26  Sacrum             41  Arcus_Vertebrae       42  Spinosus_Process
+#   43  Costal_Process_L   44  Costal_Process_R      45  Superior_Articular_L
+#   46  Superior_Articular_R  47  Inferior_Articular_L  48  Inferior_Articular_R
+#   49  Vertebra_Corpus_border  ← used for accurate Ha/Hm/Hp vertebral heights
+#   60  Spinal_Cord        61  Spinal_Canal
+#   62  Endplate (all merged) ← rendered + used as ep-ep DHI fallback (coral #ff6b6b)
+#   100 Vertebra_Disc (all merged)
+#
+# VERIDAH seg-vert_msk (fully used):
+#   1-25  per-vertebra labels (C1-L6)
+#   100+X IVD below vertebra X      ← primary disc source for per-level DHI
+#   200+X Endplate of vertebra X    ← primary source for ep-to-ep distance (pink #ff8888)
+#   If 200+X absent, falls back to SPINEPS label 62 sliced to level Z-range
+#
+# TotalSpineSeg step2_output (ALL 50 labels rendered):
+#   1=cord  2=canal  (preferred over SPINEPS for canal AP/DSCA — full spine coverage)
+#   11-17=C1-C7    21-32=T1-T12    41-45=L1-L5    50=sacrum
+#   63-100=all discs (used for per-level canal AP sampling at disc midpoints)
+#   ⚠  TSS 26=vertebrae_T6  (NOT sacrum — different file from SPINEPS)
+#   ⚠  TSS 41-45=vertebra bodies  ≠  SPINEPS 41-48=sub-region structures
+#
 
 # ── Morphometric thresholds reference (informational — not editable here) ─────
 #

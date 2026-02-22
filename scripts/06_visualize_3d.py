@@ -9,19 +9,32 @@ ISOTROPIC-FIRST ARCHITECTURE
   under step-subsampling; marching cubes finds no isosurface.
   After zoom to 1mm³ those same slices become ~5 solid voxels → MC works.
 
-SPINEPS seg-spine_msk labels (from README + live logs):
-  26=Sacrum  41=Arcus  42=Spinous  43=TP-Left  44=TP-Right
-  45=SupArt-L  46=SupArt-R  47=InfArt-L  48=InfArt-R
-  49=CorpusBorder  60=Cord  61=Canal  62=Endplate  100=Disc(all)
+SPINEPS seg-spine_msk labels (from README):
+  26=Sacrum  41=Arcus_Vertebrae  42=Spinosus_Process
+  43=Costal_Process_Left  44=Costal_Process_Right
+  45=Superior_Articular_Left   46=Superior_Articular_Right
+  47=Inferior_Articular_Left   48=Inferior_Articular_Right
+  49=Vertebra_Corpus_border    60=Spinal_Cord  61=Spinal_Canal
+  62=Endplate (all vertebrae merged, single label)
+  100=Vertebra_Disc (all discs merged, single label)
+  NOTE: label 43/44 are COSTAL (transverse) processes, not generic TPs.
 
-VERIDAH seg-vert_msk labels:
+VERIDAH seg-vert_msk labels (from README):
   1-7=C1-C7  8-19=T1-T12  28=T13  20=L1  21-25=L2-L6  26=Sacrum
-  100+X=IVD below X   200+X=Endplate of X
+  100+X = IVD below vertebra X    (e.g. 120 = IVD below T12=19)
+  200+X = Endplate of vertebra X  (e.g. 220 = endplate of L1=20)
+  → Per-vertebra endplates (200+X) are used for endplate-to-endplate DHI.
 
-TotalSpineSeg sagittal labels (from README + live logs):
-  1=cord  2=canal  31=T11  32=T12  41=L1..45=L5  50=sacrum
-  82=disc_T11-T12  91=disc_T12-L1  92-95=disc_L1-L4_L5  100=disc_L5-S
-  ⚠  TSS 43=L3 vertebra body  44=L4 vertebra body  (different from SPINEPS!)
+TotalSpineSeg step2_output labels (from README / tss_map.json):
+  1=spinal_cord   2=spinal_canal
+  11-17=C1-C7     21-32=T1-T12    41-45=L1-L5    50=sacrum
+  63-67=disc_C2_C3..C6_C7   71=disc_C7_T1
+  72-82=disc_T1_T2..T11_T12
+  91=disc_T12_L1  92-95=disc_L1_L2..L4_L5  100=disc_L5_S
+  ⚠  TSS 26=vertebrae_T6  (SPINEPS 26=Sacrum — DIFFERENT files, no conflict)
+  ⚠  TSS 41-45=L1-L5 bodies  ≠  SPINEPS 41-48=sub-region structures
+  NOTE: TSS cord/canal are preferred over SPINEPS for morphometrics because
+        TSS covers the full spine while SPINEPS may truncate at L5/S1.
 
 MORPHOMETRICS IMPLEMENTED (from Spine_Morphometrics__Beyond_Basic_Measurements.pdf):
 ─────────────────────────────────────────────────────────────────────────────────
@@ -137,21 +150,26 @@ logger = logging.getLogger(__name__)
 
 # ── Label maps ────────────────────────────────────────────────────────────────
 
-SPINE_MASK_LABELS = [                              # (lbl, name, colour, op, fill)
-    ( 26, 'Sacrum (spine)',          '#ff8c00', 0.72, True),
-    ( 41, 'Arcus Vertebrae',         '#8855cc', 0.55, True),
-    ( 42, 'Spinous Process',         '#e8c84a', 0.75, True),
-    ( 43, 'TP Left  (costal 43)',    '#ff3333', 0.95, False),
-    ( 44, 'TP Right (costal 44)',    '#00d4ff', 0.95, False),
-    ( 45, 'Sup Articular Left',      '#66ccaa', 0.65, True),
-    ( 46, 'Sup Articular Right',     '#44aa88', 0.65, True),
-    ( 47, 'Inf Articular Left',      '#aaddcc', 0.60, True),
-    ( 48, 'Inf Articular Right',     '#88ccbb', 0.60, True),
-    ( 49, 'Vertebra Corpus Border',  '#6699cc', 0.35, True),
-    ( 60, 'Spinal Cord',             '#ffe066', 0.65, False),
-    ( 61, 'Spinal Canal',            '#00ffb3', 0.18, False),
-    ( 62, 'Endplate',                '#c8f0c8', 0.45, True),
-    (100, 'IVD (spine, all)',         '#ffcc44', 0.55, True),
+SPINE_MASK_LABELS = [                              # (lbl, name, colour, op, fill, smooth)
+    # fill=False and low smooth for thin flat structures (endplates, TPs, canal)
+    # fill=True  for solid volumetric structures
+    ( 26, 'Sacrum (spine)',          '#ff8c00', 0.72, True,  1.5),
+    ( 41, 'Arcus Vertebrae',         '#8855cc', 0.55, True,  1.5),
+    ( 42, 'Spinous Process',         '#e8c84a', 0.75, True,  1.5),
+    ( 43, 'TP Left  (costal 43)',    '#ff3333', 0.95, False, 1.0),
+    ( 44, 'TP Right (costal 44)',    '#00d4ff', 0.95, False, 1.0),
+    ( 45, 'Sup Articular Left',      '#66ccaa', 0.65, True,  1.5),
+    ( 46, 'Sup Articular Right',     '#44aa88', 0.65, True,  1.5),
+    ( 47, 'Inf Articular Left',      '#aaddcc', 0.60, True,  1.5),
+    ( 48, 'Inf Articular Right',     '#88ccbb', 0.60, True,  1.5),
+    ( 49, 'Vertebra Corpus Border',  '#6699cc', 0.40, True,  1.5),
+    ( 60, 'Spinal Cord',             '#ffe066', 0.65, False, 1.2),
+    ( 61, 'Spinal Canal',            '#00ffb3', 0.18, False, 1.0),
+    # Endplate: fill_holes=False (it IS a surface — filling destroys the mesh),
+    # smooth=0.6 (thin structure — high sigma washes it out below 0.5 threshold),
+    # bright coral so it registers visually on top of vertebral bodies
+    ( 62, 'Endplate',                '#ff6b6b', 0.80, False, 0.6),
+    (100, 'IVD (spine, all)',         '#ffcc44', 0.55, True,  1.5),
 ]
 
 VERIDAH_CERVICAL = {i: (f'C{i}',    '#557799', 0.20) for i in range(1, 8)}
@@ -175,25 +193,89 @@ VERIDAH_NAMES = {**{k:v[0] for k,v in VERIDAH_LUMBAR.items()},
 LUMBAR_LABELS_ORDERED = [25, 24, 23, 22, 21, 20]
 
 TSS_SACRUM_LABEL = 50
+
+# Complete TotalSpineSeg label map from README (tss_map.json)
+# Cervical vertebrae:  11-17 = C1-C7
+# Thoracic vertebrae:  21-32 = T1-T12
+# Lumbar vertebrae:    41-45 = L1-L5
+# Sacrum:              50
+# Cervical discs:      63-67 = C2-C3 … C6-C7,  71 = C7-T1
+# Thoracic discs:      72-82 = T1-T2 … T11-T12
+# Thoracolumbar/lumbar discs: 91-95, 100
+# ⚠  TSS vertebra labels DO NOT match SPINEPS sub-region labels —
+#    TSS 41=L1 body, 43=L3 body, 44=L4 body (SPINEPS 43=TP-L, 44=TP-R)
 TSS_LABELS = [
-    (  1,'TSS Cord',         '#ffe066',0.50),
-    (  2,'TSS Canal',        '#00ffb3',0.14),
-    ( 31,'TSS T11',          '#447766',0.25),
-    ( 32,'TSS T12',          '#447766',0.25),
-    ( 41,'TSS L1',           '#1e6fa8',0.25),
-    ( 42,'TSS L2',           '#2389cc',0.25),
-    ( 43,'TSS L3',           '#29a3e8',0.25),
-    ( 44,'TSS L4',           '#52bef5',0.25),
-    ( 45,'TSS L5',           '#85d4ff',0.28),
-    ( 50,'TSS Sacrum',       '#ff8c00',0.65),
-    ( 82,'TSS disc T11-T12', '#ffe28a',0.40),
-    ( 91,'TSS disc T12-L1',  '#ffd060',0.45),
-    ( 92,'TSS disc L1-L2',   '#ffb830',0.50),
-    ( 93,'TSS disc L2-L3',   '#ff9900',0.50),
-    ( 94,'TSS disc L3-L4',   '#ff7700',0.50),
-    ( 95,'TSS disc L4-L5',   '#ff5500',0.52),
-    (100,'TSS disc L5-S',    '#ff3300',0.55),
+    # Cord & Canal
+    (  1, 'TSS Cord',          '#ffe066', 0.50),
+    (  2, 'TSS Canal',         '#00ffb3', 0.14),
+    # Cervical vertebrae (hidden by default — low opacity, toggle in legend)
+    ( 11, 'TSS C1',            '#88aabb', 0.18),
+    ( 12, 'TSS C2',            '#88aabb', 0.18),
+    ( 13, 'TSS C3',            '#88aabb', 0.18),
+    ( 14, 'TSS C4',            '#88aabb', 0.18),
+    ( 15, 'TSS C5',            '#88aabb', 0.18),
+    ( 16, 'TSS C6',            '#88aabb', 0.18),
+    ( 17, 'TSS C7',            '#88aabb', 0.18),
+    # Thoracic vertebrae
+    ( 21, 'TSS T1',            '#447766', 0.18),
+    ( 22, 'TSS T2',            '#447766', 0.18),
+    ( 23, 'TSS T3',            '#447766', 0.18),
+    ( 24, 'TSS T4',            '#447766', 0.18),
+    ( 25, 'TSS T5',            '#447766', 0.18),
+    ( 26, 'TSS T6',            '#447766', 0.18),
+    ( 27, 'TSS T7',            '#447766', 0.18),
+    ( 28, 'TSS T8',            '#447766', 0.18),
+    ( 29, 'TSS T9',            '#447766', 0.18),
+    ( 30, 'TSS T10',           '#447766', 0.18),
+    ( 31, 'TSS T11',           '#447766', 0.22),
+    ( 32, 'TSS T12',           '#447766', 0.22),
+    # Lumbar vertebrae (higher opacity — primary region of interest)
+    ( 41, 'TSS L1',            '#1e6fa8', 0.25),
+    ( 42, 'TSS L2',            '#2389cc', 0.25),
+    ( 43, 'TSS L3',            '#29a3e8', 0.25),
+    ( 44, 'TSS L4',            '#52bef5', 0.25),
+    ( 45, 'TSS L5',            '#85d4ff', 0.28),
+    # Sacrum
+    ( 50, 'TSS Sacrum',        '#ff8c00', 0.65),
+    # Cervical discs
+    ( 63, 'TSS disc C2-C3',    '#d4e8ff', 0.35),
+    ( 64, 'TSS disc C3-C4',    '#d4e8ff', 0.35),
+    ( 65, 'TSS disc C4-C5',    '#d4e8ff', 0.35),
+    ( 66, 'TSS disc C5-C6',    '#d4e8ff', 0.35),
+    ( 67, 'TSS disc C6-C7',    '#d4e8ff', 0.35),
+    ( 71, 'TSS disc C7-T1',    '#d4e8ff', 0.35),
+    # Thoracic discs (shown but semi-transparent)
+    ( 72, 'TSS disc T1-T2',    '#ffe8aa', 0.28),
+    ( 73, 'TSS disc T2-T3',    '#ffe8aa', 0.28),
+    ( 74, 'TSS disc T3-T4',    '#ffe8aa', 0.28),
+    ( 75, 'TSS disc T4-T5',    '#ffe8aa', 0.28),
+    ( 76, 'TSS disc T5-T6',    '#ffe8aa', 0.28),
+    ( 77, 'TSS disc T6-T7',    '#ffe8aa', 0.28),
+    ( 78, 'TSS disc T7-T8',    '#ffe8aa', 0.28),
+    ( 79, 'TSS disc T8-T9',    '#ffe8aa', 0.28),
+    ( 80, 'TSS disc T9-T10',   '#ffe8aa', 0.28),
+    ( 81, 'TSS disc T10-T11',  '#ffe8aa', 0.30),
+    ( 82, 'TSS disc T11-T12',  '#ffe28a', 0.40),
+    # Thoracolumbar and lumbar discs (primary — full opacity gradient)
+    ( 91, 'TSS disc T12-L1',   '#ffd060', 0.45),
+    ( 92, 'TSS disc L1-L2',    '#ffb830', 0.50),
+    ( 93, 'TSS disc L2-L3',    '#ff9900', 0.50),
+    ( 94, 'TSS disc L3-L4',    '#ff7700', 0.50),
+    ( 95, 'TSS disc L4-L5',    '#ff5500', 0.52),
+    (100, 'TSS disc L5-S',     '#ff3300', 0.55),
 ]
+
+# TSS label lookup for morphometric use (vertebra body labels only)
+TSS_LUMBAR_LABELS = {41:'L1', 42:'L2', 43:'L3', 44:'L4', 45:'L5'}
+TSS_DISC_LABELS = {
+    91:'T12-L1', 92:'L1-L2', 93:'L2-L3', 94:'L3-L4', 95:'L4-L5', 100:'L5-S1'
+}
+
+# VERIDAH per-vertebra endplate labels: 200+X → endplate of vertebra X
+# These are separate from the SPINEPS global label 62 (all endplates merged)
+VERIDAH_ENDPLATE_BASE = 200
+# Same vertebra labels as IVD: L1=20, L2=21, L3=22, L4=23, L5=24, L6=25
+VERIDAH_ENDPLATE_COLOUR = '#ff8888'  # bright coral — distinct from #ff6b6b SPINEPS endplate
 
 TP_LEFT_LABEL   = 43
 TP_RIGHT_LABEL  = 44
@@ -823,42 +905,83 @@ def compute_foraminal_volume_proxy(sup_art_mask, inf_art_mask, disc_mask, level_
 def run_all_morphometrics(sp_iso, vert_iso, tss_iso, sac_iso):
     """
     Run all morphometric analyses on resampled isotropic volumes.
+
+    Mask sources used:
+    ─────────────────────────────────────────────────────────────────────
+    SPINEPS seg-spine_msk:
+      26 Sacrum          41 Arcus          42 Spinous
+      43 TP-L            44 TP-R           45 SupArt-L   46 SupArt-R
+      47 InfArt-L        48 InfArt-R       49 CorpusBorder
+      60 Cord            61 Canal          62 Endplate (all, merged)
+      100 IVD (all, merged)
+
+    VERIDAH seg-vert_msk:
+      1-25  per-vertebra labels (C1-L6)
+      100+X per-vertebra IVD below vertebra X
+      200+X per-vertebra endplate of vertebra X   ← NOW USED in DHI
+
+    TotalSpineSeg:
+      1 cord  2 canal  11-17 C1-C7  21-32 T1-T12  41-45 L1-L5  50 sacrum
+      63-100 discs (full cervical/thoracic/lumbar coverage)  ← NOW USED
+    ─────────────────────────────────────────────────────────────────────
     Returns a dict of all computed morphometric values.
     """
     metrics = {}
 
-    # ── 1. Extract key masks ───────────────────────────────────────────────────
-    canal_mask  = (sp_iso == 61) if (sp_iso == 61).any() else None
-    cord_mask   = (sp_iso == 60) if (sp_iso == 60).any() else None
-    arcus_mask  = (sp_iso == 41) if (sp_iso == 41).any() else None
-    spinous_msk = (sp_iso == 42) if (sp_iso == 42).any() else None
-    sup_art_L   = (sp_iso == 45) if (sp_iso == 45).any() else None
-    sup_art_R   = (sp_iso == 46) if (sp_iso == 46).any() else None
-    inf_art_L   = (sp_iso == 47) if (sp_iso == 47).any() else None
-    inf_art_R   = (sp_iso == 48) if (sp_iso == 48).any() else None
-    endplate_msk = (sp_iso == 62) if (sp_iso == 62).any() else None
-    disc_mask   = (sp_iso == 100) if (sp_iso == 100).any() else None
+    # ── 1. Extract key masks from SPINEPS ─────────────────────────────────────
+    canal_mask    = (sp_iso == 61)  if (sp_iso == 61).any()  else None
+    cord_mask     = (sp_iso == 60)  if (sp_iso == 60).any()  else None
+    arcus_mask    = (sp_iso == 41)  if (sp_iso == 41).any()  else None
+    spinous_msk   = (sp_iso == 42)  if (sp_iso == 42).any()  else None
+    sup_art_L     = (sp_iso == 45)  if (sp_iso == 45).any()  else None
+    sup_art_R     = (sp_iso == 46)  if (sp_iso == 46).any()  else None
+    inf_art_L     = (sp_iso == 47)  if (sp_iso == 47).any()  else None
+    inf_art_R     = (sp_iso == 48)  if (sp_iso == 48).any()  else None
+    # Corpus border (49): the vertebral body surface — more precise than full
+    # vertebra body label for DHI anterior/posterior height measurement
+    corpus_border = (sp_iso == 49)  if (sp_iso == 49).any()  else None
+    # Global merged endplate mask (62): present when SPINEPS ran successfully;
+    # used for per-disc endplate-to-endplate disc height when per-vertebra
+    # VERIDAH endplates (200+X) are not available.
+    ep_global     = (sp_iso == 62)  if (sp_iso == 62).any()  else None
+    disc_mask     = (sp_iso == 100) if (sp_iso == 100).any() else None
+
+    # Prefer corpus_border over raw vert mask for vertebral height calculations
+    # because corpus_border excludes posterior elements (arcus, processes) that
+    # inflate the apparent Ha/Hm/Hp when measured from the full instance label.
+    logger.info(f"  Endplate (global sp62): {'present' if ep_global is not None else 'absent'}")
+    logger.info(f"  Corpus border (sp49):   {'present' if corpus_border is not None else 'absent'}")
 
     # ── 2. Central canal stenosis ──────────────────────────────────────────────
-    if canal_mask is not None:
-        ap_mm, dsca_mm2 = compute_canal_ap_diameter(canal_mask)
+    # Use TSS canal (label 2) preferentially — it is segmented from whole-spine
+    # coverage whereas SPINEPS canal may be cropped at L5/S1.
+    tss_canal = (tss_iso == 2) if (tss_iso is not None and (tss_iso == 2).any()) else None
+    active_canal = tss_canal if tss_canal is not None else canal_mask
+    if active_canal is not None:
+        ap_mm, dsca_mm2 = compute_canal_ap_diameter(active_canal)
         if ap_mm is not None:
-            metrics['canal_AP_mm']   = ap_mm
+            metrics['canal_AP_mm']    = ap_mm
             metrics['canal_DSCA_mm2'] = dsca_mm2
             ap_cls, dsca_cls = classify_canal_stenosis(ap_mm, dsca_mm2)
             metrics['canal_AP_class']   = ap_cls
             metrics['canal_DSCA_class'] = dsca_cls
-            # Absolute stenosis flag
+            metrics['canal_source']     = 'TSS' if tss_canal is not None else 'SPINEPS'
             metrics['canal_absolute_stenosis'] = (
                 ap_mm < CanalThresholds.AP_ABSOLUTE_MM or
                 (dsca_mm2 is not None and dsca_mm2 < CanalThresholds.DSCA_ABSOLUTE_MM2))
 
-    # ── 3. Spinal cord metrics (MSCC, CSA, K-line proxy) ──────────────────────
-    cord_metrics = compute_cord_metrics(cord_mask, canal_mask)
+    # ── 3. Spinal cord metrics (MSCC proxy, CSA, K-line proxy) ────────────────
+    # Use TSS cord (label 1) preferentially — see TotalSpineSeg README note:
+    # "not intended to replace validated CSA methods" but suitable for MSCC proxy.
+    tss_cord = (tss_iso == 1) if (tss_iso is not None and (tss_iso == 1).any()) else None
+    active_cord = tss_cord if tss_cord is not None else cord_mask
+    cord_metrics = compute_cord_metrics(active_cord, active_canal)
     metrics.update(cord_metrics)
+    if tss_cord is not None:
+        metrics['cord_source'] = 'TSS'
 
     # ── 4. Ligamentum Flavum proxy ─────────────────────────────────────────────
-    lf_metrics = compute_ligamentum_flavum_metrics(arcus_mask, canal_mask)
+    lf_metrics = compute_ligamentum_flavum_metrics(arcus_mask, active_canal)
     metrics.update(lf_metrics)
 
     # ── 5. Spinous process / Baastrup disease ──────────────────────────────────
@@ -866,21 +989,35 @@ def run_all_morphometrics(sp_iso, vert_iso, tss_iso, sac_iso):
         bstp = compute_spinous_process_metrics(spinous_msk)
         metrics.update({f'baastrup_{k}': v for k, v in bstp.items()})
 
-    # ── 6. Facet tropism (proxy) ───────────────────────────────────────────────
+    # ── 6. Facet tropism (proxy from sup articular processes) ─────────────────
     ft = compute_facet_tropism_proxy(sup_art_L, sup_art_R)
     metrics.update(ft)
 
-    # ── 7. Per-vertebral-level analysis (lumbar) ───────────────────────────────
-    lumbar_pairs = [(20,21,'L1','L2'), (21,22,'L2','L3'),
-                    (22,23,'L3','L4'), (23,24,'L4','L5'), (24,26,'L5','S1')]
+    # ── 7. Per-vertebral-level analysis (lumbar L1-S1) ────────────────────────
+    lumbar_pairs = [(20, 21, 'L1', 'L2'), (21, 22, 'L2', 'L3'),
+                    (22, 23, 'L3', 'L4'), (23, 24, 'L4', 'L5'), (24, 26, 'L5', 'S1')]
+
     for upper_lbl, lower_lbl, upper_name, lower_name in lumbar_pairs:
         level = f'{upper_name}_{lower_name}'
         upper_mask = (vert_iso == upper_lbl) if (vert_iso == upper_lbl).any() else None
         lower_mask = (vert_iso == lower_lbl) if (vert_iso == lower_lbl).any() else None
 
-        # Vertebral body height ratios (upper vertebra)
-        if upper_mask is not None:
-            h = compute_vertebral_heights(upper_mask)
+        # 7a. Vertebral body height ratios
+        # Prefer corpus_border sliced to the vertebra's Z-range for cleaner Ha/Hm/Hp;
+        # fall back to the raw instance label if corpus_border is absent.
+        vert_src = upper_mask
+        if corpus_border is not None and upper_mask is not None:
+            zr = get_z_range(upper_mask)
+            if zr:
+                z_lo, z_hi = zr
+                cb_slice = corpus_border.copy()
+                cb_slice[:, :, :z_lo] = False
+                cb_slice[:, :, z_hi+1:] = False
+                if cb_slice.any():
+                    vert_src = cb_slice
+                    logger.debug(f"  {upper_name}: using corpus_border for height ratios")
+        if vert_src is not None:
+            h = compute_vertebral_heights(vert_src)
             if h:
                 ratios = compute_height_ratios(h)
                 for k, v in h.items():
@@ -888,29 +1025,104 @@ def run_all_morphometrics(sp_iso, vert_iso, tss_iso, sac_iso):
                 for k, v in ratios.items():
                     metrics[f'{upper_name}_{k}'] = v
 
-        # Spondylolisthesis (upper→lower)
+        # 7b. Spondylolisthesis (upper→lower sagittal translation)
         if upper_mask is not None and lower_mask is not None:
             spondy = compute_spondylolisthesis_proxy(vert_iso, upper_lbl, lower_lbl)
             for k, v in spondy.items():
                 metrics[f'{level}_{k}'] = v
 
-        # Disc height index (IVD between upper and lower)
-        ivd_lbl = VERIDAH_IVD_BASE + upper_lbl
-        ivd_mask_v = (vert_iso == ivd_lbl) if (vert_iso == ivd_lbl).any() else disc_mask
+        # 7c. Disc Height Index
+        # Priority 1: VERIDAH per-vertebra IVD label (100+X) — most accurate
+        # Priority 2: TSS disc label for this level — good coverage
+        # Priority 3: merged SPINEPS IVD label 100 — least precise (all discs merged)
+        ivd_lbl_veridah = VERIDAH_IVD_BASE + upper_lbl
+        ivd_mask_v = None
+        ivd_source = 'none'
+        if (vert_iso == ivd_lbl_veridah).any():
+            ivd_mask_v = (vert_iso == ivd_lbl_veridah)
+            ivd_source = f'VERIDAH({ivd_lbl_veridah})'
+        elif tss_iso is not None:
+            # Map level to TSS disc label
+            tss_disc_map = {'L1_L2': 92, 'L2_L3': 93, 'L3_L4': 94,
+                            'L4_L5': 95, 'L5_S1': 100}
+            tss_dlbl = tss_disc_map.get(level)
+            if tss_dlbl and (tss_iso == tss_dlbl).any():
+                ivd_mask_v = (tss_iso == tss_dlbl)
+                ivd_source = f'TSS({tss_dlbl})'
+        if ivd_mask_v is None and disc_mask is not None:
+            # Restrict merged mask to Z-range between upper and lower vertebrae
+            if upper_mask is not None and lower_mask is not None:
+                zr_up = get_z_range(upper_mask)
+                zr_lo = get_z_range(lower_mask)
+                if zr_up and zr_lo:
+                    z_lo_disc = min(zr_up[1], zr_lo[1])
+                    z_hi_disc = max(zr_up[0], zr_lo[0])
+                    ivd_mask_v = disc_mask.copy()
+                    ivd_mask_v[:, :, :z_lo_disc] = False
+                    ivd_mask_v[:, :, z_hi_disc+1:] = False
+                    if ivd_mask_v.any():
+                        ivd_source = 'SPINEPS-merged'
+                    else:
+                        ivd_mask_v = None
+
+        metrics[f'{level}_disc_source'] = ivd_source
         if ivd_mask_v is not None:
+            # DHI Farfan method (Ha+Hp)/(Ds+Di)×100
             dhi = compute_disc_height_index(ivd_mask_v, upper_mask, lower_mask)
             if dhi is not None:
                 metrics[f'{level}_DHI_pct'] = dhi
                 metrics[f'{level}_DHI_grade'] = (
                     'Severe (>50% loss)' if dhi < 50.0 else
-                    'Moderate' if dhi < 70.0 else 'Mild' if dhi < 85.0 else 'Normal')
-            # DHI Method 2
+                    'Moderate'           if dhi < 70.0 else
+                    'Mild'               if dhi < 85.0 else 'Normal')
+
+            # DHI Method 2: mid-disc / mid-vertebra height
             if upper_mask is not None:
                 dhi2 = compute_disc_height_method2(ivd_mask_v, upper_mask)
                 if dhi2 is not None:
                     metrics[f'{level}_DHI_method2'] = dhi2
 
-        # Foraminal volume proxy (using sup articular as boundary)
+            # 7d. Endplate-to-endplate disc height (most precise DHI proxy)
+            # Uses VERIDAH 200+X per-vertebra endplate labels when available,
+            # or falls back to the global SPINEPS endplate mask (label 62)
+            # restricted to the inter-vertebral Z-range.
+            ep_upper_lbl = VERIDAH_ENDPLATE_BASE + upper_lbl
+            ep_lower_lbl = VERIDAH_ENDPLATE_BASE + lower_lbl
+            ep_up = ((vert_iso == ep_upper_lbl)
+                     if (vert_iso == ep_upper_lbl).any() else None)
+            ep_lo = ((vert_iso == ep_lower_lbl)
+                     if (vert_iso == ep_lower_lbl).any() else None)
+            ep_source = 'VERIDAH'
+
+            # Fall back to global endplate mask sliced to this level's Z-range
+            if (ep_up is None or ep_lo is None) and ep_global is not None:
+                if upper_mask is not None and lower_mask is not None:
+                    zr_up = get_z_range(upper_mask)
+                    zr_lo = get_z_range(lower_mask)
+                    if zr_up and zr_lo:
+                        # Superior endplate: top slice of upper vertebra
+                        z_top = zr_up[1]
+                        ep_up_tmp = ep_global.copy()
+                        ep_up_tmp[:, :, :max(0, z_top - 3)] = False
+                        ep_up_tmp[:, :, z_top + 4:] = False
+                        # Inferior endplate: bottom slice of lower vertebra
+                        z_bot = zr_lo[0]
+                        ep_lo_tmp = ep_global.copy()
+                        ep_lo_tmp[:, :, :max(0, z_bot - 3)] = False
+                        ep_lo_tmp[:, :, z_bot + 4:] = False
+                        if ep_up_tmp.any() and ep_lo_tmp.any():
+                            ep_up = ep_up_tmp if ep_up is None else ep_up
+                            ep_lo = ep_lo_tmp if ep_lo is None else ep_lo
+                            ep_source = 'SPINEPS-ep62'
+
+            if ep_up is not None and ep_lo is not None:
+                ep_dist, _, _ = min_dist_mm(ep_up, ep_lo)
+                if np.isfinite(ep_dist):
+                    metrics[f'{level}_endplate_dist_mm'] = ep_dist
+                    metrics[f'{level}_endplate_source']  = ep_source
+                    logger.debug(f"  {level} ep-to-ep dist: {ep_dist:.1f}mm ({ep_source})")
+
+        # 7e. Foraminal volume proxy (elliptical cylinder)
         if sup_art_L is not None:
             fv_l = compute_foraminal_volume_proxy(sup_art_L, inf_art_L, ivd_mask_v, level)
             for k, v in fv_l.items():
@@ -920,7 +1132,42 @@ def run_all_morphometrics(sp_iso, vert_iso, tss_iso, sac_iso):
             for k, v in fv_r.items():
                 metrics[f'{level}_R_{k}'] = v
 
-    # ── 8. Canal shape annotation per level ───────────────────────────────────
+    # ── 8. Per-level canal AP from TSS (level-specific canal shape reference) ──
+    # Use TSS disc midpoints as proxies for the inter-vertebral level location;
+    # sample canal AP at each of those Z-positions for a per-level stenosis profile.
+    if tss_iso is not None and active_canal is not None:
+        tss_disc_level_map = {92:'L1-L2', 93:'L2-L3', 94:'L3-L4',
+                               95:'L4-L5', 100:'L5-S1'}
+        for dlbl, lname in tss_disc_level_map.items():
+            if not (tss_iso == dlbl).any():
+                continue
+            disc_zr = get_z_range(tss_iso == dlbl)
+            if disc_zr is None:
+                continue
+            z_mid = (disc_zr[0] + disc_zr[1]) // 2
+            # Sample canal at this Z slice
+            canal_slice = active_canal[:, :, max(0,z_mid-1):z_mid+2]
+            if not canal_slice.any():
+                continue
+            yc = np.where(canal_slice)[1]
+            zc = np.where(canal_slice)[2]
+            ap_level = (int(yc.max()) - int(yc.min()) + 1) * ISO_MM
+            ml_level = (int(zc.max()) - int(zc.min()) + 1) * ISO_MM
+            dsca_level = (np.pi / 4.0) * ap_level * ml_level
+            key = lname.replace('-', '_')
+            metrics[f'{key}_level_AP_mm']    = ap_level
+            metrics[f'{key}_level_DSCA_mm2'] = dsca_level
+            ap_cls_l, dsca_cls_l = classify_canal_stenosis(ap_level, dsca_level)
+            metrics[f'{key}_level_AP_class']   = ap_cls_l
+            metrics[f'{key}_level_DSCA_class'] = dsca_cls_l
+            # Expected canal shape at this level
+            shape_key = lname.split('-')[1]  # e.g. 'L2' from 'L1-L2'
+            if shape_key in CANAL_SHAPE_BY_LEVEL:
+                shape, freq = CANAL_SHAPE_BY_LEVEL[shape_key]
+                metrics[f'{key}_canal_shape']      = shape
+                metrics[f'{key}_canal_shape_freq'] = freq
+
+    # ── 9. Canal shape annotation per level (VERIDAH) ─────────────────────────
     for lbl, (name, _, _) in VERIDAH_LUMBAR.items():
         if (vert_iso == lbl).any() and name in CANAL_SHAPE_BY_LEVEL:
             shape, freq = CANAL_SHAPE_BY_LEVEL[name]
@@ -934,6 +1181,15 @@ def run_all_morphometrics(sp_iso, vert_iso, tss_iso, sac_iso):
 
 def mask_to_mesh3d(iso_mask, origin_mm, name, colour, opacity,
                    smooth_sigma=1.5, fill_holes=True):
+    """
+    Convert binary mask to Plotly Mesh3d via marching cubes.
+
+    THIN / FLAT STRUCTURE RULES (endplates, canal, TPs):
+      fill_holes=False — the sheet IS the surface; fill_holes inverts it to hollow
+      smooth_sigma=0.6 — high sigma washes thin voxel sheets below 0.5 threshold
+    VOLUMETRIC STRUCTURES (vertebrae, discs, arcus, sacrum):
+      fill_holes=True, smooth_sigma=1.5 — standard pipeline
+    """
     if not iso_mask.any():
         return None
     m = binary_fill_holes(iso_mask) if fill_holes else iso_mask.copy()
@@ -1357,49 +1613,89 @@ def build_3d_figure(study_id, spineps_dir, totalspine_dir,
     traces = []
 
     # 1. SPINEPS seg-spine_msk
-    for lbl,name,col,op,fh in SPINE_MASK_LABELS:
+    # SPINE_MASK_LABELS is a 6-tuple: (lbl, name, colour, opacity, fill_holes, struct_sigma)
+    # struct_sigma is the per-structure smooth value that overrides the global --smooth
+    # for thin flat structures (endplates, canal) where high sigma destroys the mesh.
+    for lbl, name, col, op, fh, struct_sigma in SPINE_MASK_LABELS:
         if lbl not in sp_labels:
             continue
-        mask = (tp_L if lbl==TP_LEFT_LABEL
-                else tp_R if lbl==TP_RIGHT_LABEL
-                else (sp_iso==lbl))
+        mask = (tp_L if lbl == TP_LEFT_LABEL
+                else tp_R if lbl == TP_RIGHT_LABEL
+                else (sp_iso == lbl))
         if not mask.any():
             continue
+        # Use per-structure sigma for thin structures (endplate, canal, TPs);
+        # use the global --smooth for everything else, capped to struct_sigma maximum
+        # so we don't over-blur a structure that can't tolerate it.
+        effective_sigma = min(smooth, struct_sigma) if struct_sigma < 1.0 else smooth
         t = mask_to_mesh3d(mask, origin_mm, name, col, op,
-                           smooth_sigma=smooth, fill_holes=fh)
+                           smooth_sigma=effective_sigma, fill_holes=fh)
         if t:
             traces.append(t)
             logger.info(f"    ✓ seg-spine {lbl:>3}  {name}")
         else:
-            logger.warning(f"    ✗ seg-spine {lbl:>3}  {name}")
+            logger.warning(f"    ✗ seg-spine {lbl:>3}  {name}  "
+                           f"(sigma={effective_sigma:.1f} fill={fh})")
 
     # 2. VERIDAH vertebrae
     all_veridah = {**VERIDAH_CERVICAL, **VERIDAH_THORACIC, **VERIDAH_LUMBAR}
-    for lbl,(name,col,op) in sorted(all_veridah.items()):
-        if lbl not in vert_labels: continue
-        t = mask_to_mesh3d(vert_iso==lbl, origin_mm, name, col, op,
+    for lbl, (name, col, op) in sorted(all_veridah.items()):
+        if lbl not in vert_labels:
+            continue
+        t = mask_to_mesh3d(vert_iso == lbl, origin_mm, name, col, op,
                            smooth_sigma=smooth, fill_holes=True)
         if t:
             traces.append(t)
             logger.info(f"    ✓ seg-vert  {lbl:>3}  {name}")
 
-    # 2b. VERIDAH IVD labels
-    for base,col in VERIDAH_IVD_COLOURS.items():
+    # 2b. VERIDAH IVD labels (100+X)
+    for base, col in VERIDAH_IVD_COLOURS.items():
         ivd_lbl = VERIDAH_IVD_BASE + base
-        if ivd_lbl not in vert_labels: continue
-        name = f'IVD below {VERIDAH_NAMES.get(base,str(base))}'
-        t = mask_to_mesh3d(vert_iso==ivd_lbl, origin_mm, name, col, 0.55,
+        if ivd_lbl not in vert_labels:
+            continue
+        name = f'IVD below {VERIDAH_NAMES.get(base, str(base))}'
+        t = mask_to_mesh3d(vert_iso == ivd_lbl, origin_mm, name, col, 0.55,
                            smooth_sigma=smooth, fill_holes=True)
         if t:
             traces.append(t)
             logger.info(f"    ✓ seg-vert  {ivd_lbl:>3}  {name}")
 
-    # 3. TotalSpineSeg
+    # 2c. VERIDAH per-vertebra endplate labels (200+X)
+    # These are distinct from the global SPINEPS label 62 — they carry vertebra identity
+    # and are used in the morphometric endplate-to-endplate DHI measurement.
+    for base in VERIDAH_IVD_COLOURS:   # same vertebra labels: L1=20 … L5=24
+        ep_lbl = VERIDAH_ENDPLATE_BASE + base
+        if ep_lbl not in vert_labels:
+            continue
+        vname = VERIDAH_NAMES.get(base, str(base))
+        ep_name = f'Endplate {vname}'
+        # Endplates are thin (2-3 voxels) — same rendering rules as SPINEPS label 62
+        t = mask_to_mesh3d(vert_iso == ep_lbl, origin_mm, ep_name,
+                           VERIDAH_ENDPLATE_COLOUR, 0.75,
+                           smooth_sigma=0.6, fill_holes=False)
+        if t:
+            traces.append(t)
+            logger.info(f"    ✓ seg-vert  {ep_lbl:>3}  {ep_name}")
+        else:
+            logger.warning(f"    ✗ seg-vert  {ep_lbl:>3}  {ep_name}  (thin — may be absent)")
+
+    # 3. TotalSpineSeg — full label coverage per README (50 classes)
+    # TSS labels are rendered at their native opacity (not halved) since TSS is the
+    # primary source for cord/canal/sacrum and its vertebra bodies serve as the
+    # reference for per-level canal shape and cervical MSCC calculations.
+    # Cervical and thoracic entries are shown at low opacity so they don't obscure
+    # the SPINEPS sub-region detail at lumbar levels.
     if show_tss and tss_iso is not None:
-        for lbl,name,col,op in TSS_LABELS:
-            if lbl not in tss_labels: continue
-            t = mask_to_mesh3d(tss_iso==lbl, origin_mm, f'TSS {name}',
-                               col, op*0.50, smooth_sigma=smooth, fill_holes=True)
+        for lbl, name, col, op in TSS_LABELS:
+            if lbl not in tss_labels:
+                continue
+            # TSS cord/canal: fill_holes=False (hollow structures)
+            # TSS vertebrae/discs: fill_holes=True
+            is_thin = lbl in (1, 2)   # cord and canal
+            t = mask_to_mesh3d(tss_iso == lbl, origin_mm, name,
+                               col, op,
+                               smooth_sigma=0.8 if is_thin else smooth,
+                               fill_holes=not is_thin)
             if t:
                 traces.append(t)
                 logger.info(f"    ✓ TSS       {lbl:>3}  {name}")
@@ -1448,14 +1744,24 @@ def build_3d_figure(study_id, spineps_dir, totalspine_dir,
     def _fmt2(v): return f'{v:.1f}' if (v is not None and np.isfinite(v)) else 'N/A'
     def _fmm2(v): return f'{v:.0f} mm²' if (v is not None and np.isfinite(v)) else 'N/A'
 
-    # Build per-level DHI summary
+    # Build per-level DHI summary with endplate-to-endplate distance and source
     dhi_lines = []
     for pair in [('L1','L2'),('L2','L3'),('L3','L4'),('L4','L5'),('L5','S1')]:
-        key = f'{pair[0]}_{pair[1]}_DHI_pct'
-        dhi = morphometrics.get(key)
+        level_key = f'{pair[0]}_{pair[1]}'
+        dhi    = morphometrics.get(f'{level_key}_DHI_pct')
+        ep_d   = morphometrics.get(f'{level_key}_endplate_dist_mm')
+        ep_src = morphometrics.get(f'{level_key}_endplate_source', '')
+        src    = morphometrics.get(f'{level_key}_disc_source', '')
+        parts  = []
         if dhi is not None:
-            flag = ' ✗' if dhi < 50 else ''
-            dhi_lines.append(f"  {pair[0]}-{pair[1]}: {dhi:.1f}%{flag}")
+            flag = ' ✗' if dhi < 50 else (' ⚠' if dhi < 70 else '')
+            parts.append(f"DHI={dhi:.1f}%{flag}")
+        if ep_d is not None:
+            eflag = ' ✗' if ep_d < 3.0 else ''
+            parts.append(f"ep-ep={ep_d:.1f}mm{eflag}[{ep_src}]")
+        if parts:
+            src_tag = f" ({src})" if src and src != 'none' else ''
+            dhi_lines.append(f"  {pair[0]}-{pair[1]}: {', '.join(parts)}{src_tag}")
 
     # Per-level spondylolisthesis
     spondy_lines = []
@@ -1487,10 +1793,20 @@ def build_3d_figure(study_id, spineps_dir, totalspine_dir,
         f"Castellvi:   {castellvi}",
         "",
         "── Central Canal Stenosis ──",
+        f"Source:      {morphometrics.get('canal_source', 'SPINEPS')}",
         f"AP diam:     {_fmt(ap_mm)} → {ap_class}",
         f"DSCA≈:       {_fmm2(dsca_mm2)} → {dsca_cls}",
         (f"  ✗ ABSOLUTE STENOSIS" if morphometrics.get('canal_absolute_stenosis') else
          f"  ✓ within limits"),
+        "  Per-level AP (TSS disc midpoint):",
+    ] + [
+        (f"  {lv}: "
+         f"{_fmt(morphometrics.get(lv.replace('-','_') + '_level_AP_mm'))} "
+         f"→ {morphometrics.get(lv.replace('-','_') + '_level_AP_class', 'N/A')} "
+         f"({morphometrics.get(lv.replace('-','_') + '_canal_shape', '')})")
+        for lv in ['L1-L2', 'L2-L3', 'L3-L4', 'L4-L5', 'L5-S1']
+        if morphometrics.get(lv.replace('-', '_') + '_level_AP_mm') is not None
+    ] + [
         "",
         "── Spinal Cord ──",
         f"Cord CSA:    {_fmm2(cord_csa)}",
@@ -1503,7 +1819,9 @@ def build_3d_figure(study_id, spineps_dir, totalspine_dir,
         "",
         "── Disc Height Index (DHI) ──",
         "  DHI=(Ha+Hp)/(Ds+Di)×100  [Farfan]",
-        "  <50%→Severe, <70%→Mod, <85%→Mild",
+        "  ep-ep = endplate-to-endplate dist (most precise)",
+        "  Source: VERIDAH(200+X) > TSS > SPINEPS-merged",
+        "  <50%→Severe✗, <70%→Mod⚠, <85%→Mild",
     ] + dhi_lines + [
         "",
         "── Vertebral Height Ratios ──",
@@ -1688,7 +2006,8 @@ button:hover{{background:var(--bd)}} button.on{{background:var(--bl);border-colo
   <div class="li"><div class="sw" style="background:#1e6fa8;opacity:.7"></div>L1-L6</div>
   <div class="li"><div class="sw" style="background:#00ffb3;opacity:.5"></div>Canal</div>
   <div class="li"><div class="sw" style="background:#ffe066;opacity:.8"></div>Cord</div>
-  <div class="li"><div class="sw" style="background:#c8f0c8"></div>Endplate</div>
+  <div class="li"><div class="sw" style="background:#ff6b6b"></div>Endplate (SPINEPS merged)</div>
+  <div class="li"><div class="sw" style="background:#ff8888"></div>Endplate per-vertebra (VERIDAH)</div>
   <div class="li"><div class="sw" style="background:#00e6b4;opacity:.4"></div>TV plane</div>
 </div>
 <div id="pl">{plotly_div}</div>
