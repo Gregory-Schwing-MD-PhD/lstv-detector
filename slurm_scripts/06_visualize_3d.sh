@@ -21,20 +21,6 @@ ALL=false                  # set to true to render every study with SPINEPS segm
 SMOOTH=3                   # Gaussian pre-smoothing sigma for marching cubes surfaces
 NO_TSS=false               # set to true to skip TotalSpineSeg label rendering
 
-# ── Morphometric output flags ─────────────────────────────────────────────────
-# Save all computed morphometrics to results/lstv_3d/morphometrics_all_studies.csv
-# Computed parameters include:
-#   - DHI (Farfan method) + endplate-to-endplate distance per level
-#   - Canal AP + DSCA global and per-level (from TSS disc midpoints)
-#   - Vertebral height ratios Ha/Hm/Hp (using corpus_border mask when available)
-#   - Spondylolisthesis sagittal translation per level
-#   - Ligamentum flavum thickness proxy (arcus→canal distance)
-#   - Baastrup disease (spinous process gap)
-#   - Facet tropism Ko grade (sup articular PCA orientation)
-#   - Foraminal volume proxy (elliptical cylinder, Lee grade)
-#   - Spinal cord CSA + MSCC proxy
-SAVE_MORPHOMETRICS_CSV=true
-
 # ── Mask sources used in morphometrics ───────────────────────────────────────
 #
 # SPINEPS seg-spine_msk (ALL 14 labels rendered + used in morphometrics):
@@ -64,9 +50,9 @@ SAVE_MORPHOMETRICS_CSV=true
 #
 # VERTEBRAL BODY (Genant/QM):
 #   Compression Hm/Ha or Hm/Hp < 0.80 → biconcave fracture
-#   Wedge       Ha/Hp             < 0.80 → anterior wedge fracture
-#   Crush       Hp/Ha             < 0.80 → posterior height loss
-#   Intervention threshold        < 0.75 → moderate/severe fracture
+#   Wedge       Ha/Hp              < 0.80 → anterior wedge fracture
+#   Crush       Hp/Ha              < 0.80 → posterior height loss
+#   Intervention threshold         < 0.75 → moderate/severe fracture
 #
 # DISC HEIGHT INDEX (DHI, Farfan method):
 #   DHI = (Ha+Hp)/(Ds+Di) × 100
@@ -130,7 +116,6 @@ echo "================================================================"
 echo "LSTV 3D VISUALIZER + COMPREHENSIVE MORPHOMETRICS"
 echo "STUDY_ID=${STUDY_ID:-<selective/all>}  TOP_N=$TOP_N  RANK_BY=$RANK_BY"
 echo "ALL=$ALL  SMOOTH=$SMOOTH  NO_TSS=$NO_TSS"
-echo "SAVE_MORPHOMETRICS_CSV=$SAVE_MORPHOMETRICS_CSV"
 echo ""
 echo "Morphometrics: Vertebral QM · DHI · DSCA · Canal shape · LF ·"
 echo "               Spondylolisthesis · Baastrup · Facet tropism ·"
@@ -154,6 +139,7 @@ PROJECT_DIR="$(pwd)"
 UNCERTAINTY_CSV="${PROJECT_DIR}/results/epistemic_uncertainty/lstv_uncertainty_metrics.csv"
 MODELS_DIR="${PROJECT_DIR}/models"
 LSTV_JSON="${PROJECT_DIR}/results/lstv_detection/lstv_results.json"
+MORPHO_JSON="${PROJECT_DIR}/results/morphometrics/morphometrics_all.json"
 
 mkdir -p logs results/lstv_3d
 
@@ -213,10 +199,12 @@ if [[ "$NO_TSS" == "true" ]]; then
     echo "TotalSpineSeg label rendering disabled"
 fi
 
-# --- Morphometrics CSV flag ---
-if [[ "$SAVE_MORPHOMETRICS_CSV" == "true" ]]; then
-    SELECTION_ARGS+=( "--save_morphometrics_csv" )
-    echo "Morphometrics CSV export enabled → results/lstv_3d/morphometrics_all_studies.csv"
+# --- Morphometrics JSON ---
+if [[ -f "$MORPHO_JSON" ]]; then
+    SELECTION_ARGS+=( "--morphometrics_json" "/work/results/morphometrics/morphometrics_all.json" )
+    echo "Pre-computed morphometrics found — loading from JSON."
+else
+    echo "WARNING: morphometrics_all.json not found. Computations will be done inline."
 fi
 
 # --- Annotation from detection results ---
@@ -250,7 +238,6 @@ singularity exec \
 echo "================================================================"
 echo "3D visualization + morphometric analysis complete"
 echo "HTMLs      → results/lstv_3d/"
-echo "Morphometrics CSV → results/lstv_3d/morphometrics_all_studies.csv"
 echo ""
 echo "Morphometric parameters computed per study:"
 echo "  Vertebral: Ha/Hm/Hp heights, Compression/Wedge/Crush ratios, Genant grade"

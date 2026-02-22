@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
 """
 02b_spineps_selective.py — Run SPINEPS on top-N / bottom-N uncertainty studies
+                           OR on the entire valid-ID dataset (--all flag)
 ===============================================================================
 
 Reads results/epistemic_uncertainty/lstv_uncertainty_metrics.csv, ranks studies
 by the given column, selects the top N (highest) and bottom N (lowest), then
 runs SPINEPS on those studies — skipping any already segmented.
 
+With --all: processes every study in valid_id.npy regardless of uncertainty CSV.
+
 Fully self-contained — no imports from other local scripts.
 
 Usage:
+    # Selective (top/bottom N):
     python scripts/02b_spineps_selective.py \
         --uncertainty_csv results/epistemic_uncertainty/lstv_uncertainty_metrics.csv \
         --nifti_dir       results/nifti \
         --spineps_dir     results/spineps \
         --series_csv      data/raw/train_series_descriptions.csv \
         --valid_ids       models/valid_id.npy \
-        --top_n           1 \
-        --rank_by         l5_s1_confidence \
-        [--dry_run]
+        --top_n           10 \
+        --rank_by         l5_s1_confidence
+
+    # Full dataset:
+    python scripts/02b_spineps_selective.py \
+        --nifti_dir       results/nifti \
+        --spineps_dir     results/spineps \
+        --series_csv      data/raw/train_series_descriptions.csv \
+        --valid_ids       models/valid_id.npy \
+        --all
 """
 
 import argparse
@@ -207,7 +218,7 @@ def compute_uncertainty_from_softmax(derivatives_dir: Path, study_id: str,
         if not logits_files:
             return False
 
-        softmax     = np.load(logits_files[0])['arr_0']  # (H, W, D, C)
+        softmax     = np.load(logits_files[0])['arr_0']
         epsilon     = 1e-8
         entropy     = -np.sum(softmax * np.log(softmax + epsilon), axis=-1)
         num_classes = softmax.shape[-1]
@@ -382,6 +393,16 @@ def select_studies(csv_path: Path, top_n: int, rank_by: str,
     return selected, df_sorted
 
 
+def select_all_studies(nifti_dir: Path, series_df: pd.DataFrame,
+                       valid_ids: set | None) -> list[str]:
+    """Return all study IDs that have NIfTI data and are in valid_ids."""
+    all_ids = sorted(d.name for d in nifti_dir.iterdir() if d.is_dir())
+    if valid_ids is not None:
+        all_ids = [s for s in all_ids if s in valid_ids]
+        logger.info(f"Filtered to {len(all_ids)} studies via valid_ids")
+    return all_ids
+
+
 def already_segmented(study_id: str, spineps_dir: Path) -> bool:
     return (spineps_dir / 'segmentations' / study_id /
             f"{study_id}_seg-vert_msk.nii.gz").exists()
@@ -393,10 +414,11 @@ def already_segmented(study_id: str, spineps_dir: Path) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Run SPINEPS on top-N / bottom-N uncertainty studies'
+        description='Run SPINEPS on top-N / bottom-N uncertainty studies, or ALL valid studies'
     )
-    parser.add_argument('--uncertainty_csv', required=True,
-                        help='results/epistemic_uncertainty/lstv_uncertainty_metrics.csv')
+    parser.add_argument('--uncertainty_csv', default=None,
+                        help='results/epistemic_uncertainty/lstv_uncertainty_metrics.csv '
+                             '(not required when --all is set)')
     parser.add_argument('--nifti_dir',       required=True,
                         help='results/nifti')
     parser.add_argument('--spineps_dir',     required=True,
@@ -405,27 +427,32 @@ def main():
                         help='data/raw/train_series_descriptions.csv')
     parser.add_argument('--valid_ids',       default=None,
                         help='models/valid_id.npy')
-    parser.add_argument('--top_n',           type=int, required=True,
-                        help='Studies from each end of the ranking')
+    parser.add_argument('--top_n',           type=int, default=None,
+                        help='Studies from each end of the ranking (ignored with --all)')
     parser.add_argument('--rank_by',         default='l5_s1_confidence',
                         help='CSV column to rank by (default: l5_s1_confidence)')
+    parser.add_argument('--all',             action='store_true',
+                        help='Process every valid study regardless of uncertainty CSV')
     parser.add_argument('--dry_run',         action='store_true',
                         help='Print selected studies without running SPINEPS')
     args = parser.parse_args()
 
-    uncertainty_csv = Path(args.uncertainty_csv)
-    nifti_dir       = Path(args.nifti_dir)
-    spineps_dir     = Path(args.spineps_dir)
-    series_csv      = Path(args.series_csv)
-    progress_file   = spineps_dir / 'progress_selective.json'
-    seg_dir         = spineps_dir / 'segmentations'
-    metadata_dir    = spineps_dir / 'metadata'
+    if not args.all and (args.uncertainty_csv is None or args.top_n is None):
+        parser.error("--uncertainty_csv and --top_n are required unless --all is set")
+
+    nifti_dir     = Path(args.nifti_dir)
+    spineps_dir   = Path(args.spineps_dir)
+    series_csv    = Path(args.series_csv)
+    progress_file = spineps_dir / 'progress_selective.json'
+    seg_dir       = spineps_dir / 'segmentations'
+    metadata_dir  = spineps_dir / 'metadata'
 
     seg_dir.mkdir(parents=True, exist_ok=True)
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
+    mode_label = 'ALL VALID STUDIES' if args.all else f'top/bottom {args.top_n} by {args.rank_by}'
     logger.info("=" * 70)
-    logger.info(f"SPINEPS SELECTIVE — top/bottom {args.top_n} by {args.rank_by}")
+    logger.info(f"SPINEPS SEGMENTATION — {mode_label}")
     logger.info("=" * 70)
 
     # Load valid IDs
@@ -438,36 +465,44 @@ def main():
             logger.error(f"Failed to load valid_ids: {e}")
             return 1
 
+    # Load series CSV early (needed for --all study discovery)
+    series_df = load_series_csv(series_csv)
+    if series_df is None:
+        logger.error("Cannot load series CSV — aborting")
+        return 1
+
     # Select studies
-    selected_ids, df_ranked = select_studies(
-        uncertainty_csv, args.top_n, args.rank_by, valid_ids
-    )
+    if args.all:
+        selected_ids = select_all_studies(nifti_dir, series_df, valid_ids)
+        df_ranked    = None
+        logger.info(f"Total studies to process: {len(selected_ids)}")
+    else:
+        selected_ids, df_ranked = select_studies(
+            Path(args.uncertainty_csv), args.top_n, args.rank_by, valid_ids
+        )
 
     skip_already_done = [s for s in selected_ids if already_segmented(s, spineps_dir)]
     to_run            = [s for s in selected_ids if not already_segmented(s, spineps_dir)]
 
     logger.info(f"\nSelected:       {len(selected_ids)}")
-    logger.info(f"Already done:   {len(skip_already_done)} (skipping: {skip_already_done})")
+    logger.info(f"Already done:   {len(skip_already_done)} (skipping)")
     logger.info(f"To run SPINEPS: {len(to_run)}")
 
     if args.dry_run:
         logger.info("\n--- DRY RUN ---")
         for sid in to_run:
-            row   = df_ranked[df_ranked['study_id'] == sid]
-            score = float(row[args.rank_by].iloc[0]) if not row.empty else float('nan')
-            logger.info(f"  {sid}  {args.rank_by}={score:.4f}")
-        logger.info("--- DRY RUN complete — nothing was run ---")
+            if df_ranked is not None:
+                row   = df_ranked[df_ranked['study_id'] == sid]
+                score = float(row[args.rank_by].iloc[0]) if not row.empty else float('nan')
+                logger.info(f"  {sid}  {args.rank_by}={score:.4f}")
+            else:
+                logger.info(f"  {sid}")
+        logger.info(f"--- DRY RUN complete — {len(to_run)} would be run ---")
         return 0
 
     if not to_run:
         logger.info("\nAll selected studies already segmented.")
-        logger.info(f"Edit TOP_N in the slurm script and resubmit to segment more.")
         return 0
-
-    series_df = load_series_csv(series_csv)
-    if series_df is None:
-        logger.error("Cannot load series CSV — aborting")
-        return 1
 
     progress      = load_progress(progress_file)
     success_count = 0
@@ -476,7 +511,6 @@ def main():
     for study_id in tqdm(to_run, desc='SPINEPS'):
         logger.info(f"\n[{study_id}]")
 
-        # Re-check in case a parallel process finished it
         if already_segmented(study_id, spineps_dir):
             logger.info(f"  Already segmented since last check — skipping")
             mark_success(progress, study_id)
@@ -496,7 +530,6 @@ def main():
                           f"sub-{study_id}_acq-sag_T2w.nii.gz")
             if not nifti_path.exists():
                 logger.warning(f"  NIfTI not found: {nifti_path}")
-                logger.warning(f"  Run 01_dicom_to_nifti.sh first for this study")
                 mark_failed(progress, study_id)
                 save_progress(progress_file, progress)
                 error_count += 1
@@ -516,10 +549,13 @@ def main():
             save_progress(progress_file, progress)
             success_count += 1
 
-            row = df_ranked[df_ranked['study_id'] == study_id]
-            if not row.empty:
-                score = float(row[args.rank_by].iloc[0])
-                logger.info(f"  ✓  {args.rank_by}={score:.4f}")
+            if df_ranked is not None:
+                row = df_ranked[df_ranked['study_id'] == study_id]
+                if not row.empty:
+                    score = float(row[args.rank_by].iloc[0])
+                    logger.info(f"  ✓  {args.rank_by}={score:.4f}")
+            else:
+                logger.info(f"  ✓  complete")
 
         except KeyboardInterrupt:
             logger.warning("\nInterrupted — progress saved")

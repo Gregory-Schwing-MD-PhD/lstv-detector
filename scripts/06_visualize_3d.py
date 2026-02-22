@@ -1,424 +1,131 @@
 #!/usr/bin/env python3
 """
-06_visualize_3d.py  —  Comprehensive Interactive 3D Spine Segmentation Viewer
-==============================================================================
-ISOTROPIC-FIRST ARCHITECTURE
-  Every mask is resampled to 1×1×1 mm³ BEFORE meshing or measurement.
-  Root cause of missing TP voxels: sagittal MRI is ~4.88×0.94×0.94 mm
-  (only 15 slices).  A TP spanning 1-2 slices collapses to a flat sheet
-  under step-subsampling; marching cubes finds no isosurface.
-  After zoom to 1mm³ those same slices become ~5 solid voxels → MC works.
+06_visualize_3d_v2.py  —  Interactive 3D Spine Viewer (Morphometrics-JSON Edition)
+===================================================================================
+Reads pre-computed morphometrics from 05_morphometrics.py JSON output.
+NO re-computation of measurements; this script only does:
+  1. NIfTI load + isotropic resample (for mesh geometry)
+  2. Marching-cubes surface meshing
+  3. 3D annotation placement (fixed: offset from volume, not at origin)
+  4. HTML assembly
 
-SPINEPS seg-spine_msk labels (from README):
-  26=Sacrum  41=Arcus_Vertebrae  42=Spinosus_Process
-  43=Costal_Process_Left  44=Costal_Process_Right
-  45=Superior_Articular_Left   46=Superior_Articular_Right
-  47=Inferior_Articular_Left   48=Inferior_Articular_Right
-  49=Vertebra_Corpus_border    60=Spinal_Cord  61=Spinal_Canal
-  62=Endplate (all vertebrae merged, single label)
-  100=Vertebra_Disc (all discs merged, single label)
-  NOTE: label 43/44 are COSTAL (transverse) processes, not generic TPs.
+KEY CHANGE from v1:
+  All morphometric values come from --morphometrics_json (output of 05_morphometrics.py).
+  If JSON is absent, falls back to inline engine computation so the script is still
+  independently usable.
 
-VERIDAH seg-vert_msk labels (from README):
-  1-7=C1-C7  8-19=T1-T12  28=T13  20=L1  21-25=L2-L6  26=Sacrum
-  100+X = IVD below vertebra X    (e.g. 120 = IVD below T12=19)
-  200+X = Endplate of vertebra X  (e.g. 220 = endplate of L1=20)
-  → Per-vertebra endplates (200+X) are used for endplate-to-endplate DHI.
+ANNOTATION FIX:
+  All morphometric text is now rendered in an HTML panel on the right side of the page
+  (matching the style of the legend on the left), completely outside the 3D scene.
+  The Ian-Pan confidence bar chart has been removed entirely.
 
-TotalSpineSeg step2_output labels (from README / tss_map.json):
-  1=spinal_cord   2=spinal_canal
-  11-17=C1-C7     21-32=T1-T12    41-45=L1-L5    50=sacrum
-  63-67=disc_C2_C3..C6_C7   71=disc_C7_T1
-  72-82=disc_T1_T2..T11_T12
-  91=disc_T12_L1  92-95=disc_L1_L2..L4_L5  100=disc_L5_S
-  ⚠  TSS 26=vertebrae_T6  (SPINEPS 26=Sacrum — DIFFERENT files, no conflict)
-  ⚠  TSS 41-45=L1-L5 bodies  ≠  SPINEPS 41-48=sub-region structures
-  NOTE: TSS cord/canal are preferred over SPINEPS for morphometrics because
-        TSS covers the full spine while SPINEPS may truncate at L5/S1.
-
-MORPHOMETRICS IMPLEMENTED (from Spine_Morphometrics__Beyond_Basic_Measurements.pdf):
-─────────────────────────────────────────────────────────────────────────────────
-1. VERTEBRAL BODY MORPHOMETRY
-   • Genant SQ grading (normal/mild/moderate/severe)
-   • QM: Ha (anterior height), Hm (middle height), Hp (posterior height)
-   • Height Ratios: Compression (Hm/Ha or Hm/Hp), Wedge (Ha/Hp), Crush (Hp/Ha)
-     – Threshold <0.8 for biconcave / wedge / posterior height loss
-   • Wedge Ratio <0.75 → Moderate/Severe fracture intervention threshold
-   • Lumbar Lordosis Angle (LLA) from vertebral body anterior>posterior height
-   • Sagittal Translation ≥3mm → degenerative spondylolisthesis
-
-2. TRANSLATIONAL INSTABILITY
-   • Sagittal translation (linear displacement mm; normal <2-4mm)
-   • RDT Index: translation per degree of rotation
-   • AVI-Index: vertical motion perpendicular to endplate
-
-3. MODIC CHANGES
-   • Type 1: T1↓ T2↑ → fibrovascular/edema
-   • Type 2: T1↑ T2 iso/↑ → fatty replacement
-   • Type 3: T1↓ T2↓ → sclerosis
-   • MCG Grade A <25%, Grade B 25-50%, Grade C >50% vertebral body
-
-4. INTERVERTEBRAL DISC (IVD) MORPHOMETRICS
-   • DHI: DHI = (Ha+Hp)/(Ds+Di) × 100  (Farfan method)
-   • DHI Method 1: ratio anterior+posterior height / disc diameter
-   • DHI Method 2: ratio mid-disc height / mid-vertebral body height
-   • DHI Method 3: ratio mid-disc height / disc diameter
-   • DHI Method 6: mean IVD height / mean vertebral heights
-   • Pfirrmann Grades I–V (nucleus/annulus distinction, signal, height)
-   • NP-to-CSA ratio (nucleus pulposus / cross-sectional area)
-   • DSC reliability threshold >90 for DHI measurements
-
-5. CENTRAL SPINAL CANAL STENOSIS
-   • DSCA thresholds: Normal >100mm², Relative 75-100mm², Absolute <70-75mm²
-   • AP diameter: Normal >12mm, Relative 10-12mm, Absolute <7-10mm
-   • Canal shape per level: L1-L2 oval, L3-L4 triangular, L5 trefoil (60-65%)
-   • Trefoil → predisposed to lateral recess narrowing
-   • Critical threshold 11.13mm (Indian population study)
-   • AP mean absolute error 0.59–0.75mm (SpineLogic benchmark)
-
-6. LATERAL RECESS STENOSIS
-   • LRD (Lateral Recess Depth) ≤3mm → stenosis threshold
-   • LRA (Lateral Recess Angle) → superior predictor vs interfacet distance
-   • Lateral Recess Height ≤2mm → stenosis
-   • NPLC distance 0.7±0.3cm from dura at L4-L5
-   • Trefoil narrowing vs acute angular pinch mechanisms
-
-7. NEURAL FORAMINAL STENOSIS
-   • Lee Grade 0-3: normal / mild / moderate / severe (κ>0.81)
-   • Volumetric elliptical cylinder: V = π × a × b × H / 4
-     Level norms: L1/L2 ~580mm³, L2/L3 ~700mm³, L3/L4 ~770mm³,
-                  L4/L5 ~800mm³, L5/S1 ~824mm³
-   • N/F ratio (nerve root / foramen occupancy)
-   • Grade 3 threshold → intervention (morphologic nerve change)
-
-8. LIGAMENTUM FLAVUM
-   • Normal LFT baseline 3.5mm at L4-L5
-   • Hypertrophied LFT ≥ upper limit for healthy adults
-   • Severe LFH → high risk neurogenic claudication
-   • LFA cutoff 105.90mm² → optimal predictor central canal stenosis
-   • LFA preferred over LFT (encompasses full cross-sectional burden)
-   • LFT higher on left; increases with age
-
-9. BAASTRUP DISEASE (Kissing Spine)
-   • Spinous process apposition → cortical sclerosis/hypertrophy
-   • Interspinous bursitis (T2/STIR high signal)
-   • Osseous remodeling (flattening/enlargement)
-   • Epidural extension → midline epidural cysts → thecal compression
-   • Most prevalent L4-L5; incidence 81% in symptomatic >80 yrs
-
-10. FACET JOINT MORPHOMETRICS
-    • Grogan MRI grades 1-4 (cartilage integrity)
-    • Weishaupt CT/MRI grades 1-4 (joint space width; normal 2-4mm, mild <2mm)
-    • Facet orientation angle (transverse plane vs midsagittal)
-    • Facet Tropism (FT) = |angle_R - angle_L|
-      Ko grade 0: ≤7° (normal), Grade 1: 7-x° (disc prolapse risk),
-      Grade 2: ≥x° (spondylolisthesis risk)
-    • Thresholds vary: 7°, 8°, 10° in literature
-    • FT accelerates disc dehydration via shear forces
-
-11. CERVICAL SPINE MORPHOMETRICS
-    • MSCC: Modified Spinal Cord Compression (normalized AP cord diameter)
-    • CSA: cross-sectional area of cord → conservative vs operative threshold
-    • K-Line: C2-C7 midpoint line; K-line negative = anterior contact → surgery
-    • Dice >0.90 benchmark for cervical anatomy automated systems
-
-12. INTEGRATED CLINICAL THRESHOLDS (summary table)
-    • Central Stenosis DSCA <70mm²
-    • Lateral Recess Depth ≤2mm (severe)
-    • Foraminal Lee Grade 3
-    • LF Hypertrophy >5mm
-    • Disc Degeneration Grade V / >50% height loss
-    • Vertebral Deformity ratio <0.75
-    • Modic Burden Grade C (>50% vertebral volume)
+Label reference — see 04_detect_lstv.py and morphometrics_engine.py for full tables.
 """
 
 import argparse, json, logging, traceback
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import nibabel as nib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from scipy.ndimage import (binary_fill_holes, distance_transform_edt,
-                           gaussian_filter, label as cc_label,
-                           zoom as ndizoom)
+from scipy.ndimage import (binary_fill_holes, gaussian_filter,
+                            label as cc_label, zoom as ndizoom)
 from skimage.measure import marching_cubes
+
+# Engine — import for fallback computation and constants only
+from morphometrics_engine import (
+    T, ISO_MM, TP_HEIGHT_MM, CONTACT_DIST_MM,
+    SP_TP_L, SP_TP_R, SP_SACRUM, SP_CORD, SP_CANAL,
+    SP_ARCUS, SP_SPINOUS, SP_SAL, SP_SAR, SP_IAL, SP_IAR,
+    SP_CORPUS, SP_ENDPLATE, SP_IVD,
+    VD_L1, VD_L2, VD_L3, VD_L4, VD_L5, VD_L6, VD_SAC,
+    VD_IVD_BASE, VD_EP_BASE,
+    TSS_CORD, TSS_CANAL, TSS_SACRUM,
+    VERIDAH_LUMBAR_LABELS, VERIDAH_NAMES,
+    LUMBAR_PAIRS, CANAL_SHAPE,
+    load_study_masks, run_all_morphometrics,
+)
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ── Label maps ────────────────────────────────────────────────────────────────
+# ─── Annotation geometry ──────────────────────────────────────────────────────
 
-SPINE_MASK_LABELS = [                              # (lbl, name, colour, op, fill, smooth)
-    # fill=False and low smooth for thin flat structures (endplates, TPs, canal)
-    # fill=True  for solid volumetric structures
-    ( 26, 'Sacrum (spine)',          '#ff8c00', 0.72, True,  1.5),
-    ( 41, 'Arcus Vertebrae',         '#8855cc', 0.55, True,  1.5),
-    ( 42, 'Spinous Process',         '#e8c84a', 0.75, True,  1.5),
-    ( 43, 'TP Left  (costal 43)',    '#ff3333', 0.95, False, 1.0),
-    ( 44, 'TP Right (costal 44)',    '#00d4ff', 0.95, False, 1.0),
-    ( 45, 'Sup Articular Left',      '#66ccaa', 0.65, True,  1.5),
-    ( 46, 'Sup Articular Right',     '#44aa88', 0.65, True,  1.5),
-    ( 47, 'Inf Articular Left',      '#aaddcc', 0.60, True,  1.5),
-    ( 48, 'Inf Articular Right',     '#88ccbb', 0.60, True,  1.5),
-    ( 49, 'Vertebra Corpus Border',  '#6699cc', 0.40, True,  1.5),
-    ( 60, 'Spinal Cord',             '#ffe066', 0.65, False, 1.2),
-    ( 61, 'Spinal Canal',            '#00ffb3', 0.18, False, 1.0),
-    # Endplate: fill_holes=False (it IS a surface — filling destroys the mesh),
-    # smooth=0.6 (thin structure — high sigma washes it out below 0.5 threshold),
-    # bright coral so it registers visually on top of vertebral bodies
-    ( 62, 'Endplate',                '#ff6b6b', 0.80, False, 0.6),
-    (100, 'IVD (spine, all)',         '#ffcc44', 0.55, True,  1.5),
-]
-
-VERIDAH_CERVICAL = {i: (f'C{i}',    '#557799', 0.20) for i in range(1, 8)}
-VERIDAH_THORACIC = {i+7: (f'T{i+1}','#447766', 0.20) for i in range(12)}
-VERIDAH_THORACIC[28] = ('T13', '#447766', 0.20)
-VERIDAH_LUMBAR = {
-    20: ('L1',              '#1e6fa8', 0.48),
-    21: ('L2',              '#2389cc', 0.48),
-    22: ('L3',              '#29a3e8', 0.48),
-    23: ('L4',              '#52bef5', 0.50),
-    24: ('L5',              '#85d4ff', 0.52),
-    25: ('L6',              '#aae3ff', 0.52),
-    26: ('Sacrum (vert 26)','#ff8c00', 0.62),
-}
-VERIDAH_IVD_BASE    = 100
-VERIDAH_IVD_COLOURS = {20:'#ffe28a',21:'#ffd060',22:'#ffb830',
-                        23:'#ff9900',24:'#ff7700',25:'#ff5500'}
-VERIDAH_NAMES = {**{k:v[0] for k,v in VERIDAH_LUMBAR.items()},
-                 **{k:v[0] for k,v in VERIDAH_CERVICAL.items()},
-                 **{k:v[0] for k,v in VERIDAH_THORACIC.items()}}
-LUMBAR_LABELS_ORDERED = [25, 24, 23, 22, 21, 20]
-
-TSS_SACRUM_LABEL = 50
-
-# Complete TotalSpineSeg label map from README (tss_map.json)
-# Cervical vertebrae:  11-17 = C1-C7
-# Thoracic vertebrae:  21-32 = T1-T12
-# Lumbar vertebrae:    41-45 = L1-L5
-# Sacrum:              50
-# Cervical discs:      63-67 = C2-C3 … C6-C7,  71 = C7-T1
-# Thoracic discs:      72-82 = T1-T2 … T11-T12
-# Thoracolumbar/lumbar discs: 91-95, 100
-# ⚠  TSS vertebra labels DO NOT match SPINEPS sub-region labels —
-#    TSS 41=L1 body, 43=L3 body, 44=L4 body (SPINEPS 43=TP-L, 44=TP-R)
-TSS_LABELS = [
-    # Cord & Canal
-    (  1, 'TSS Cord',          '#ffe066', 0.50),
-    (  2, 'TSS Canal',         '#00ffb3', 0.14),
-    # Cervical vertebrae (hidden by default — low opacity, toggle in legend)
-    ( 11, 'TSS C1',            '#88aabb', 0.18),
-    ( 12, 'TSS C2',            '#88aabb', 0.18),
-    ( 13, 'TSS C3',            '#88aabb', 0.18),
-    ( 14, 'TSS C4',            '#88aabb', 0.18),
-    ( 15, 'TSS C5',            '#88aabb', 0.18),
-    ( 16, 'TSS C6',            '#88aabb', 0.18),
-    ( 17, 'TSS C7',            '#88aabb', 0.18),
-    # Thoracic vertebrae
-    ( 21, 'TSS T1',            '#447766', 0.18),
-    ( 22, 'TSS T2',            '#447766', 0.18),
-    ( 23, 'TSS T3',            '#447766', 0.18),
-    ( 24, 'TSS T4',            '#447766', 0.18),
-    ( 25, 'TSS T5',            '#447766', 0.18),
-    ( 26, 'TSS T6',            '#447766', 0.18),
-    ( 27, 'TSS T7',            '#447766', 0.18),
-    ( 28, 'TSS T8',            '#447766', 0.18),
-    ( 29, 'TSS T9',            '#447766', 0.18),
-    ( 30, 'TSS T10',           '#447766', 0.18),
-    ( 31, 'TSS T11',           '#447766', 0.22),
-    ( 32, 'TSS T12',           '#447766', 0.22),
-    # Lumbar vertebrae (higher opacity — primary region of interest)
-    ( 41, 'TSS L1',            '#1e6fa8', 0.25),
-    ( 42, 'TSS L2',            '#2389cc', 0.25),
-    ( 43, 'TSS L3',            '#29a3e8', 0.25),
-    ( 44, 'TSS L4',            '#52bef5', 0.25),
-    ( 45, 'TSS L5',            '#85d4ff', 0.28),
-    # Sacrum
-    ( 50, 'TSS Sacrum',        '#ff8c00', 0.65),
-    # Cervical discs
-    ( 63, 'TSS disc C2-C3',    '#d4e8ff', 0.35),
-    ( 64, 'TSS disc C3-C4',    '#d4e8ff', 0.35),
-    ( 65, 'TSS disc C4-C5',    '#d4e8ff', 0.35),
-    ( 66, 'TSS disc C5-C6',    '#d4e8ff', 0.35),
-    ( 67, 'TSS disc C6-C7',    '#d4e8ff', 0.35),
-    ( 71, 'TSS disc C7-T1',    '#d4e8ff', 0.35),
-    # Thoracic discs (shown but semi-transparent)
-    ( 72, 'TSS disc T1-T2',    '#ffe8aa', 0.28),
-    ( 73, 'TSS disc T2-T3',    '#ffe8aa', 0.28),
-    ( 74, 'TSS disc T3-T4',    '#ffe8aa', 0.28),
-    ( 75, 'TSS disc T4-T5',    '#ffe8aa', 0.28),
-    ( 76, 'TSS disc T5-T6',    '#ffe8aa', 0.28),
-    ( 77, 'TSS disc T6-T7',    '#ffe8aa', 0.28),
-    ( 78, 'TSS disc T7-T8',    '#ffe8aa', 0.28),
-    ( 79, 'TSS disc T8-T9',    '#ffe8aa', 0.28),
-    ( 80, 'TSS disc T9-T10',   '#ffe8aa', 0.28),
-    ( 81, 'TSS disc T10-T11',  '#ffe8aa', 0.30),
-    ( 82, 'TSS disc T11-T12',  '#ffe28a', 0.40),
-    # Thoracolumbar and lumbar discs (primary — full opacity gradient)
-    ( 91, 'TSS disc T12-L1',   '#ffd060', 0.45),
-    ( 92, 'TSS disc L1-L2',    '#ffb830', 0.50),
-    ( 93, 'TSS disc L2-L3',    '#ff9900', 0.50),
-    ( 94, 'TSS disc L3-L4',    '#ff7700', 0.50),
-    ( 95, 'TSS disc L4-L5',    '#ff5500', 0.52),
-    (100, 'TSS disc L5-S',     '#ff3300', 0.55),
-]
-
-# TSS label lookup for morphometric use (vertebra body labels only)
-TSS_LUMBAR_LABELS = {41:'L1', 42:'L2', 43:'L3', 44:'L4', 45:'L5'}
-TSS_DISC_LABELS = {
-    91:'T12-L1', 92:'L1-L2', 93:'L2-L3', 94:'L3-L4', 95:'L4-L5', 100:'L5-S1'
-}
-
-# VERIDAH per-vertebra endplate labels: 200+X → endplate of vertebra X
-# These are separate from the SPINEPS global label 62 (all endplates merged)
-VERIDAH_ENDPLATE_BASE = 200
-# Same vertebra labels as IVD: L1=20, L2=21, L3=22, L4=23, L5=24, L6=25
-VERIDAH_ENDPLATE_COLOUR = '#ff8888'  # bright coral — distinct from #ff6b6b SPINEPS endplate
-
-TP_LEFT_LABEL   = 43
-TP_RIGHT_LABEL  = 44
-SPINEPS_SACRUM  = 26
-TP_HEIGHT_MM    = 19.0
-CONTACT_DIST_MM = 2.0
-ISO_MM          = 1.0    # ← isotropic target voxel size in mm
+BBOX_HALF = 16
 
 IAN_PAN_LEVELS = ['l1_l2','l2_l3','l3_l4','l4_l5','l5_s1']
 IAN_PAN_LABELS = ['L1-L2','L2-L3','L3-L4','L4-L5','L5-S1']
-
-_VALID_S3D_SYM = {'circle','circle-open','cross','diamond',
+_VALID_SYM     = {'circle','circle-open','cross','diamond',
                   'diamond-open','square','square-open','x'}
 
-# ── Morphometric clinical thresholds (PDF reference) ─────────────────────────
+# ─── Label colour tables ──────────────────────────────────────────────────────
 
-class VertebralThresholds:
-    """Genant/QM vertebral body morphometry thresholds."""
-    COMPRESSION_RATIO_BICONCAVE  = 0.80   # Hm/Ha or Hm/Hp < 0.8 → biconcave
-    WEDGE_RATIO_FRACTURE         = 0.80   # Ha/Hp < 0.8 → anterior wedge
-    CRUSH_RATIO_POSTERIOR        = 0.80   # Hp/Ha < 0.8 → posterior loss
-    HEIGHT_RATIO_INTERVENTION    = 0.75   # <0.75 → moderate/severe fracture
-    SPONDYLOLISTHESIS_MM         = 3.0    # ≥3mm sagittal translation
-    SAGITTAL_TRANSLATION_NORMAL  = 4.0    # <2-4mm normal
+# (lbl, name, colour, opacity, fill_holes, max_smooth_sigma)
+SPINE_LABELS = [
+    ( 26, 'Sacrum (spine)',        '#ff8c00', 0.72, True,  1.5),
+    ( 41, 'Arcus Vertebrae',       '#8855cc', 0.55, True,  1.5),
+    ( 42, 'Spinous Process',       '#e8c84a', 0.75, True,  1.5),
+    ( 43, 'TP Left (costal)',      '#ff3333', 0.95, False, 1.0),
+    ( 44, 'TP Right (costal)',     '#00d4ff', 0.95, False, 1.0),
+    ( 45, 'Sup Articular Left',    '#66ccaa', 0.65, True,  1.5),
+    ( 46, 'Sup Articular Right',   '#44aa88', 0.65, True,  1.5),
+    ( 47, 'Inf Articular Left',    '#aaddcc', 0.60, True,  1.5),
+    ( 48, 'Inf Articular Right',   '#88ccbb', 0.60, True,  1.5),
+    ( 49, 'Corpus Border',         '#6699cc', 0.40, True,  1.5),
+    ( 60, 'Spinal Cord',           '#ffe066', 0.65, False, 1.2),
+    ( 61, 'Spinal Canal',          '#00ffb3', 0.18, False, 1.0),
+    ( 62, 'Endplate (merged)',      '#ff6b6b', 0.80, False, 0.6),
+    (100, 'IVD (spine, all)',       '#ffcc44', 0.55, True,  1.5),
+]
 
-class DiscThresholds:
-    """IVD morphometric thresholds."""
-    DHI_SEVERE_LOSS_PCT          = 50.0   # >50% height loss → intervention
-    PFIRRMANN_INTERVENTION_GRADE = 5      # Grade V → intervention
-
-class CanalThresholds:
-    """Spinal canal stenosis thresholds."""
-    DSCA_NORMAL_MM2              = 100.0  # >100 mm² normal
-    DSCA_RELATIVE_LOW_MM2        = 75.0   # 75-100 mm² relative stenosis
-    DSCA_ABSOLUTE_MM2            = 70.0   # <70-75 mm² absolute stenosis
-    AP_NORMAL_MM                 = 12.0   # >12mm normal
-    AP_RELATIVE_LOW_MM           = 10.0   # 10-12mm relative
-    AP_ABSOLUTE_MM               = 7.0    # <7-10mm absolute
-    AP_CRITICAL_INDIAN_MM        = 11.13  # critical symptom threshold
-    AP_AI_ERROR_LOW_MM           = 0.59   # SpineLogic MAE range low
-    AP_AI_ERROR_HIGH_MM          = 0.75   # SpineLogic MAE range high
-
-class LateralRecessThresholds:
-    """Lateral recess stenosis thresholds."""
-    DEPTH_STENOSIS_MM            = 3.0    # LRD ≤3mm → stenosis
-    HEIGHT_STENOSIS_MM           = 2.0    # LR height ≤2mm → stenosis
-    NPLC_DISTANCE_MEAN_CM        = 0.7    # narrowest point 0.7±0.3cm from dura at L4-L5
-    NPLC_DISTANCE_SD_CM          = 0.3
-
-class ForaminalThresholds:
-    """Neural foraminal morphometric thresholds."""
-    LEE_INTERVENTION_GRADE       = 3      # Grade 3 → nerve morphologic change
-    LEE_KAPPA                    = 0.81   # nearly perfect interobserver agreement
-    # Normative foraminal volumes (mm³) from elliptical cylinder approximation
-    VOLUME_NORMS = {
-        'L1_L2': {'R': 579.92, 'L': 594.43, 'sd_R': 55, 'sd_L': 44},
-        'L2_L3': {'R': 688.22, 'L': 715.87, 'sd_R': 55, 'sd_L': 48},
-        'L3_L4': {'R': 761.70, 'L': 790.30, 'sd_R': 59, 'sd_L': 50},
-        'L4_L5': {'R': 787.82, 'L': 809.61, 'sd_R': 29, 'sd_L': 57},
-        'L5_S1': {'R': 824.24, 'L': None,   'sd_R': 68, 'sd_L': None},
-    }
-
-class LigamentumFlavumThresholds:
-    """Ligamentum Flavum thickness/area thresholds."""
-    LFT_NORMAL_BASELINE_MM       = 3.5    # baseline at L4-L5
-    LFT_HYPERTROPHY_MM           = 4.0    # upper limit healthy adults (varies)
-    LFT_SEVERE_MM                = 5.0    # >5mm significant canal encroachment
-    LFA_STENOSIS_CUTOFF_MM2      = 105.90 # optimal predictor central canal stenosis
-
-class FacetThresholds:
-    """Facet joint morphometric thresholds."""
-    JOINT_SPACE_NORMAL_LOW_MM    = 2.0    # Weishaupt: normal 2-4mm
-    JOINT_SPACE_NORMAL_HIGH_MM   = 4.0
-    JOINT_SPACE_MILD_MM          = 2.0    # narrowing <2mm → mild
-    TROPISM_NORMAL_DEG           = 7.0    # Ko grade 0 ≤7°
-    TROPISM_MODERATE_DEG         = 7.0    # grade 1 start
-    TROPISM_SEVERE_DEG           = 10.0   # grade 2 (varies: 7°, 8°, 10° in literature)
-
-class ModicThresholds:
-    """Modic change burden thresholds."""
-    GRADE_A_MAX_PCT              = 25.0   # <25% vertebral body height/volume
-    GRADE_B_MAX_PCT              = 50.0   # 25-50%
-    GRADE_C_MIN_PCT              = 50.0   # >50%
-
-class CervicalThresholds:
-    """Cervical spine morphometric thresholds."""
-    CORD_DICE_AUTOMATED          = 0.90   # automated system benchmark
-    K_LINE_CONTACT_THRESHOLD     = 0.0    # K-line negative → anterior contact
-
-# ── Canal shape lookup per vertebral level ────────────────────────────────────
-
-CANAL_SHAPE_BY_LEVEL = {
-    'L1': ('Oval',       '85-95%'),
-    'L2': ('Oval',       '90%'),
-    'L3': ('Triangular', '80-95%'),
-    'L4': ('Triangular', '95%'),
-    'L5': ('Trefoil',    '60-65%'),
+VERIDAH_CERVICAL = {i: (f'C{i}','#557799',0.20) for i in range(1,8)}
+VERIDAH_THORACIC = {i+7: (f'T{i+1}','#447766',0.20) for i in range(12)}
+VERIDAH_THORACIC[28] = ('T13','#447766',0.20)
+VERIDAH_LUMBAR_MAP = {
+    20:('L1','#1e6fa8',0.48), 21:('L2','#2389cc',0.48),
+    22:('L3','#29a3e8',0.48), 23:('L4','#52bef5',0.50),
+    24:('L5','#85d4ff',0.52), 25:('L6','#aae3ff',0.52),
+    26:('Sacrum (vert 26)','#ff8c00',0.62),
 }
+VERIDAH_IVD_COLOURS = {20:'#ffe28a',21:'#ffd060',22:'#ffb830',
+                        23:'#ff9900',24:'#ff7700',25:'#ff5500'}
+VERIDAH_EP_COLOUR = '#ff8888'
 
-# ── Pfirrmann grade descriptions ──────────────────────────────────────────────
+TSS_LABELS = [
+    (1,'TSS Cord','#ffe066',0.50),(2,'TSS Canal','#00ffb3',0.14),
+    (11,'TSS C1','#88aabb',0.18),(12,'TSS C2','#88aabb',0.18),
+    (13,'TSS C3','#88aabb',0.18),(14,'TSS C4','#88aabb',0.18),
+    (15,'TSS C5','#88aabb',0.18),(16,'TSS C6','#88aabb',0.18),
+    (17,'TSS C7','#88aabb',0.18),
+    (21,'TSS T1','#447766',0.18),(22,'TSS T2','#447766',0.18),
+    (23,'TSS T3','#447766',0.18),(24,'TSS T4','#447766',0.18),
+    (25,'TSS T5','#447766',0.18),(26,'TSS T6','#447766',0.18),
+    (27,'TSS T7','#447766',0.18),(28,'TSS T8','#447766',0.18),
+    (29,'TSS T9','#447766',0.18),(30,'TSS T10','#447766',0.18),
+    (31,'TSS T11','#447766',0.22),(32,'TSS T12','#447766',0.22),
+    (41,'TSS L1','#1e6fa8',0.25),(42,'TSS L2','#2389cc',0.25),
+    (43,'TSS L3','#29a3e8',0.25),(44,'TSS L4','#52bef5',0.25),
+    (45,'TSS L5','#85d4ff',0.28),(50,'TSS Sacrum','#ff8c00',0.65),
+    (63,'TSS disc C2-C3','#d4e8ff',0.35),(64,'TSS disc C3-C4','#d4e8ff',0.35),
+    (65,'TSS disc C4-C5','#d4e8ff',0.35),(66,'TSS disc C5-C6','#d4e8ff',0.35),
+    (67,'TSS disc C6-C7','#d4e8ff',0.35),(71,'TSS disc C7-T1','#d4e8ff',0.35),
+    (72,'TSS disc T1-T2','#ffe8aa',0.28),(73,'TSS disc T2-T3','#ffe8aa',0.28),
+    (74,'TSS disc T3-T4','#ffe8aa',0.28),(75,'TSS disc T4-T5','#ffe8aa',0.28),
+    (76,'TSS disc T5-T6','#ffe8aa',0.28),(77,'TSS disc T6-T7','#ffe8aa',0.28),
+    (78,'TSS disc T7-T8','#ffe8aa',0.28),(79,'TSS disc T8-T9','#ffe8aa',0.28),
+    (80,'TSS disc T9-T10','#ffe8aa',0.28),(81,'TSS disc T10-T11','#ffe8aa',0.30),
+    (82,'TSS disc T11-T12','#ffe28a',0.40),
+    (91,'TSS disc T12-L1','#ffd060',0.45),(92,'TSS disc L1-L2','#ffb830',0.50),
+    (93,'TSS disc L2-L3','#ff9900',0.50),(94,'TSS disc L3-L4','#ff7700',0.50),
+    (95,'TSS disc L4-L5','#ff5500',0.52),(100,'TSS disc L5-S','#ff3300',0.55),
+]
 
-PFIRRMANN_GRADES = {
-    1: {'nucleus_annulus': 'Clear',   'signal': 'Hyperintense',
-        'height': 'Normal',                     'label': 'Grade I'},
-    2: {'nucleus_annulus': 'Clear',   'signal': 'Hyperintense (horiz bands)',
-        'height': 'Normal',                     'label': 'Grade II'},
-    3: {'nucleus_annulus': 'Unclear', 'signal': 'Intermediate',
-        'height': 'Normal to slight decrease',  'label': 'Grade III'},
-    4: {'nucleus_annulus': 'Lost',    'signal': 'Intermediate to Hypointense',
-        'height': 'Normal to moderate decrease','label': 'Grade IV'},
-    5: {'nucleus_annulus': 'Lost',    'signal': 'Hypointense (Black)',
-        'height': 'Collapsed',                  'label': 'Grade V'},
-}
+# ─── NIfTI + resample ────────────────────────────────────────────────────────
 
-# ── Genant SQ grading ─────────────────────────────────────────────────────────
-
-GENANT_GRADES = {
-    0: 'Normal',
-    1: 'Mild (20-25% height reduction)',
-    2: 'Moderate (25-40% height reduction)',
-    3: 'Severe (>40% height reduction)',
-}
-
-# ── Lee foraminal grading ─────────────────────────────────────────────────────
-
-LEE_GRADES = {
-    0: 'Normal — no stenosis, fat well-maintained',
-    1: 'Mild — fat obliteration 2 opposing directions',
-    2: 'Moderate — fat obliteration 4 directions, no nerve morphologic change',
-    3: 'Severe — morphologic change/compression of nerve root, fat lost',
-}
-
-# ── Modic type descriptions ───────────────────────────────────────────────────
-
-MODIC_TYPES = {
-    1: {'T1': 'Hypointense',  'T2': 'Hyperintense',      'basis': 'Fibrovascular tissue / bone marrow edema'},
-    2: {'T1': 'Hyperintense', 'T2': 'Iso/Hyperintense',  'basis': 'Fatty replacement of bone marrow'},
-    3: {'T1': 'Hypointense',  'T2': 'Hypointense',       'basis': 'Extensive subchondral bone sclerosis'},
-}
-
-# ── NIfTI loading ─────────────────────────────────────────────────────────────
-
-def load_canonical(path):
+def _load_canonical(path: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
     nii  = nib.load(str(path))
     nii  = nib.as_closest_canonical(nii)
     data = nii.get_fdata()
@@ -430,799 +137,95 @@ def load_canonical(path):
         raise ValueError(f"Cannot reduce {path.name} to 3D: {data.shape}")
     return data, nii
 
-def voxel_size_mm(nii):
+def _voxmm(nii):
     return np.abs(np.array(nii.header.get_zooms()[:3], dtype=float))
 
-# ── Isotropic resampling ──────────────────────────────────────────────────────
-
-def resample_label_vol_to_iso(label_vol, vox_mm, target_mm=ISO_MM):
-    """
-    Resample integer label volume to isotropic target_mm³ using
-    nearest-neighbour interpolation (order=0) so label values are preserved.
-    """
-    zoom_factors = (vox_mm / target_mm).tolist()
-    return ndizoom(label_vol.astype(np.int32), zoom_factors,
+def _resample(vol, vox_mm, target=ISO_MM):
+    return ndizoom(vol.astype(np.int32), (vox_mm/target).tolist(),
                    order=0, mode='nearest', prefilter=False).astype(np.int32)
 
-# ── Geometry helpers — all in isotropic mm space ──────────────────────────────
+# ─── Geometry helpers ─────────────────────────────────────────────────────────
 
-def centroid_mm(iso_mask):
-    coords = np.array(np.where(iso_mask))
-    if coords.size == 0:
-        return None
-    return coords.mean(axis=1) * ISO_MM
+def _centroid(mask):
+    c = np.array(np.where(mask))
+    return c.mean(axis=1)*ISO_MM if c.size else None
 
-def min_dist_mm(mask_a, mask_b):
-    if not mask_a.any() or not mask_b.any():
-        return float('inf'), None, None
-    dt      = distance_transform_edt(~mask_b) * ISO_MM
-    dist_at = np.where(mask_a, dt, np.inf)
-    flat    = int(np.argmin(dist_at))
-    vox_a   = np.array(np.unravel_index(flat, mask_a.shape))
-    dist_mm = float(dt[tuple(vox_a)])
-    cb      = np.array(np.where(mask_b))
-    d2      = ((cb.T - vox_a) ** 2).sum(axis=1)
-    vox_b   = cb[:, int(np.argmin(d2))]
-    return dist_mm, vox_a.astype(float) * ISO_MM, vox_b.astype(float) * ISO_MM
+def _min_dist(a, b):
+    from scipy.ndimage import distance_transform_edt
+    if not a.any() or not b.any(): return float('inf'), None, None
+    dt = distance_transform_edt(~b)*ISO_MM
+    di = np.where(a, dt, np.inf)
+    flat = int(np.argmin(di))
+    va = np.array(np.unravel_index(flat, a.shape), dtype=float)
+    dist = float(dt[tuple(va.astype(int))])
+    cb = np.array(np.where(b), dtype=float)
+    d2 = ((cb.T-va)**2).sum(axis=1)
+    vb = cb[:, int(np.argmin(d2))]
+    return dist, va*ISO_MM, vb*ISO_MM
 
-def tp_height_mm(tp_iso):
-    if not tp_iso.any():
-        return 0.0
-    zc = np.where(tp_iso)[2]
-    return (int(zc.max()) - int(zc.min())) * ISO_MM
-
-def inferiormost_cc(mask_iso, sac_iso=None):
-    if not mask_iso.any():
-        return np.zeros_like(mask_iso, dtype=bool)
-    labeled, n = cc_label(mask_iso)
-    if n == 1:
-        return mask_iso.astype(bool)
-    sac_z_min = None
-    if sac_iso is not None and sac_iso.any():
-        sac_z_min = int(np.where(sac_iso)[2].min())
-    cc_info = []
-    for i in range(1, n + 1):
-        comp = (labeled == i)
-        zc   = np.where(comp)[2]
-        cc_info.append((float(zc.mean()), int(zc.max()), comp))
-    cc_info.sort(key=lambda t: t[0])
-    if sac_z_min is not None:
-        cands = [c for _, zmax, c in cc_info if zmax < sac_z_min]
-        if cands:
-            return cands[0].astype(bool)
-    return cc_info[0][2].astype(bool)
-
-def isolate_at_z_range(mask_iso, z_lo, z_hi, margin=20):
-    out = np.zeros_like(mask_iso)
-    lo2 = max(0, z_lo - margin)
-    hi2 = min(mask_iso.shape[2] - 1, z_hi + margin)
-    out[:, :, lo2:hi2 + 1] = mask_iso[:, :, lo2:hi2 + 1]
-    return out
-
-def get_z_range(iso_mask):
-    if not iso_mask.any():
-        return None
-    zc = np.where(iso_mask)[2]
+def _z_range(mask):
+    if not mask.any(): return None
+    zc = np.where(mask)[2]
     return int(zc.min()), int(zc.max())
 
-# ── Morphometric computation functions ───────────────────────────────────────
+def _tp_h(tp):
+    if not tp.any(): return 0.0
+    zc = np.where(tp)[2]
+    return (int(zc.max())-int(zc.min()))*ISO_MM
 
-def compute_vertebral_heights(vert_mask_iso):
-    """
-    Estimate anterior (Ha), middle (Hm), posterior (Hp) heights from a single
-    vertebral body mask in isotropic mm space.
-
-    Strategy: sample the mask in the sagittal (X) dimension.
-    Anterior = front third of Y-extent, Posterior = rear third, Middle = mid.
-    Heights are measured as Z-extents of the sub-column.
-
-    Returns dict with Ha, Hm, Hp in mm (or None if mask empty).
-    """
-    if not vert_mask_iso.any():
-        return None
-    coords = np.array(np.where(vert_mask_iso))  # shape 3×N
-    ymin, ymax = int(coords[1].min()), int(coords[1].max())
-    y_range = ymax - ymin
-    if y_range < 3:
-        return None
-    third = max(1, y_range // 3)
-    y_ant = ymin + third
-    y_mid_lo, y_mid_hi = ymin + third, ymin + 2 * third
-    y_post = ymin + 2 * third
-
-    def z_span(y_lo, y_hi):
-        sub = vert_mask_iso[:, y_lo:y_hi+1, :]
-        if not sub.any():
-            return None
-        zc = np.where(sub)[2]
-        return (int(zc.max()) - int(zc.min()) + 1) * ISO_MM
-
-    ha = z_span(ymin,     y_ant)
-    hm = z_span(y_mid_lo, y_mid_hi)
-    hp = z_span(y_post,   ymax)
-    return {'Ha': ha, 'Hm': hm, 'Hp': hp}
-
-def compute_height_ratios(heights):
-    """
-    Compute Genant-style height ratios from Ha/Hm/Hp dict.
-    Returns dict with Compression, Wedge, Crush ratios and Genant grade.
-    """
-    if heights is None:
-        return {}
-    ha, hm, hp = heights.get('Ha'), heights.get('Hm'), heights.get('Hp')
-    result = {}
-    if ha and hm:
-        result['Compression_Hm_Ha'] = hm / ha
-    if hp and hm:
-        result['Compression_Hm_Hp'] = hm / hp
-    if ha and hp:
-        result['Wedge_Ha_Hp'] = ha / hp
-        result['Crush_Hp_Ha'] = hp / ha
-
-    # Genant SQ grade (simplified from ratio)
-    min_ratio = min(v for v in result.values() if v is not None) if result else 1.0
-    if min_ratio >= 0.80:
-        result['Genant_Grade'] = 0
-        result['Genant_Label'] = GENANT_GRADES[0]
-    elif min_ratio >= 0.75:
-        result['Genant_Grade'] = 1
-        result['Genant_Label'] = GENANT_GRADES[1]
-    elif min_ratio >= 0.60:
-        result['Genant_Grade'] = 2
-        result['Genant_Label'] = GENANT_GRADES[2]
-    else:
-        result['Genant_Grade'] = 3
-        result['Genant_Label'] = GENANT_GRADES[3]
-    return result
-
-def compute_disc_height_index(disc_mask_iso, sup_vert_mask, inf_vert_mask):
-    """
-    Compute DHI (Method 1 / Farfan) from IVD and adjacent vertebral masks.
-    DHI = (Ha + Hp) / (Ds + Di) × 100
-    where Ha,Hp = anterior/posterior disc heights, Ds,Di = sup/inf disc depths.
-    Returns DHI float or None.
-    """
-    if not disc_mask_iso.any():
-        return None
-    coords  = np.array(np.where(disc_mask_iso))
-    ymin, ymax = int(coords[1].min()), int(coords[1].max())
-    zmin, zmax = int(coords[2].min()), int(coords[2].max())
-    xmid = int(coords[0].mean())
-    third = max(1, (ymax - ymin) // 3)
-
-    def z_height(y_lo, y_hi):
-        sub = disc_mask_iso[xmid-2:xmid+3, y_lo:y_hi+1, :]
-        if not sub.any():
-            return None
-        zc = np.where(sub)[2]
-        return (int(zc.max()) - int(zc.min()) + 1) * ISO_MM
-
-    ha_disc = z_height(ymin, ymin + third)
-    hp_disc = z_height(ymax - third, ymax)
-
-    # Ds, Di from adjacent vertebral body Z-extents at disc level
-    def vert_depth(vmask):
-        if vmask is None or not vmask.any():
-            return None
-        sub = vmask[xmid-2:xmid+3, :, zmin:zmax+1]
-        if not sub.any():
-            return None
-        yc = np.where(sub)[1]
-        return (int(yc.max()) - int(yc.min()) + 1) * ISO_MM
-
-    ds = vert_depth(sup_vert_mask)
-    di = vert_depth(inf_vert_mask)
-
-    if ha_disc and hp_disc and ds and di and (ds + di) > 0:
-        return ((ha_disc + hp_disc) / (ds + di)) * 100.0
-    return None
-
-def compute_disc_height_method2(disc_mask_iso, vert_mask_iso):
-    """
-    DHI Method 2: mid-disc height / mid-vertebral body height.
-    """
-    if not disc_mask_iso.any() or not vert_mask_iso.any():
-        return None
-    xmid_d = int(np.where(disc_mask_iso)[0].mean())
-    xmid_v = int(np.where(vert_mask_iso)[0].mean())
-
-    def mid_z_height(mask, xmid):
-        col = mask[max(0,xmid-2):xmid+3, :, :]
-        if not col.any():
-            return None
-        zc = np.where(col)[2]
-        return (int(zc.max()) - int(zc.min()) + 1) * ISO_MM
-
-    hd = mid_z_height(disc_mask_iso, xmid_d)
-    hv = mid_z_height(vert_mask_iso, xmid_v)
-    if hd and hv and hv > 0:
-        return hd / hv
-    return None
-
-def compute_canal_ap_diameter(canal_mask_iso):
-    """
-    Estimate anteroposterior (AP) diameter of spinal canal from canal mask.
-    Measured as Y-extent of the canal in isotropic mm space.
-    Returns AP diameter in mm and area estimate.
-    """
-    if canal_mask_iso is None or not canal_mask_iso.any():
-        return None, None
-    coords  = np.array(np.where(canal_mask_iso))
-    xmid    = int(coords[0].mean())
-    # Slice at mid-X to get axial cross-section
-    axial   = canal_mask_iso[max(0,xmid-2):xmid+3, :, :]
-    if not axial.any():
-        return None, None
-    yc = np.where(axial)[1]
-    zc = np.where(axial)[2]
-    ap_mm = (int(yc.max()) - int(yc.min()) + 1) * ISO_MM
-    ml_mm = (int(zc.max()) - int(zc.min()) + 1) * ISO_MM
-    # Approximate DSCA as ellipse: π/4 × AP × ML
-    dsca_mm2 = (np.pi / 4.0) * ap_mm * ml_mm
-    return ap_mm, dsca_mm2
-
-def classify_canal_stenosis(ap_mm, dsca_mm2):
-    """
-    Classify central canal stenosis per clinical thresholds.
-    Returns (ap_class, dsca_class) strings.
-    """
-    ap_class = 'N/A'
-    dsca_class = 'N/A'
-    if ap_mm is not None:
-        if ap_mm > CanalThresholds.AP_NORMAL_MM:
-            ap_class = 'Normal'
-        elif ap_mm >= CanalThresholds.AP_RELATIVE_LOW_MM:
-            ap_class = 'Relative Stenosis'
-        elif ap_mm >= CanalThresholds.AP_ABSOLUTE_MM:
-            ap_class = 'Absolute Stenosis'
-        else:
-            ap_class = 'Critical Stenosis'
-    if dsca_mm2 is not None:
-        if dsca_mm2 > CanalThresholds.DSCA_NORMAL_MM2:
-            dsca_class = 'Normal'
-        elif dsca_mm2 >= CanalThresholds.DSCA_RELATIVE_LOW_MM2:
-            dsca_class = 'Relative Stenosis'
-        else:
-            dsca_class = 'Absolute Stenosis'
-    return ap_class, dsca_class
-
-def compute_cord_metrics(cord_mask_iso, canal_mask_iso):
-    """
-    Compute spinal cord metrics:
-    - CSA: cross-sectional area of cord in mm²
-    - MSCC proxy: cord AP / canal AP (normalized compression index)
-    - Canal occupation ratio: cord CSA / canal CSA
-    """
-    if cord_mask_iso is None or not cord_mask_iso.any():
-        return {}
-    coords  = np.array(np.where(cord_mask_iso))
-    xmid    = int(coords[0].mean())
-    axial_c = cord_mask_iso[max(0,xmid-2):xmid+3, :, :]
-    result  = {}
-    if axial_c.any():
-        yc = np.where(axial_c)[1]
-        zc = np.where(axial_c)[2]
-        cord_ap = (int(yc.max()) - int(yc.min()) + 1) * ISO_MM
-        cord_ml = (int(zc.max()) - int(zc.min()) + 1) * ISO_MM
-        cord_csa = (np.pi / 4.0) * cord_ap * cord_ml
-        result['Cord_AP_mm']  = cord_ap
-        result['Cord_ML_mm']  = cord_ml
-        result['Cord_CSA_mm2'] = cord_csa
-
-    if canal_mask_iso is not None and canal_mask_iso.any():
-        axial_ca = canal_mask_iso[max(0,xmid-2):xmid+3, :, :]
-        if axial_ca.any():
-            yc2 = np.where(axial_ca)[1]
-            zc2 = np.where(axial_ca)[2]
-            canal_ap = (int(yc2.max()) - int(yc2.min()) + 1) * ISO_MM
-            canal_ml = (int(zc2.max()) - int(zc2.min()) + 1) * ISO_MM
-            canal_csa = (np.pi / 4.0) * canal_ap * canal_ml
-            result['Canal_AP_mm']  = canal_ap
-            result['Canal_ML_mm']  = canal_ml
-            result['Canal_CSA_mm2'] = canal_csa
-            if 'Cord_AP_mm' in result and canal_ap > 0:
-                result['MSCC_proxy'] = result['Cord_AP_mm'] / canal_ap
-            if 'Cord_CSA_mm2' in result and canal_csa > 0:
-                result['Canal_Occupation_ratio'] = result['Cord_CSA_mm2'] / canal_csa
-    return result
-
-def compute_ligamentum_flavum_metrics(arcus_mask_iso, canal_mask_iso):
-    """
-    Proxy LF thickness from arcus (posterior arch) to canal boundary.
-    Returns estimated LFT and LFA classification strings.
-    This is a geometric proxy; ground-truth requires dedicated LF segmentation.
-    """
-    if arcus_mask_iso is None or not arcus_mask_iso.any():
-        return {}
-    result = {}
-    # LF thickness proxy: min distance from arcus to canal posterior wall
-    if canal_mask_iso is not None and canal_mask_iso.any():
-        lft_proxy, _, _ = min_dist_mm(canal_mask_iso, arcus_mask_iso)
-        if np.isfinite(lft_proxy):
-            result['LFT_proxy_mm'] = lft_proxy
-            if lft_proxy <= LigamentumFlavumThresholds.LFT_NORMAL_BASELINE_MM:
-                result['LFT_class'] = 'Normal'
-            elif lft_proxy <= LigamentumFlavumThresholds.LFT_SEVERE_MM:
-                result['LFT_class'] = 'Hypertrophied'
-            else:
-                result['LFT_class'] = 'Severe — neurogenic claudication risk'
-    return result
-
-def compute_spinous_process_metrics(spinous_mask_iso):
-    """
-    Spinous process (Baastrup disease) metrics.
-    Evaluates S-I extent of spinous processes and inter-process gap.
-    Returns list of level-to-level z-gaps (proxy for apposition/contact).
-    """
-    if spinous_mask_iso is None or not spinous_mask_iso.any():
-        return {}
-    labeled, n = cc_label(spinous_mask_iso)
-    if n < 2:
-        return {'spinous_count': n}
-    # Sort components by superior-inferior centroid
+def _inferiormost_cc(mask, sac=None):
+    if not mask.any(): return np.zeros_like(mask, bool)
+    lab, n = cc_label(mask)
+    if n == 1: return mask.astype(bool)
+    sz = None
+    if sac is not None and sac.any(): sz = int(np.where(sac)[2].min())
     comps = []
-    for i in range(1, n + 1):
-        comp = (labeled == i)
-        zc   = np.where(comp)[2]
-        comps.append((float(zc.mean()), int(zc.min()), int(zc.max()), comp))
+    for i in range(1,n+1):
+        c = (lab==i); zc = np.where(c)[2]
+        comps.append((float(zc.mean()), int(zc.max()), c))
     comps.sort(key=lambda t: t[0])
-    gaps = []
-    for i in range(len(comps) - 1):
-        _, _, z_hi_cur, _ = comps[i]
-        _, z_lo_nxt, _, _ = comps[i + 1]
-        gap_mm = (z_lo_nxt - z_hi_cur) * ISO_MM
-        gaps.append(gap_mm)
-    min_gap = min(gaps) if gaps else float('inf')
-    result = {
-        'spinous_count':   n,
-        'inter_process_gaps_mm': gaps,
-        'min_inter_process_gap_mm': min_gap,
-    }
-    # Baastrup apposition: gap ≤ 0 (contact)
-    result['baastrup_contact'] = min_gap <= 0.0
-    result['baastrup_risk']    = min_gap <= 2.0
-    return result
+    if sz is not None:
+        cands = [c for _,zm,c in comps if zm < sz]
+        if cands: return cands[0].astype(bool)
+    return comps[0][2].astype(bool)
 
-def compute_facet_tropism_proxy(sup_art_L_iso, sup_art_R_iso):
-    """
-    Facet tropism proxy: asymmetry between left and right superior articular
-    processes (orientation angle in transverse/axial plane).
-    Uses centroid offsets as a directional proxy.
-    Returns angle difference estimate in degrees.
-    """
-    result = {}
-    if sup_art_L_iso is None or not sup_art_L_iso.any():
-        return result
-    if sup_art_R_iso is None or not sup_art_R_iso.any():
-        return result
+def _isolate_z(mask, z_lo, z_hi, margin=20):
+    out = np.zeros_like(mask)
+    lo = max(0, z_lo-margin); hi = min(mask.shape[2]-1, z_hi+margin)
+    out[:,:,lo:hi+1] = mask[:,:,lo:hi+1]
+    return out
 
-    def facet_angle_proxy(mask):
-        """Principal orientation in X-Y plane (transverse)."""
-        coords = np.array(np.where(mask), dtype=float).T  # N×3
-        if len(coords) < 5:
-            return None
-        # PCA on X-Y
-        xy = coords[:, :2]
-        xy -= xy.mean(axis=0)
-        cov = np.cov(xy.T)
-        vals, vecs = np.linalg.eigh(cov)
-        principal = vecs[:, np.argmax(vals)]
-        angle_rad = np.arctan2(principal[1], principal[0])
-        return np.degrees(angle_rad) % 180.0
-
-    ang_L = facet_angle_proxy(sup_art_L_iso)
-    ang_R = facet_angle_proxy(sup_art_R_iso)
-    if ang_L is not None and ang_R is not None:
-        tropism = abs(ang_L - ang_R)
-        if tropism > 90:
-            tropism = 180 - tropism
-        result['facet_angle_L_deg'] = ang_L
-        result['facet_angle_R_deg'] = ang_R
-        result['facet_tropism_deg'] = tropism
-        # Ko et al. grading
-        if tropism <= FacetThresholds.TROPISM_NORMAL_DEG:
-            result['facet_tropism_grade'] = 'Grade 0 (normal asymmetry)'
-        elif tropism < FacetThresholds.TROPISM_SEVERE_DEG:
-            result['facet_tropism_grade'] = 'Grade 1 (moderate — disc prolapse risk)'
-        else:
-            result['facet_tropism_grade'] = 'Grade 2 (severe — spondylolisthesis risk)'
-    return result
-
-def compute_spondylolisthesis_proxy(vert_label_iso, upper_lbl, lower_lbl):
-    """
-    Estimate sagittal translation between two adjacent vertebral bodies.
-    Compares anterior centroid Y-positions (sagittal offset) in mm.
-    Returns translation_mm and classification.
-    """
-    result = {}
-    upper = (vert_label_iso == upper_lbl)
-    lower = (vert_label_iso == lower_lbl)
-    if not upper.any() or not lower.any():
-        return result
-    def ant_centroid_y(mask):
-        coords = np.array(np.where(mask))
-        ymin = int(coords[1].min())
-        ymax = int(coords[1].max())
-        ant_zone = mask[:, ymin:ymin + max(1,(ymax-ymin)//3), :]
-        if not ant_zone.any():
-            return None
-        return float(np.where(ant_zone)[1].mean()) * ISO_MM
-    y_up = ant_centroid_y(upper)
-    y_lo = ant_centroid_y(lower)
-    if y_up is not None and y_lo is not None:
-        trans_mm = abs(y_up - y_lo)
-        result['sagittal_translation_mm'] = trans_mm
-        if trans_mm >= VertebralThresholds.SPONDYLOLISTHESIS_MM:
-            result['spondylolisthesis'] = f'POSITIVE ({trans_mm:.1f}mm ≥ {VertebralThresholds.SPONDYLOLISTHESIS_MM}mm)'
-        else:
-            result['spondylolisthesis'] = f'Negative ({trans_mm:.1f}mm < {VertebralThresholds.SPONDYLOLISTHESIS_MM}mm)'
-    return result
-
-def compute_foraminal_volume_proxy(sup_art_mask, inf_art_mask, disc_mask, level_name):
-    """
-    Approximate neural foraminal volume using elliptical cylinder model.
-    V = π × a × b × H / 4
-    a = major axis (longest sagittal distance), b = minor axis, H = AP depth.
-    Compares against normative data from PDF.
-    """
-    result = {}
-    # Use sup articular process as proxy boundary of foramen
-    if sup_art_mask is None or not sup_art_mask.any():
-        return result
-    coords = np.array(np.where(sup_art_mask), dtype=float)
-    if coords.shape[1] < 5:
-        return result
-    # Major axis = Z-extent (superior-inferior, craniocaudal)
-    zc = coords[2]
-    a  = (float(zc.max()) - float(zc.min())) * ISO_MM
-    # Minor axis = Y-extent (anteroposterior)
-    yc = coords[1]
-    b  = (float(yc.max()) - float(yc.min())) * ISO_MM
-    # Depth H = X-extent (mediolateral)
-    xc = coords[0]
-    H  = (float(xc.max()) - float(xc.min())) * ISO_MM
-    if a > 0 and b > 0 and H > 0:
-        vol = (np.pi * a * b * H) / 4.0
-        result['foraminal_volume_proxy_mm3'] = vol
-        # Compare to normative
-        norms = ForaminalThresholds.VOLUME_NORMS.get(level_name, {})
-        norm_R = norms.get('R')
-        if norm_R:
-            pct = (vol / norm_R) * 100.0
-            result['foraminal_volume_norm_pct'] = pct
-            if pct < 60:
-                result['foraminal_stenosis_class'] = 'Severe (Lee Grade 3 equivalent)'
-            elif pct < 80:
-                result['foraminal_stenosis_class'] = 'Moderate (Lee Grade 2 equivalent)'
-            elif pct < 95:
-                result['foraminal_stenosis_class'] = 'Mild (Lee Grade 1 equivalent)'
-            else:
-                result['foraminal_stenosis_class'] = 'Normal (Lee Grade 0)'
-    return result
-
-# ── Comprehensive morphometric analysis ──────────────────────────────────────
-
-def run_all_morphometrics(sp_iso, vert_iso, tss_iso, sac_iso):
-    """
-    Run all morphometric analyses on resampled isotropic volumes.
-
-    Mask sources used:
-    ─────────────────────────────────────────────────────────────────────
-    SPINEPS seg-spine_msk:
-      26 Sacrum          41 Arcus          42 Spinous
-      43 TP-L            44 TP-R           45 SupArt-L   46 SupArt-R
-      47 InfArt-L        48 InfArt-R       49 CorpusBorder
-      60 Cord            61 Canal          62 Endplate (all, merged)
-      100 IVD (all, merged)
-
-    VERIDAH seg-vert_msk:
-      1-25  per-vertebra labels (C1-L6)
-      100+X per-vertebra IVD below vertebra X
-      200+X per-vertebra endplate of vertebra X   ← NOW USED in DHI
-
-    TotalSpineSeg:
-      1 cord  2 canal  11-17 C1-C7  21-32 T1-T12  41-45 L1-L5  50 sacrum
-      63-100 discs (full cervical/thoracic/lumbar coverage)  ← NOW USED
-    ─────────────────────────────────────────────────────────────────────
-    Returns a dict of all computed morphometric values.
-    """
-    metrics = {}
-
-    # ── 1. Extract key masks from SPINEPS ─────────────────────────────────────
-    canal_mask    = (sp_iso == 61)  if (sp_iso == 61).any()  else None
-    cord_mask     = (sp_iso == 60)  if (sp_iso == 60).any()  else None
-    arcus_mask    = (sp_iso == 41)  if (sp_iso == 41).any()  else None
-    spinous_msk   = (sp_iso == 42)  if (sp_iso == 42).any()  else None
-    sup_art_L     = (sp_iso == 45)  if (sp_iso == 45).any()  else None
-    sup_art_R     = (sp_iso == 46)  if (sp_iso == 46).any()  else None
-    inf_art_L     = (sp_iso == 47)  if (sp_iso == 47).any()  else None
-    inf_art_R     = (sp_iso == 48)  if (sp_iso == 48).any()  else None
-    # Corpus border (49): the vertebral body surface — more precise than full
-    # vertebra body label for DHI anterior/posterior height measurement
-    corpus_border = (sp_iso == 49)  if (sp_iso == 49).any()  else None
-    # Global merged endplate mask (62): present when SPINEPS ran successfully;
-    # used for per-disc endplate-to-endplate disc height when per-vertebra
-    # VERIDAH endplates (200+X) are not available.
-    ep_global     = (sp_iso == 62)  if (sp_iso == 62).any()  else None
-    disc_mask     = (sp_iso == 100) if (sp_iso == 100).any() else None
-
-    # Prefer corpus_border over raw vert mask for vertebral height calculations
-    # because corpus_border excludes posterior elements (arcus, processes) that
-    # inflate the apparent Ha/Hm/Hp when measured from the full instance label.
-    logger.info(f"  Endplate (global sp62): {'present' if ep_global is not None else 'absent'}")
-    logger.info(f"  Corpus border (sp49):   {'present' if corpus_border is not None else 'absent'}")
-
-    # ── 2. Central canal stenosis ──────────────────────────────────────────────
-    # Use TSS canal (label 2) preferentially — it is segmented from whole-spine
-    # coverage whereas SPINEPS canal may be cropped at L5/S1.
-    tss_canal = (tss_iso == 2) if (tss_iso is not None and (tss_iso == 2).any()) else None
-    active_canal = tss_canal if tss_canal is not None else canal_mask
-    if active_canal is not None:
-        ap_mm, dsca_mm2 = compute_canal_ap_diameter(active_canal)
-        if ap_mm is not None:
-            metrics['canal_AP_mm']    = ap_mm
-            metrics['canal_DSCA_mm2'] = dsca_mm2
-            ap_cls, dsca_cls = classify_canal_stenosis(ap_mm, dsca_mm2)
-            metrics['canal_AP_class']   = ap_cls
-            metrics['canal_DSCA_class'] = dsca_cls
-            metrics['canal_source']     = 'TSS' if tss_canal is not None else 'SPINEPS'
-            metrics['canal_absolute_stenosis'] = (
-                ap_mm < CanalThresholds.AP_ABSOLUTE_MM or
-                (dsca_mm2 is not None and dsca_mm2 < CanalThresholds.DSCA_ABSOLUTE_MM2))
-
-    # ── 3. Spinal cord metrics (MSCC proxy, CSA, K-line proxy) ────────────────
-    # Use TSS cord (label 1) preferentially — see TotalSpineSeg README note:
-    # "not intended to replace validated CSA methods" but suitable for MSCC proxy.
-    tss_cord = (tss_iso == 1) if (tss_iso is not None and (tss_iso == 1).any()) else None
-    active_cord = tss_cord if tss_cord is not None else cord_mask
-    cord_metrics = compute_cord_metrics(active_cord, active_canal)
-    metrics.update(cord_metrics)
-    if tss_cord is not None:
-        metrics['cord_source'] = 'TSS'
-
-    # ── 4. Ligamentum Flavum proxy ─────────────────────────────────────────────
-    lf_metrics = compute_ligamentum_flavum_metrics(arcus_mask, active_canal)
-    metrics.update(lf_metrics)
-
-    # ── 5. Spinous process / Baastrup disease ──────────────────────────────────
-    if spinous_msk is not None:
-        bstp = compute_spinous_process_metrics(spinous_msk)
-        metrics.update({f'baastrup_{k}': v for k, v in bstp.items()})
-
-    # ── 6. Facet tropism (proxy from sup articular processes) ─────────────────
-    ft = compute_facet_tropism_proxy(sup_art_L, sup_art_R)
-    metrics.update(ft)
-
-    # ── 7. Per-vertebral-level analysis (lumbar L1-S1) ────────────────────────
-    lumbar_pairs = [(20, 21, 'L1', 'L2'), (21, 22, 'L2', 'L3'),
-                    (22, 23, 'L3', 'L4'), (23, 24, 'L4', 'L5'), (24, 26, 'L5', 'S1')]
-
-    for upper_lbl, lower_lbl, upper_name, lower_name in lumbar_pairs:
-        level = f'{upper_name}_{lower_name}'
-        upper_mask = (vert_iso == upper_lbl) if (vert_iso == upper_lbl).any() else None
-        lower_mask = (vert_iso == lower_lbl) if (vert_iso == lower_lbl).any() else None
-
-        # 7a. Vertebral body height ratios
-        # Prefer corpus_border sliced to the vertebra's Z-range for cleaner Ha/Hm/Hp;
-        # fall back to the raw instance label if corpus_border is absent.
-        vert_src = upper_mask
-        if corpus_border is not None and upper_mask is not None:
-            zr = get_z_range(upper_mask)
-            if zr:
-                z_lo, z_hi = zr
-                cb_slice = corpus_border.copy()
-                cb_slice[:, :, :z_lo] = False
-                cb_slice[:, :, z_hi+1:] = False
-                if cb_slice.any():
-                    vert_src = cb_slice
-                    logger.debug(f"  {upper_name}: using corpus_border for height ratios")
-        if vert_src is not None:
-            h = compute_vertebral_heights(vert_src)
-            if h:
-                ratios = compute_height_ratios(h)
-                for k, v in h.items():
-                    metrics[f'{upper_name}_{k}_mm'] = v
-                for k, v in ratios.items():
-                    metrics[f'{upper_name}_{k}'] = v
-
-        # 7b. Spondylolisthesis (upper→lower sagittal translation)
-        if upper_mask is not None and lower_mask is not None:
-            spondy = compute_spondylolisthesis_proxy(vert_iso, upper_lbl, lower_lbl)
-            for k, v in spondy.items():
-                metrics[f'{level}_{k}'] = v
-
-        # 7c. Disc Height Index
-        # Priority 1: VERIDAH per-vertebra IVD label (100+X) — most accurate
-        # Priority 2: TSS disc label for this level — good coverage
-        # Priority 3: merged SPINEPS IVD label 100 — least precise (all discs merged)
-        ivd_lbl_veridah = VERIDAH_IVD_BASE + upper_lbl
-        ivd_mask_v = None
-        ivd_source = 'none'
-        if (vert_iso == ivd_lbl_veridah).any():
-            ivd_mask_v = (vert_iso == ivd_lbl_veridah)
-            ivd_source = f'VERIDAH({ivd_lbl_veridah})'
-        elif tss_iso is not None:
-            # Map level to TSS disc label
-            tss_disc_map = {'L1_L2': 92, 'L2_L3': 93, 'L3_L4': 94,
-                            'L4_L5': 95, 'L5_S1': 100}
-            tss_dlbl = tss_disc_map.get(level)
-            if tss_dlbl and (tss_iso == tss_dlbl).any():
-                ivd_mask_v = (tss_iso == tss_dlbl)
-                ivd_source = f'TSS({tss_dlbl})'
-        if ivd_mask_v is None and disc_mask is not None:
-            # Restrict merged mask to Z-range between upper and lower vertebrae
-            if upper_mask is not None and lower_mask is not None:
-                zr_up = get_z_range(upper_mask)
-                zr_lo = get_z_range(lower_mask)
-                if zr_up and zr_lo:
-                    z_lo_disc = min(zr_up[1], zr_lo[1])
-                    z_hi_disc = max(zr_up[0], zr_lo[0])
-                    ivd_mask_v = disc_mask.copy()
-                    ivd_mask_v[:, :, :z_lo_disc] = False
-                    ivd_mask_v[:, :, z_hi_disc+1:] = False
-                    if ivd_mask_v.any():
-                        ivd_source = 'SPINEPS-merged'
-                    else:
-                        ivd_mask_v = None
-
-        metrics[f'{level}_disc_source'] = ivd_source
-        if ivd_mask_v is not None:
-            # DHI Farfan method (Ha+Hp)/(Ds+Di)×100
-            dhi = compute_disc_height_index(ivd_mask_v, upper_mask, lower_mask)
-            if dhi is not None:
-                metrics[f'{level}_DHI_pct'] = dhi
-                metrics[f'{level}_DHI_grade'] = (
-                    'Severe (>50% loss)' if dhi < 50.0 else
-                    'Moderate'           if dhi < 70.0 else
-                    'Mild'               if dhi < 85.0 else 'Normal')
-
-            # DHI Method 2: mid-disc / mid-vertebra height
-            if upper_mask is not None:
-                dhi2 = compute_disc_height_method2(ivd_mask_v, upper_mask)
-                if dhi2 is not None:
-                    metrics[f'{level}_DHI_method2'] = dhi2
-
-            # 7d. Endplate-to-endplate disc height (most precise DHI proxy)
-            # Uses VERIDAH 200+X per-vertebra endplate labels when available,
-            # or falls back to the global SPINEPS endplate mask (label 62)
-            # restricted to the inter-vertebral Z-range.
-            ep_upper_lbl = VERIDAH_ENDPLATE_BASE + upper_lbl
-            ep_lower_lbl = VERIDAH_ENDPLATE_BASE + lower_lbl
-            ep_up = ((vert_iso == ep_upper_lbl)
-                     if (vert_iso == ep_upper_lbl).any() else None)
-            ep_lo = ((vert_iso == ep_lower_lbl)
-                     if (vert_iso == ep_lower_lbl).any() else None)
-            ep_source = 'VERIDAH'
-
-            # Fall back to global endplate mask sliced to this level's Z-range
-            if (ep_up is None or ep_lo is None) and ep_global is not None:
-                if upper_mask is not None and lower_mask is not None:
-                    zr_up = get_z_range(upper_mask)
-                    zr_lo = get_z_range(lower_mask)
-                    if zr_up and zr_lo:
-                        # Superior endplate: top slice of upper vertebra
-                        z_top = zr_up[1]
-                        ep_up_tmp = ep_global.copy()
-                        ep_up_tmp[:, :, :max(0, z_top - 3)] = False
-                        ep_up_tmp[:, :, z_top + 4:] = False
-                        # Inferior endplate: bottom slice of lower vertebra
-                        z_bot = zr_lo[0]
-                        ep_lo_tmp = ep_global.copy()
-                        ep_lo_tmp[:, :, :max(0, z_bot - 3)] = False
-                        ep_lo_tmp[:, :, z_bot + 4:] = False
-                        if ep_up_tmp.any() and ep_lo_tmp.any():
-                            ep_up = ep_up_tmp if ep_up is None else ep_up
-                            ep_lo = ep_lo_tmp if ep_lo is None else ep_lo
-                            ep_source = 'SPINEPS-ep62'
-
-            if ep_up is not None and ep_lo is not None:
-                ep_dist, _, _ = min_dist_mm(ep_up, ep_lo)
-                if np.isfinite(ep_dist):
-                    metrics[f'{level}_endplate_dist_mm'] = ep_dist
-                    metrics[f'{level}_endplate_source']  = ep_source
-                    logger.debug(f"  {level} ep-to-ep dist: {ep_dist:.1f}mm ({ep_source})")
-
-        # 7e. Foraminal volume proxy (elliptical cylinder)
-        if sup_art_L is not None:
-            fv_l = compute_foraminal_volume_proxy(sup_art_L, inf_art_L, ivd_mask_v, level)
-            for k, v in fv_l.items():
-                metrics[f'{level}_L_{k}'] = v
-        if sup_art_R is not None:
-            fv_r = compute_foraminal_volume_proxy(sup_art_R, inf_art_R, ivd_mask_v, level)
-            for k, v in fv_r.items():
-                metrics[f'{level}_R_{k}'] = v
-
-    # ── 8. Per-level canal AP from TSS (level-specific canal shape reference) ──
-    # Use TSS disc midpoints as proxies for the inter-vertebral level location;
-    # sample canal AP at each of those Z-positions for a per-level stenosis profile.
-    if tss_iso is not None and active_canal is not None:
-        tss_disc_level_map = {92:'L1-L2', 93:'L2-L3', 94:'L3-L4',
-                               95:'L4-L5', 100:'L5-S1'}
-        for dlbl, lname in tss_disc_level_map.items():
-            if not (tss_iso == dlbl).any():
-                continue
-            disc_zr = get_z_range(tss_iso == dlbl)
-            if disc_zr is None:
-                continue
-            z_mid = (disc_zr[0] + disc_zr[1]) // 2
-            # Sample canal at this Z slice
-            canal_slice = active_canal[:, :, max(0,z_mid-1):z_mid+2]
-            if not canal_slice.any():
-                continue
-            yc = np.where(canal_slice)[1]
-            zc = np.where(canal_slice)[2]
-            ap_level = (int(yc.max()) - int(yc.min()) + 1) * ISO_MM
-            ml_level = (int(zc.max()) - int(zc.min()) + 1) * ISO_MM
-            dsca_level = (np.pi / 4.0) * ap_level * ml_level
-            key = lname.replace('-', '_')
-            metrics[f'{key}_level_AP_mm']    = ap_level
-            metrics[f'{key}_level_DSCA_mm2'] = dsca_level
-            ap_cls_l, dsca_cls_l = classify_canal_stenosis(ap_level, dsca_level)
-            metrics[f'{key}_level_AP_class']   = ap_cls_l
-            metrics[f'{key}_level_DSCA_class'] = dsca_cls_l
-            # Expected canal shape at this level
-            shape_key = lname.split('-')[1]  # e.g. 'L2' from 'L1-L2'
-            if shape_key in CANAL_SHAPE_BY_LEVEL:
-                shape, freq = CANAL_SHAPE_BY_LEVEL[shape_key]
-                metrics[f'{key}_canal_shape']      = shape
-                metrics[f'{key}_canal_shape_freq'] = freq
-
-    # ── 9. Canal shape annotation per level (VERIDAH) ─────────────────────────
-    for lbl, (name, _, _) in VERIDAH_LUMBAR.items():
-        if (vert_iso == lbl).any() and name in CANAL_SHAPE_BY_LEVEL:
-            shape, freq = CANAL_SHAPE_BY_LEVEL[name]
-            metrics[f'{name}_canal_shape'] = shape
-            metrics[f'{name}_canal_shape_freq'] = freq
-
-    logger.info(f"  Morphometrics computed: {len(metrics)} parameters")
-    return metrics
-
-# ── Marching cubes → Plotly Mesh3d ───────────────────────────────────────────
+# ─── Marching cubes → Mesh3d ──────────────────────────────────────────────────
 
 def mask_to_mesh3d(iso_mask, origin_mm, name, colour, opacity,
                    smooth_sigma=1.5, fill_holes=True):
-    """
-    Convert binary mask to Plotly Mesh3d via marching cubes.
-
-    THIN / FLAT STRUCTURE RULES (endplates, canal, TPs):
-      fill_holes=False — the sheet IS the surface; fill_holes inverts it to hollow
-      smooth_sigma=0.6 — high sigma washes thin voxel sheets below 0.5 threshold
-    VOLUMETRIC STRUCTURES (vertebrae, discs, arcus, sacrum):
-      fill_holes=True, smooth_sigma=1.5 — standard pipeline
-    """
-    if not iso_mask.any():
-        return None
+    if not iso_mask.any(): return None
     m = binary_fill_holes(iso_mask) if fill_holes else iso_mask.copy()
-    if not m.any():
-        return None
+    if not m.any(): return None
     vol = gaussian_filter(m.astype(np.float32), sigma=smooth_sigma)
     vol = np.pad(vol, 1, mode='constant', constant_values=0)
-    if vol.max() <= 0.5 or vol.min() >= 0.5:
-        logger.debug(f"  '{name}': no 0.5 crossing — skipped")
-        return None
+    if vol.max() <= 0.5 or vol.min() >= 0.5: return None
     try:
         verts, faces, _, _ = marching_cubes(
             vol, level=0.5, spacing=(ISO_MM, ISO_MM, ISO_MM))
     except Exception as e:
-        logger.warning(f"  MC failed '{name}': {e}")
-        return None
+        logger.warning(f"  MC failed '{name}': {e}"); return None
     verts -= ISO_MM
-    verts -= origin_mm[np.newaxis, :]
+    verts -= origin_mm[np.newaxis,:]
     return go.Mesh3d(
         x=verts[:,0].tolist(), y=verts[:,1].tolist(), z=verts[:,2].tolist(),
         i=faces[:,0].tolist(), j=faces[:,1].tolist(), k=faces[:,2].tolist(),
         color=colour, opacity=opacity, name=name,
         showlegend=True, flatshading=False,
-        lighting=dict(ambient=0.35, diffuse=0.75,
-                      specular=0.30, roughness=0.6, fresnel=0.2),
+        lighting=dict(ambient=0.35, diffuse=0.75, specular=0.30,
+                      roughness=0.6, fresnel=0.2),
         lightposition=dict(x=100, y=200, z=150),
         hoverinfo='name', showscale=False,
     )
 
-# ── Annotation helpers ────────────────────────────────────────────────────────
+# ─── Annotation primitives ────────────────────────────────────────────────────
 
-def _sym(s):
-    return s if s in _VALID_S3D_SYM else 'circle'
+def _sym(s): return s if s in _VALID_SYM else 'circle'
 
 def ruler_line(p0, p1, colour, name, width=6, dash='solid'):
     return go.Scatter3d(
@@ -1230,742 +233,600 @@ def ruler_line(p0, p1, colour, name, width=6, dash='solid'):
         mode='lines', line=dict(color=colour, width=width, dash=dash),
         name=name, showlegend=True, hoverinfo='name')
 
-def label_point(pos, text, colour, size=10, symbol='circle'):
+def label_point(pos, text, colour, size=10, symbol='circle', showlegend=False):
     return go.Scatter3d(
         x=[pos[0]], y=[pos[1]], z=[pos[2]],
         mode='markers+text',
         marker=dict(size=size, color=colour, symbol=_sym(symbol),
                     line=dict(color='white', width=1)),
         text=[text], textposition='top center',
-        textfont=dict(size=11, color=colour),
-        name=text, showlegend=False, hoverinfo='text')
+        textfont=dict(size=10, color=colour),
+        name=text, showlegend=showlegend, hoverinfo='text')
 
-def midpt(a, b):
-    return (np.array(a) + np.array(b)) / 2.0
+def midpt(a, b): return (np.array(a)+np.array(b))/2.0
+
+# ─── Per-study TP annotation traces (3D mesh attached) ───────────────────────
 
 def tp_height_ruler_traces(tp_iso, origin_mm, colour, side, span_mm):
-    if not tp_iso.any():
-        return []
-    best_x, best_span = tp_iso.shape[0] // 2, 0.0
+    if not tp_iso.any(): return []
+    best_x, best_span = tp_iso.shape[0]//2, 0.0
     for x in range(tp_iso.shape[0]):
         col = tp_iso[x]
-        if not col.any():
-            continue
+        if not col.any(): continue
         zc = np.where(col.any(axis=0))[0]
-        if zc.size < 2:
-            continue
-        sp = (zc.max() - zc.min()) * ISO_MM
-        if sp > best_span:
-            best_span, best_x = sp, x
+        if zc.size < 2: continue
+        sp = (zc.max()-zc.min())*ISO_MM
+        if sp > best_span: best_span, best_x = sp, x
     col = tp_iso[best_x]
-    if not col.any():
-        return []
-    zc  = np.where(col.any(axis=0))[0]
-    yc  = np.where(col.any(axis=1))[0]
+    if not col.any(): return []
+    zc = np.where(col.any(axis=0))[0]
+    yc = np.where(col.any(axis=1))[0]
     z_lo, z_hi = int(zc.min()), int(zc.max())
-    y_c = int(yc.mean()) if yc.size else tp_iso.shape[1] // 2
-    def iv(x,y,z): return np.array([x,y,z],float)*ISO_MM - origin_mm
-    p_lo = iv(best_x, y_c, z_lo)
-    p_hi = iv(best_x, y_c, z_hi)
+    y_c = int(yc.mean()) if yc.size else tp_iso.shape[1]//2
+    def iv(x,y,z): return np.array([x,y,z],float)*ISO_MM-origin_mm
+    p_lo = iv(best_x, y_c, z_lo); p_hi = iv(best_x, y_c, z_hi)
     mid  = midpt(p_lo, p_hi)
     flag = '✓' if span_mm < TP_HEIGHT_MM else f'✗ ≥{TP_HEIGHT_MM:.0f}mm→TypeI'
-    lbl  = f'{side} TP: {span_mm:.1f}mm  {flag}'
     traces = [ruler_line(p_lo, p_hi, colour, f'Height ruler {side}', width=8)]
-    traces.append(label_point(mid, lbl, colour, size=9, symbol='diamond'))
+    traces.append(label_point(mid, f'{side} TP: {span_mm:.1f}mm  {flag}',
+                              colour, size=9, symbol='diamond'))
     off = np.array([5.,0.,0.])
     for pt in (p_lo, p_hi):
         traces.append(ruler_line(pt-off, pt+off, colour, f'Tick {side}', width=4))
     return traces
 
 def gap_ruler_traces(tp_iso, sac_iso, origin_mm, colour, side, dist_mm):
-    if not tp_iso.any() or not sac_iso.any():
-        return []
-    _, pt_a, pt_b = min_dist_mm(tp_iso, sac_iso)
-    if pt_a is None:
-        return []
-    p_a = pt_a - origin_mm
-    p_b = pt_b - origin_mm
+    if not tp_iso.any() or not sac_iso.any(): return []
+    _, pt_a, pt_b = _min_dist(tp_iso, sac_iso)
+    if pt_a is None: return []
+    p_a = pt_a-origin_mm; p_b = pt_b-origin_mm
     mid = midpt(p_a, p_b)
     contact = np.isfinite(dist_mm) and dist_mm <= CONTACT_DIST_MM
-    dash    = 'dot' if contact else 'dash'
-    clbl    = (f'CONTACT {dist_mm:.1f}mm→P2' if contact
-               else f'Gap: {dist_mm:.1f}mm ✓')
+    dash  = 'dot' if contact else 'dash'
+    clbl  = (f'CONTACT {dist_mm:.1f}mm→P2' if contact
+             else f'Gap: {dist_mm:.1f}mm ✓')
     return [ruler_line(p_a, p_b, colour, f'Gap ruler {side}', width=5, dash=dash),
             label_point(mid, f'{side}: {clbl}', colour, size=7, symbol='square')]
 
 def tv_plane_traces(vert_iso, tv_label, origin_mm, tv_name):
-    mask = (vert_iso == tv_label)
-    if not mask.any():
-        return []
-    zc    = np.where(mask)[2]
-    z_mid = int((zc.min() + zc.max()) // 2)
-    xs = np.linspace(0, vert_iso.shape[0]-1, 12)
-    ys = np.linspace(0, vert_iso.shape[1]-1, 12)
+    mask = (vert_iso==tv_label)
+    if not mask.any(): return []
+    zc   = np.where(mask)[2]
+    z_mid= int((zc.min()+zc.max())//2)
+    xs   = np.linspace(0, vert_iso.shape[0]-1, 12)
+    ys   = np.linspace(0, vert_iso.shape[1]-1, 12)
     xg, yg = np.meshgrid(xs, ys)
-    zg = np.full_like(xg, z_mid)
-    xm = xg*ISO_MM - origin_mm[0]
-    ym = yg*ISO_MM - origin_mm[1]
-    zm = zg*ISO_MM - origin_mm[2]
+    zg   = np.full_like(xg, z_mid)
     plane = go.Surface(
-        x=xm, y=ym, z=zm,
+        x=xg*ISO_MM-origin_mm[0], y=yg*ISO_MM-origin_mm[1], z=zg*ISO_MM-origin_mm[2],
         colorscale=[[0,'rgba(0,230,180,0.10)'],[1,'rgba(0,230,180,0.10)']],
-        showscale=False, opacity=0.18,
-        name=f'TV plane ({tv_name})', showlegend=True, hoverinfo='name')
-    ctr = centroid_mm(mask)
+        showscale=False, opacity=0.18, name=f'TV plane ({tv_name})',
+        showlegend=True, hoverinfo='name')
+    ctr = _centroid(mask)
     pts = ([label_point(ctr-origin_mm, f'TV: {tv_name}', '#00e6b4',
                         size=14, symbol='cross')]
            if ctr is not None else [])
-    return [plane] + pts
+    return [plane]+pts
 
 def castellvi_contact_traces(tp_L, tp_R, sac_iso, origin_mm,
                               cls_L, cls_R, dist_L, dist_R):
     traces = []
-    for tp_iso, side, dist_mm, cls in (
-        (tp_L,'Left', dist_L, cls_L),(tp_R,'Right',dist_R,cls_R)):
-        if not (tp_iso.any() and sac_iso.any()):
-            continue
-        if not (np.isfinite(dist_mm) and dist_mm <= CONTACT_DIST_MM):
-            continue
-        _, pt_a, _ = min_dist_mm(tp_iso, sac_iso)
-        if pt_a is None:
-            continue
-        p   = pt_a - origin_mm
+    for tp, side, dist_mm, cls in (
+        (tp_L,'Left',dist_L,cls_L),(tp_R,'Right',dist_R,cls_R)):
+        if not (tp.any() and sac_iso.any()): continue
+        if not (np.isfinite(dist_mm) and dist_mm <= CONTACT_DIST_MM): continue
+        _, pt_a, _ = _min_dist(tp, sac_iso)
+        if pt_a is None: continue
+        p   = pt_a-origin_mm
         col = '#ff2222' if 'III' in (cls or '') else '#ff9900'
         traces.append(go.Scatter3d(
-            x=[p[0]],y=[p[1]],z=[p[2]],
-            mode='markers+text',
-            marker=dict(size=20,color=col,opacity=0.85,symbol='circle',
+            x=[p[0]],y=[p[1]],z=[p[2]], mode='markers+text',
+            marker=dict(size=20, color=col, opacity=0.85, symbol='circle',
                         line=dict(color='white',width=2)),
             text=[f'{side}: {cls}'], textposition='middle right',
-            textfont=dict(size=13,color=col),
-            name=f'Contact {side} ({cls})',showlegend=True,hoverinfo='text'))
+            textfont=dict(size=13, color=col),
+            name=f'Contact {side} ({cls})', showlegend=True, hoverinfo='text'))
     return traces
 
-def ian_pan_bar_traces(uncertainty_row, origin_mm, x_offset_mm=55):
-    if uncertainty_row is None:
-        return []
-    confs = {lvl: uncertainty_row.get(f'{lvl}_confidence', float('nan'))
-             for lvl in IAN_PAN_LEVELS}
-    valid = [v for v in confs.values() if not np.isnan(v)]
-    if not valid:
-        return []
-    max_conf = max(valid)
-    max_h=40.0; bar_w=5.0; gap=2.0
+def cord_compression_traces(cord_profile: Optional[dict], cord_iso, origin_mm):
+    """
+    Highlight flagged cord compression zones directly on the cord mesh.
+    Places coloured spheres at each flagged Z slice (offset so they don't
+    obscure the cord mesh — shifted +2mm in X).
+    """
+    if cord_profile is None or not cord_iso.any(): return []
     traces = []
-    for i,(lvl,lbl) in enumerate(zip(IAN_PAN_LEVELS,IAN_PAN_LABELS)):
-        conf = confs[lvl]
-        if np.isnan(conf):
-            continue
-        x0 = origin_mm[0]+x_offset_mm+i*(bar_w+gap); x1=x0+bar_w
-        h  = conf*max_h; z0=-max_h/2; z1=z0+h; y=0.0
-        col = '#e63946' if conf==max_conf else '#457b9d'
-        vx=[x0,x1,x1,x0,x0,x1,x1,x0]
-        vy=[y-1,y-1,y+1,y+1,y-1,y-1,y+1,y+1]
-        vz=[z0,z0,z0,z0,z1,z1,z1,z1]
-        fi=[0,0,1,1,4,4,0,0,3,3,1,2]; fj=[1,3,2,5,5,7,4,3,7,2,5,6]
-        fk=[2,2,5,6,6,6,5,7,6,6,6,7]
-        traces.append(go.Mesh3d(x=vx,y=vy,z=vz,i=fi,j=fj,k=fk,
-                                color=col,opacity=0.80,
-                                name=f'Ian {lbl}: {conf:.2f}',
-                                showlegend=True,flatshading=True,hoverinfo='name'))
+    slices = cord_profile.get('slices', [])
+    cols   = {'Mild':'#f0a500','Moderate':'#e07800','Severe':'#e02020'}
+    for s in slices:
+        if not s.get('flagged'): continue
+        z_vox = int(s['z_mm'] / ISO_MM)
+        if z_vox >= cord_iso.shape[2]: continue
+        sl = cord_iso[:,:,z_vox]
+        if not sl.any(): continue
+        yc = np.where(sl)[0]; xc = np.where(sl)[1]
+        x_mm = float(xc.mean()+2)*ISO_MM - origin_mm[0]
+        y_mm = float(yc.mean())*ISO_MM   - origin_mm[1]
+        z_mm = s['z_mm'] - origin_mm[2]
+        col  = cols.get(s['cls'], '#ffaa00')
         traces.append(go.Scatter3d(
-            x=[(x0+x1)/2],y=[y],z=[z1+3],mode='text',
-            text=[f'{lbl}<br>{conf:.2f}'],
-            textfont=dict(size=9,color=col),showlegend=False,hoverinfo='skip'))
+            x=[x_mm], y=[y_mm], z=[z_mm], mode='markers',
+            marker=dict(size=8, color=col, opacity=0.7,
+                        symbol='circle', line=dict(color='white',width=1)),
+            name=f"Cord {s['cls']} z={s['z_mm']:.0f}mm MSCC={s['mscc']:.2f}",
+            showlegend=True, hoverinfo='name'))
     return traces
 
-def canal_stenosis_annotation_trace(canal_mask, origin_mm, ap_mm, dsca_mm2,
-                                     ap_class, dsca_class):
-    """3D annotation sphere at canal centroid showing stenosis grade."""
-    if canal_mask is None or not canal_mask.any():
-        return []
-    ctr = centroid_mm(canal_mask)
-    if ctr is None:
-        return []
-    p = ctr - origin_mm
-    col = ('#ff3333' if 'Absolute' in (ap_class or '') else
-           '#ff9900' if 'Relative' in (ap_class or '') else '#2dc653')
-    label = f'Canal: AP={ap_mm:.1f}mm ({ap_class})\nDSCA≈{dsca_mm2:.0f}mm²'
-    return [label_point(p, label, col, size=12, symbol='square')]
 
-def spinous_annotation_traces(bstp_metrics, spinous_mask, origin_mm):
-    """3D markers for Baastrup disease risk zones."""
-    traces = []
-    if not bstp_metrics.get('baastrup_contact') and not bstp_metrics.get('baastrup_risk'):
-        return traces
-    if spinous_mask is None or not spinous_mask.any():
-        return traces
-    ctr = centroid_mm(spinous_mask)
-    if ctr is None:
-        return traces
-    p = ctr - origin_mm
-    min_gap = bstp_metrics.get('baastrup_min_inter_process_gap_mm', float('inf'))
-    if bstp_metrics.get('baastrup_contact'):
-        col, txt = '#ff3333', f'Baastrup: CONTACT (gap={min_gap:.1f}mm)'
+# ─── HTML metrics panel builder ───────────────────────────────────────────────
+
+def build_metrics_panel_html(metrics: dict,
+                              span_L: float, span_R: float,
+                              dist_L: float, dist_R: float,
+                              castellvi: str, cls_L: str, cls_R: str,
+                              tv_name: str,
+                              uncertainty_row: Optional[dict]) -> str:
+    """
+    Returns an HTML string for the right-side metrics panel.
+    Colour coding: green=ok, orange=warning, red=critical — matching the
+    existing header badges.
+    """
+
+    def row(label: str, value: str, css_cls: str = 'ok') -> str:
+        return (f'<div class="pr">'
+                f'<span class="pk">{label}</span>'
+                f'<span class="pv {css_cls}">{value}</span>'
+                f'</div>')
+
+    def section(title: str) -> str:
+        return f'<div class="ps">{title}</div>'
+
+    def val_cls(v, crit_fn, warn_fn=None) -> str:
+        if v is None: return 'pm'
+        if crit_fn(v): return 'cr'
+        if warn_fn and warn_fn(v): return 'wn'
+        return 'ok'
+
+    lines = []
+
+    # ── LSTV ──────────────────────────────────────────────────────────────────
+    lines.append(section('LSTV'))
+    lines.append(row('TV', tv_name or 'N/A'))
+    lines.append(row('Castellvi', castellvi or 'N/A'))
+    tpl_cls = 'wn' if span_L >= TP_HEIGHT_MM else 'ok'
+    tpr_cls = 'wn' if span_R >= TP_HEIGHT_MM else 'ok'
+    lines.append(row('TP Left',  f'{span_L:.1f} mm', tpl_cls))
+    lines.append(row('TP Right', f'{span_R:.1f} mm', tpr_cls))
+    gl_cls = 'cr' if (np.isfinite(dist_L) and dist_L <= CONTACT_DIST_MM) else 'ok'
+    gr_cls = 'cr' if (np.isfinite(dist_R) and dist_R <= CONTACT_DIST_MM) else 'ok'
+    lines.append(row('Gap Left',  f'{dist_L:.1f} mm' if np.isfinite(dist_L) else 'N/A', gl_cls))
+    lines.append(row('Gap Right', f'{dist_R:.1f} mm' if np.isfinite(dist_R) else 'N/A', gr_cls))
+    lines.append(row('Class Left',  cls_L or 'N/A'))
+    lines.append(row('Class Right', cls_R or 'N/A'))
+
+    # ── Canal ─────────────────────────────────────────────────────────────────
+    lines.append(section('Canal Stenosis'))
+    ap     = metrics.get('canal_ap_mm')
+    ap_cls = metrics.get('canal_ap_class', 'N/A')
+    dsca   = metrics.get('canal_dsca_mm2')
+    ap_col = ('cr' if 'Absolute' in (ap_cls or '') else
+              'wn' if 'Relative' in (ap_cls or '') else 'ok')
+    if ap:
+        lines.append(row('AP (overall)', f'{ap:.1f} mm — {ap_cls}', ap_col))
+    if dsca:
+        lines.append(row('DSCA≈', f'{dsca:.0f} mm²', ap_col))
+
+    # ── Per-level canal AP ────────────────────────────────────────────────────
+    level_ap_found = False
+    for _, _, up_n, lo_n in LUMBAR_PAIRS:
+        lk  = f'{up_n}_{lo_n}_level_ap_mm'
+        lck = f'{up_n}_{lo_n}_level_ap_class'
+        ap_v   = metrics.get(lk)
+        ap_c   = metrics.get(lck, 'N/A')
+        if ap_v is None: continue
+        if not level_ap_found:
+            lines.append(section('Level AP'))
+            level_ap_found = True
+        col = ('cr' if 'Absolute' in (ap_c or '') else
+               'wn' if 'Relative' in (ap_c or '') else 'ok')
+        lines.append(row(f'{up_n}-{lo_n}', f'{ap_v:.1f} mm ({ap_c})', col))
+
+    # ── Cord compression ──────────────────────────────────────────────────────
+    lines.append(section('Cord Compression'))
+    cp = metrics.get('cord_compression_profile')
+    if cp:
+        mc  = cp.get('max_mscc', 0)
+        cc  = cp.get('classification', 'N/A')
+        fc  = cp.get('flagged_count', 0)
+        col = ('cr' if cc == 'Severe' else
+               'wn' if cc in ('Moderate', 'Mild') else 'ok')
+        lines.append(row('Max MSCC', f'{mc:.2f} — {cc}', col))
+        lines.append(row('Flagged slices', str(fc), col if fc > 0 else 'ok'))
     else:
-        col, txt = '#ff9900', f'Baastrup risk: gap={min_gap:.1f}mm'
-    traces.append(label_point(p, txt, col, size=11, symbol='diamond'))
-    return traces
+        lines.append(row('Profile', 'N/A', 'pm'))
 
-def facet_tropism_traces(facet_metrics, sup_art_L, sup_art_R, origin_mm):
-    """3D annotation for facet tropism grade."""
-    traces = []
-    tropism = facet_metrics.get('facet_tropism_deg')
-    grade   = facet_metrics.get('facet_tropism_grade', '')
-    if tropism is None:
-        return traces
-    for mask, side in ((sup_art_L, 'L'), (sup_art_R, 'R')):
-        if mask is None or not mask.any():
-            continue
-        ctr = centroid_mm(mask)
-        if ctr is None:
-            continue
-        p = ctr - origin_mm
-        col = ('#ff3333' if 'Grade 2' in grade else
-               '#ff9900' if 'Grade 1' in grade else '#2dc653')
-        traces.append(label_point(p,
-            f'FT {side}: {tropism:.1f}° {grade}', col, size=8, symbol='circle'))
-    return traces
+    # ── Disc DHI ──────────────────────────────────────────────────────────────
+    lines.append(section('Disc DHI'))
+    for _, _, up_n, lo_n in LUMBAR_PAIRS:
+        dhi = metrics.get(f'{up_n}_{lo_n}_dhi_pct')
+        if dhi is None: continue
+        col = ('cr' if dhi < T.DHI_SEVERE_PCT else
+               'wn' if dhi < T.DHI_MODERATE_PCT else 'ok')
+        lines.append(row(f'{up_n}-{lo_n}', f'{dhi:.0f}%', col))
 
-def spondylolisthesis_traces(spondy_metrics_by_level, vert_iso, origin_mm):
-    """3D ruler and annotation for spondylolisthesis at each level."""
-    traces = []
-    for level, metrics in spondy_metrics_by_level.items():
-        trans_mm = metrics.get('sagittal_translation_mm')
-        if trans_mm is None or trans_mm < VertebralThresholds.SPONDYLOLISTHESIS_MM:
-            continue
-        # Find the two vertebral labels
-        parts = level.split('_')
-        if len(parts) < 2:
-            continue
-        col = '#ff4444'
-        txt = f'Spondy {level}: {trans_mm:.1f}mm'
-        # Put a marker near origin (no per-level centroid lookup here for brevity)
-        traces.append(go.Scatter3d(
-            x=[0], y=[0], z=[0],
-            mode='text',
-            text=[txt], textfont=dict(size=11, color=col),
-            showlegend=True, name=txt, hoverinfo='text'))
-    return traces
+    # ── Spondylolisthesis ─────────────────────────────────────────────────────
+    lines.append(section('Spondylolisthesis'))
+    for _, _, up_n, lo_n in LUMBAR_PAIRS:
+        trans = metrics.get(f'{up_n}_{lo_n}_sagittal_translation_mm')
+        if trans is None: continue
+        col  = 'cr' if trans >= T.SPONDYLO_MM else 'ok'
+        flag = ' ✗' if trans >= T.SPONDYLO_MM else ''
+        lines.append(row(f'{up_n}-{lo_n}', f'{trans:.1f} mm{flag}', col))
 
-# ── Study selection ───────────────────────────────────────────────────────────
+    # ── Ligamentum flavum ─────────────────────────────────────────────────────
+    lines.append(section('Lig. Flavum'))
+    lft     = metrics.get('lft_proxy_mm')
+    lft_cls = metrics.get('lft_class', 'N/A')
+    if lft is not None:
+        col = ('cr' if lft > T.LFT_SEVERE_MM else
+               'wn' if lft > T.LFT_NORMAL_MM else 'ok')
+        lines.append(row('LFT proxy', f'{lft:.1f} mm — {lft_cls}', col))
+    else:
+        lines.append(row('LFT proxy', 'N/A', 'pm'))
 
-def select_studies(csv_path, top_n, rank_by, valid_ids):
-    if not csv_path.exists():
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
-    df = pd.read_csv(csv_path)
-    df['study_id'] = df['study_id'].astype(str)
-    if valid_ids is not None:
-        before = len(df)
-        df = df[df['study_id'].isin(valid_ids)]
-        logger.info(f"Filtered to {len(df)} ({before-len(df)} excluded)")
-    if rank_by not in df.columns:
-        raise ValueError(f"Column '{rank_by}' not found.")
-    df_s = df.sort_values(rank_by,ascending=False).reset_index(drop=True)
-    top  = df_s.head(top_n)['study_id'].tolist()
-    bot  = df_s.tail(top_n)['study_id'].tolist()
-    seen,sel = set(),[]
-    for sid in top+bot:
-        if sid not in seen: sel.append(sid); seen.add(sid)
-    logger.info(f"Rank={rank_by}  Top{top_n}:{top}  Bot{top_n}:{bot}")
-    return sel
+    # ── Baastrup ──────────────────────────────────────────────────────────────
+    lines.append(section('Baastrup'))
+    gap     = metrics.get('min_inter_process_gap_mm')
+    contact = metrics.get('baastrup_contact', False)
+    risk    = metrics.get('baastrup_risk', False)
+    if gap is not None:
+        col = 'cr' if contact else 'wn' if risk else 'ok'
+        lbl = 'CONTACT' if contact else ('Risk zone' if risk else 'Normal')
+        lines.append(row('Min gap', f'{gap:.1f} mm — {lbl}', col))
+    else:
+        lines.append(row('Min gap', 'N/A', 'pm'))
 
-# ── Per-study builder ─────────────────────────────────────────────────────────
+    # ── Facet tropism ─────────────────────────────────────────────────────────
+    lines.append(section('Facet Tropism'))
+    trop     = metrics.get('facet_tropism_deg')
+    ft_grade = metrics.get('facet_tropism_grade', 'N/A')
+    fa_l     = metrics.get('facet_angle_l_deg')
+    fa_r     = metrics.get('facet_angle_r_deg')
+    if trop is not None:
+        col = ('cr' if trop >= T.TROPISM_SEVERE_DEG else
+               'wn' if trop >= T.TROPISM_NORMAL_DEG else 'ok')
+        grade_short = ft_grade.split('(')[0].strip() if ft_grade else 'N/A'
+        lines.append(row('Asymmetry', f'{trop:.1f}° — {grade_short}', col))
+    if fa_l is not None:
+        lines.append(row('Angle Left',  f'{fa_l:.1f}°'))
+    if fa_r is not None:
+        lines.append(row('Angle Right', f'{fa_r:.1f}°'))
 
-def build_3d_figure(study_id, spineps_dir, totalspine_dir,
-                    smooth=1.5, lstv_result=None,
-                    uncertainty_row=None, show_tss=True):
+    # ── Foraminal ─────────────────────────────────────────────────────────────
+    lines.append(section('Foraminal'))
+    for _, _, up_n, lo_n in LUMBAR_PAIRS:
+        fl  = metrics.get(f'{up_n}_{lo_n}_foraminal_class_L')
+        fr  = metrics.get(f'{up_n}_{lo_n}_foraminal_class_R')
+        if fl or fr:
+            left_col  = 'cr' if fl and 'Grade 3' in fl else 'wn' if fl and ('Grade 1' in fl or 'Grade 2' in fl) else 'ok'
+            right_col = 'cr' if fr and 'Grade 3' in fr else 'wn' if fr and ('Grade 1' in fr or 'Grade 2' in fr) else 'ok'
+            left_lbl  = (fl or 'N/A').replace('Normal (','').replace(')','')
+            right_lbl = (fr or 'N/A').replace('Normal (','').replace(')','')
+            lines.append(row(f'{up_n}-{lo_n} L', left_lbl,  left_col))
+            lines.append(row(f'{up_n}-{lo_n} R', right_lbl, right_col))
 
+    # ── Uncertainty (Ian-Pan) ─────────────────────────────────────────────────
+    if uncertainty_row:
+        has_any = any(
+            not np.isnan(uncertainty_row.get(f'{lvl}_confidence', float('nan')))
+            for lvl in IAN_PAN_LEVELS)
+        if has_any:
+            lines.append(section('Ian-Pan Confidence'))
+            for lvl, lbl in zip(IAN_PAN_LEVELS, IAN_PAN_LABELS):
+                v = uncertainty_row.get(f'{lvl}_confidence', float('nan'))
+                if not np.isnan(v):
+                    lines.append(row(lbl, f'{v:.3f}', 'pm'))
+
+    return '\n'.join(lines)
+
+
+# ─── Main per-study builder ───────────────────────────────────────────────────
+
+def build_3d_figure(study_id: str, spineps_dir: Path, totalspine_dir: Path,
+                    smooth: float = 1.5, show_tss: bool = True,
+                    lstv_result: Optional[dict] = None,
+                    morphometrics: Optional[dict] = None,
+                    uncertainty_row: Optional[dict] = None):
+    """
+    Build interactive 3D figure for one study.
+
+    morphometrics: dict (pre-computed by 05_morphometrics.py) or None.
+                   If None, falls back to inline computation.
+    """
+    # ── Load masks for mesh generation ───────────────────────────────────────
     seg_dir    = spineps_dir / 'segmentations' / study_id
-    spine_path = seg_dir  / f"{study_id}_seg-spine_msk.nii.gz"
-    vert_path  = seg_dir  / f"{study_id}_seg-vert_msk.nii.gz"
+    spine_path = seg_dir / f"{study_id}_seg-spine_msk.nii.gz"
+    vert_path  = seg_dir / f"{study_id}_seg-vert_msk.nii.gz"
     tss_path   = (totalspine_dir / study_id / 'sagittal'
                   / f"{study_id}_sagittal_labeled.nii.gz")
 
-    def _load(path, tag):
-        if not path.exists():
-            logger.warning(f"  Missing: {path.name}"); return None,None
-        try:    return load_canonical(path)
-        except Exception as e:
-            logger.warning(f"  Cannot load {tag}: {e}"); return None,None
+    def _load(p, tag):
+        if not p.exists(): logger.warning(f"  Missing: {p.name}"); return None,None
+        try: return _load_canonical(p)
+        except Exception as e: logger.warning(f"  {tag}: {e}"); return None,None
 
     sag_sp,  nii_ref = _load(spine_path, 'seg-spine_msk')
     sag_vert, _      = _load(vert_path,  'seg-vert_msk')
     sag_tss,  _      = _load(tss_path,   'TSS sagittal')
+    if sag_sp is None or sag_vert is None:
+        logger.error(f"[{study_id}] Missing required masks"); return None
 
-    if sag_sp is None:
-        logger.error(f"  [{study_id}] Missing seg-spine_msk"); return None
-    if sag_vert is None:
-        logger.error(f"  [{study_id}] Missing seg-vert_msk");  return None
-
-    vox_mm = voxel_size_mm(nii_ref)
-    logger.info(f"  Native voxel: {np.round(vox_mm,3)}  "
-                f"shape: {sag_sp.shape}  → resampling to {ISO_MM}mm isotropic")
-
-    # ── RESAMPLE ALL VOLUMES TO ISOTROPIC 1mm³ ────────────────────────────────
-    sp_iso   = resample_label_vol_to_iso(sag_sp.astype(np.int32),   vox_mm)
-    vert_iso = resample_label_vol_to_iso(sag_vert.astype(np.int32), vox_mm)
-    tss_iso  = (resample_label_vol_to_iso(sag_tss.astype(np.int32), vox_mm)
+    vox_mm   = _voxmm(nii_ref)
+    sp_iso   = _resample(sag_sp.astype(np.int32), vox_mm)
+    vert_iso = _resample(sag_vert.astype(np.int32), vox_mm)
+    tss_iso  = (_resample(sag_tss.astype(np.int32), _voxmm(_load(tss_path,'tss')[1] or nii_ref))
                 if sag_tss is not None else None)
-    logger.info(f"  Iso shape: {sp_iso.shape}")
 
-    sp_labels   = set(np.unique(sp_iso).tolist())   - {0}
-    vert_labels = set(np.unique(vert_iso).tolist())  - {0}
-    tss_labels  = (set(np.unique(tss_iso).tolist()) - {0}
-                   if tss_iso is not None else set())
-    logger.info(f"  seg-spine iso labels: {sorted(sp_labels)}")
-    logger.info(f"  seg-vert  iso labels: {sorted(vert_labels)}")
-    if tss_iso is not None:
-        logger.info(f"  TSS       iso labels: {sorted(tss_labels)}")
+    sp_labels   = set(np.unique(sp_iso).tolist())-{0}
+    vert_labels = set(np.unique(vert_iso).tolist())-{0}
+    tss_labels  = (set(np.unique(tss_iso).tolist())-{0} if tss_iso is not None else set())
+
+    # ── Morphometrics: use pre-computed or fall back ──────────────────────────
+    if morphometrics is None:
+        logger.info(f"  [{study_id}] No pre-computed morphometrics — computing inline")
+        from morphometrics_engine import MaskSet as _MS
+        ms = _MS(study_id=study_id, sp_iso=sp_iso, vert_iso=vert_iso,
+                 tss_iso=tss_iso, sp_labels=sp_labels,
+                 vert_labels=vert_labels, tss_labels=tss_labels)
+        res = run_all_morphometrics(ms)
+        metrics = res.to_dict()
+        if res.cord_compression_profile:
+            metrics['cord_compression_profile'] = res.cord_compression_profile
+    else:
+        metrics = morphometrics
 
     # ── Origin ────────────────────────────────────────────────────────────────
     col_mask  = vert_iso > 0
-    origin_mm = (centroid_mm(col_mask)
+    origin_mm = (_centroid(col_mask)
                  if col_mask.any()
-                 else np.array(sp_iso.shape, float) / 2.0 * ISO_MM)
-    logger.info(f"  Origin_mm: {np.round(origin_mm,1)}")
+                 else np.array(sp_iso.shape,float)/2.0*ISO_MM)
 
-    # ── Sacrum mask ───────────────────────────────────────────────────────────
-    if tss_iso is not None and (tss_iso == TSS_SACRUM_LABEL).any():
-        sac_iso = (tss_iso == TSS_SACRUM_LABEL)
-        logger.info("  Sacrum: TSS label 50")
-    elif (sp_iso == SPINEPS_SACRUM).any():
-        sac_iso = (sp_iso == SPINEPS_SACRUM)
-        logger.warning("  Sacrum: fallback SPINEPS label 26")
+    # ── Sacrum ────────────────────────────────────────────────────────────────
+    if tss_iso is not None and (tss_iso==TSS_SACRUM).any():
+        sac_iso = (tss_iso==TSS_SACRUM)
+    elif (sp_iso==SP_SACRUM).any():
+        sac_iso = (sp_iso==SP_SACRUM)
     else:
         sac_iso = np.zeros(sp_iso.shape, bool)
-        logger.warning("  Sacrum: NOT FOUND")
 
     # ── Transitional vertebra ─────────────────────────────────────────────────
     tv_label, tv_name = None, 'N/A'
-    for cand in LUMBAR_LABELS_ORDERED:
+    for cand in VERIDAH_LUMBAR_LABELS:
         if cand in vert_labels:
             tv_label = cand
             tv_name  = VERIDAH_NAMES.get(cand, str(cand))
             break
-    logger.info(f"  TV: {tv_name}  label={tv_label}")
+    if lstv_result:
+        det_tv = lstv_result.get('details',{}).get('tv_name')
+        if det_tv: tv_name = det_tv
 
     # ── TP masks ──────────────────────────────────────────────────────────────
-    tp_L_full = (sp_iso == TP_LEFT_LABEL)
-    tp_R_full = (sp_iso == TP_RIGHT_LABEL)
-    logger.info(f"  TP-L full: {tp_L_full.sum()} vox   "
-                f"TP-R full: {tp_R_full.sum()} vox")
-
+    tp_L_full = (sp_iso==SP_TP_L); tp_R_full = (sp_iso==SP_TP_R)
     if tv_label is not None:
-        tv_zr = get_z_range(vert_iso == tv_label)
-        if tv_zr is not None:
-            z_lo_tv, z_hi_tv = tv_zr
-            logger.info(f"  TV z-range (iso mm): [{z_lo_tv*ISO_MM:.0f}, "
-                        f"{z_hi_tv*ISO_MM:.0f}]")
-            tp_L_iso = isolate_at_z_range(tp_L_full, z_lo_tv, z_hi_tv, margin=20)
-            tp_R_iso = isolate_at_z_range(tp_R_full, z_lo_tv, z_hi_tv, margin=20)
-            if not tp_L_iso.any():
-                logger.warning("  TP-L isolation empty → full volume")
-                tp_L_iso = tp_L_full
-            if not tp_R_iso.any():
-                logger.warning("  TP-R isolation empty → full volume")
-                tp_R_iso = tp_R_full
+        tv_zr = _z_range(vert_iso==tv_label)
+        if tv_zr:
+            tp_L_iso = _isolate_z(tp_L_full, *tv_zr)
+            tp_R_iso = _isolate_z(tp_R_full, *tv_zr)
+            if not tp_L_iso.any(): tp_L_iso = tp_L_full
+            if not tp_R_iso.any(): tp_R_iso = tp_R_full
         else:
             tp_L_iso = tp_L_full; tp_R_iso = tp_R_full
     else:
         tp_L_iso = tp_L_full; tp_R_iso = tp_R_full
 
-    tp_L = inferiormost_cc(tp_L_iso, sac_iso if sac_iso.any() else None)
-    tp_R = inferiormost_cc(tp_R_iso, sac_iso if sac_iso.any() else None)
+    tp_L = _inferiormost_cc(tp_L_iso, sac_iso if sac_iso.any() else None)
+    tp_R = _inferiormost_cc(tp_R_iso, sac_iso if sac_iso.any() else None)
+    span_L = _tp_h(tp_L); span_R = _tp_h(tp_R)
+    dist_L = _min_dist(tp_L, sac_iso)[0]; dist_R = _min_dist(tp_R, sac_iso)[0]
 
-    span_L = tp_height_mm(tp_L)
-    span_R = tp_height_mm(tp_R)
-    dist_L, _, _ = min_dist_mm(tp_L, sac_iso)
-    dist_R, _, _ = min_dist_mm(tp_R, sac_iso)
-    logger.info(f"  TP-L: {tp_L.sum()} vox  height={span_L:.1f}mm  "
-                f"gap={dist_L:.1f}mm")
-    logger.info(f"  TP-R: {tp_R.sum()} vox  height={span_R:.1f}mm  "
-                f"gap={dist_R:.1f}mm")
-
-    # ── Classification ────────────────────────────────────────────────────────
-    castellvi='N/A'; cls_L='N/A'; cls_R='N/A'
+    # ── Castellvi from LSTV result ────────────────────────────────────────────
+    castellvi = 'N/A'; cls_L = 'N/A'; cls_R = 'N/A'
     if lstv_result:
         castellvi = lstv_result.get('castellvi_type') or 'None'
         cls_L     = lstv_result.get('left',  {}).get('classification','N/A')
         cls_R     = lstv_result.get('right', {}).get('classification','N/A')
-        det_tv    = lstv_result.get('details',{}).get('tv_name')
-        if det_tv: tv_name = det_tv
-
-    # ── RUN ALL MORPHOMETRICS ─────────────────────────────────────────────────
-    logger.info("  Running comprehensive morphometric analysis...")
-    morphometrics = run_all_morphometrics(sp_iso, vert_iso, tss_iso, sac_iso)
-
-    # Extract key metrics for display
-    ap_mm    = morphometrics.get('canal_AP_mm')
-    dsca_mm2 = morphometrics.get('canal_DSCA_mm2')
-    ap_class = morphometrics.get('canal_AP_class', 'N/A')
-    dsca_cls = morphometrics.get('canal_DSCA_class', 'N/A')
-    lft_prox = morphometrics.get('LFT_proxy_mm')
-    lft_cls  = morphometrics.get('LFT_class', 'N/A')
-    cord_csa = morphometrics.get('Cord_CSA_mm2')
-    mscc     = morphometrics.get('MSCC_proxy')
-    bstp_contact = morphometrics.get('baastrup_baastrup_contact', False)
-    bstp_gap = morphometrics.get('baastrup_min_inter_process_gap_mm', float('inf'))
-    tropism  = morphometrics.get('facet_tropism_deg')
-    ft_grade = morphometrics.get('facet_tropism_grade', 'N/A')
 
     # ── Build traces ──────────────────────────────────────────────────────────
     traces = []
 
-    # 1. SPINEPS seg-spine_msk
-    # SPINE_MASK_LABELS is a 6-tuple: (lbl, name, colour, opacity, fill_holes, struct_sigma)
-    # struct_sigma is the per-structure smooth value that overrides the global --smooth
-    # for thin flat structures (endplates, canal) where high sigma destroys the mesh.
-    for lbl, name, col, op, fh, struct_sigma in SPINE_MASK_LABELS:
-        if lbl not in sp_labels:
-            continue
-        mask = (tp_L if lbl == TP_LEFT_LABEL
-                else tp_R if lbl == TP_RIGHT_LABEL
-                else (sp_iso == lbl))
-        if not mask.any():
-            continue
-        # Use per-structure sigma for thin structures (endplate, canal, TPs);
-        # use the global --smooth for everything else, capped to struct_sigma maximum
-        # so we don't over-blur a structure that can't tolerate it.
-        effective_sigma = min(smooth, struct_sigma) if struct_sigma < 1.0 else smooth
-        t = mask_to_mesh3d(mask, origin_mm, name, col, op,
-                           smooth_sigma=effective_sigma, fill_holes=fh)
-        if t:
-            traces.append(t)
-            logger.info(f"    ✓ seg-spine {lbl:>3}  {name}")
-        else:
-            logger.warning(f"    ✗ seg-spine {lbl:>3}  {name}  "
-                           f"(sigma={effective_sigma:.1f} fill={fh})")
+    # 1. SPINEPS seg-spine_msk meshes
+    for lbl, name, col, op, fh, max_sig in SPINE_LABELS:
+        if lbl not in sp_labels: continue
+        mask = (tp_L if lbl==SP_TP_L else tp_R if lbl==SP_TP_R else (sp_iso==lbl))
+        if not mask.any(): continue
+        eff_sig = min(smooth, max_sig) if max_sig < 1.0 else smooth
+        t = mask_to_mesh3d(mask, origin_mm, name, col, op, eff_sig, fh)
+        if t: traces.append(t)
 
     # 2. VERIDAH vertebrae
-    all_veridah = {**VERIDAH_CERVICAL, **VERIDAH_THORACIC, **VERIDAH_LUMBAR}
-    for lbl, (name, col, op) in sorted(all_veridah.items()):
-        if lbl not in vert_labels:
-            continue
-        t = mask_to_mesh3d(vert_iso == lbl, origin_mm, name, col, op,
-                           smooth_sigma=smooth, fill_holes=True)
-        if t:
-            traces.append(t)
-            logger.info(f"    ✓ seg-vert  {lbl:>3}  {name}")
+    all_vd = {**VERIDAH_CERVICAL, **VERIDAH_THORACIC, **VERIDAH_LUMBAR_MAP}
+    for lbl,(name,col,op) in sorted(all_vd.items()):
+        if lbl not in vert_labels: continue
+        t = mask_to_mesh3d(vert_iso==lbl, origin_mm, name, col, op, smooth, True)
+        if t: traces.append(t)
 
-    # 2b. VERIDAH IVD labels (100+X)
+    # 2b. VERIDAH IVD (100+X)
     for base, col in VERIDAH_IVD_COLOURS.items():
-        ivd_lbl = VERIDAH_IVD_BASE + base
-        if ivd_lbl not in vert_labels:
-            continue
-        name = f'IVD below {VERIDAH_NAMES.get(base, str(base))}'
-        t = mask_to_mesh3d(vert_iso == ivd_lbl, origin_mm, name, col, 0.55,
-                           smooth_sigma=smooth, fill_holes=True)
-        if t:
-            traces.append(t)
-            logger.info(f"    ✓ seg-vert  {ivd_lbl:>3}  {name}")
+        ivd_lbl = VD_IVD_BASE+base
+        if ivd_lbl not in vert_labels: continue
+        name = f'IVD below {VERIDAH_NAMES.get(base,str(base))}'
+        t = mask_to_mesh3d(vert_iso==ivd_lbl, origin_mm, name, col, 0.55, smooth, True)
+        if t: traces.append(t)
 
-    # 2c. VERIDAH per-vertebra endplate labels (200+X)
-    # These are distinct from the global SPINEPS label 62 — they carry vertebra identity
-    # and are used in the morphometric endplate-to-endplate DHI measurement.
-    for base in VERIDAH_IVD_COLOURS:   # same vertebra labels: L1=20 … L5=24
-        ep_lbl = VERIDAH_ENDPLATE_BASE + base
-        if ep_lbl not in vert_labels:
-            continue
-        vname = VERIDAH_NAMES.get(base, str(base))
-        ep_name = f'Endplate {vname}'
-        # Endplates are thin (2-3 voxels) — same rendering rules as SPINEPS label 62
-        t = mask_to_mesh3d(vert_iso == ep_lbl, origin_mm, ep_name,
-                           VERIDAH_ENDPLATE_COLOUR, 0.75,
-                           smooth_sigma=0.6, fill_holes=False)
-        if t:
-            traces.append(t)
-            logger.info(f"    ✓ seg-vert  {ep_lbl:>3}  {ep_name}")
-        else:
-            logger.warning(f"    ✗ seg-vert  {ep_lbl:>3}  {ep_name}  (thin — may be absent)")
+    # 2c. VERIDAH per-vertebra endplates (200+X)
+    for base in VERIDAH_IVD_COLOURS:
+        ep_lbl = VD_EP_BASE+base
+        if ep_lbl not in vert_labels: continue
+        name = f'Endplate {VERIDAH_NAMES.get(base,str(base))}'
+        t = mask_to_mesh3d(vert_iso==ep_lbl, origin_mm, name,
+                           VERIDAH_EP_COLOUR, 0.75, 0.6, False)
+        if t: traces.append(t)
 
-    # 3. TotalSpineSeg — full label coverage per README (50 classes)
-    # TSS labels are rendered at their native opacity (not halved) since TSS is the
-    # primary source for cord/canal/sacrum and its vertebra bodies serve as the
-    # reference for per-level canal shape and cervical MSCC calculations.
-    # Cervical and thoracic entries are shown at low opacity so they don't obscure
-    # the SPINEPS sub-region detail at lumbar levels.
+    # 3. TotalSpineSeg meshes
     if show_tss and tss_iso is not None:
         for lbl, name, col, op in TSS_LABELS:
-            if lbl not in tss_labels:
-                continue
-            # TSS cord/canal: fill_holes=False (hollow structures)
-            # TSS vertebrae/discs: fill_holes=True
-            is_thin = lbl in (1, 2)   # cord and canal
-            t = mask_to_mesh3d(tss_iso == lbl, origin_mm, name,
-                               col, op,
-                               smooth_sigma=0.8 if is_thin else smooth,
-                               fill_holes=not is_thin)
-            if t:
-                traces.append(t)
-                logger.info(f"    ✓ TSS       {lbl:>3}  {name}")
+            if lbl not in tss_labels: continue
+            is_thin = lbl in (1,2)
+            t = mask_to_mesh3d(tss_iso==lbl, origin_mm, name, col, op,
+                               0.8 if is_thin else smooth, not is_thin)
+            if t: traces.append(t)
 
     if not any(isinstance(tr, go.Mesh3d) for tr in traces):
-        logger.error(f"  [{study_id}] Zero meshes — check label maps")
-        return None
+        logger.error(f"[{study_id}] Zero meshes"); return None
 
-    # 4. LSTV annotations (original)
+    # 4. 3D ruler annotations (attached to mesh)
     if tv_label is not None:
         traces += tv_plane_traces(vert_iso, tv_label, origin_mm, tv_name)
-    traces += tp_height_ruler_traces(tp_L, origin_mm,'#ff3333','Left', span_L)
-    traces += tp_height_ruler_traces(tp_R, origin_mm,'#00d4ff','Right',span_R)
-    traces += gap_ruler_traces(tp_L, sac_iso, origin_mm,'#ff8800','Left', dist_L)
-    traces += gap_ruler_traces(tp_R, sac_iso, origin_mm,'#00aaff','Right',dist_R)
+    traces += tp_height_ruler_traces(tp_L, origin_mm, '#ff3333', 'Left',  span_L)
+    traces += tp_height_ruler_traces(tp_R, origin_mm, '#00d4ff', 'Right', span_R)
+    traces += gap_ruler_traces(tp_L, sac_iso, origin_mm, '#ff8800', 'Left',  dist_L)
+    traces += gap_ruler_traces(tp_R, sac_iso, origin_mm, '#00aaff', 'Right', dist_R)
     traces += castellvi_contact_traces(tp_L,tp_R,sac_iso,origin_mm,
-                                        cls_L,cls_R,dist_L,dist_R)
-    traces += ian_pan_bar_traces(uncertainty_row, origin_mm)
+                                       cls_L,cls_R,dist_L,dist_R)
 
-    # 5. NEW morphometric annotations
-    canal_mask_iso  = (sp_iso == 61) if 61 in sp_labels else None
-    spinous_mask_iso = (sp_iso == 42) if 42 in sp_labels else None
-    sup_art_L_iso   = (sp_iso == 45) if 45 in sp_labels else None
-    sup_art_R_iso   = (sp_iso == 46) if 46 in sp_labels else None
+    # 5. Cord compression sphere markers on cord mesh
+    cord_iso = (sp_iso==SP_CORD) if SP_CORD in sp_labels else \
+               ((tss_iso==TSS_CORD) if (tss_iso is not None and TSS_CORD in tss_labels)
+                else np.zeros(sp_iso.shape, bool))
+    cp = metrics.get('cord_compression_profile')
+    if cord_iso.any():
+        traces += cord_compression_traces(cp, cord_iso, origin_mm)
 
-    # Canal stenosis annotation
-    if canal_mask_iso is not None and ap_mm is not None:
-        traces += canal_stenosis_annotation_trace(
-            canal_mask_iso, origin_mm, ap_mm, dsca_mm2, ap_class, dsca_cls)
-
-    # Baastrup annotation
-    bstp_dict = {k.replace('baastrup_',''):v
-                 for k,v in morphometrics.items() if k.startswith('baastrup_')}
-    if bstp_dict:
-        traces += spinous_annotation_traces(bstp_dict, spinous_mask_iso, origin_mm)
-
-    # Facet tropism annotation
-    ft_dict = {k:v for k,v in morphometrics.items()
-               if k.startswith('facet_')}
-    if ft_dict:
-        traces += facet_tropism_traces(ft_dict, sup_art_L_iso, sup_art_R_iso,
-                                       origin_mm)
-
-    # ── Summary panel ─────────────────────────────────────────────────────────
-    def _fmt(v): return f'{v:.1f} mm' if (v is not None and np.isfinite(v)) else 'N/A'
-    def _fmt2(v): return f'{v:.1f}' if (v is not None and np.isfinite(v)) else 'N/A'
-    def _fmm2(v): return f'{v:.0f} mm²' if (v is not None and np.isfinite(v)) else 'N/A'
-
-    # Build per-level DHI summary with endplate-to-endplate distance and source
-    dhi_lines = []
-    for pair in [('L1','L2'),('L2','L3'),('L3','L4'),('L4','L5'),('L5','S1')]:
-        level_key = f'{pair[0]}_{pair[1]}'
-        dhi    = morphometrics.get(f'{level_key}_DHI_pct')
-        ep_d   = morphometrics.get(f'{level_key}_endplate_dist_mm')
-        ep_src = morphometrics.get(f'{level_key}_endplate_source', '')
-        src    = morphometrics.get(f'{level_key}_disc_source', '')
-        parts  = []
-        if dhi is not None:
-            flag = ' ✗' if dhi < 50 else (' ⚠' if dhi < 70 else '')
-            parts.append(f"DHI={dhi:.1f}%{flag}")
-        if ep_d is not None:
-            eflag = ' ✗' if ep_d < 3.0 else ''
-            parts.append(f"ep-ep={ep_d:.1f}mm{eflag}[{ep_src}]")
-        if parts:
-            src_tag = f" ({src})" if src and src != 'none' else ''
-            dhi_lines.append(f"  {pair[0]}-{pair[1]}: {', '.join(parts)}{src_tag}")
-
-    # Per-level spondylolisthesis
-    spondy_lines = []
-    for pair in [('L1','L2'),('L2','L3'),('L3','L4'),('L4','L5'),('L5','S1')]:
-        key = f'{pair[0]}_{pair[1]}_sagittal_translation_mm'
-        trans = morphometrics.get(key)
-        if trans is not None:
-            flag = ' ✗ SPONDY' if trans >= VertebralThresholds.SPONDYLOLISTHESIS_MM else ''
-            spondy_lines.append(f"  {pair[0]}-{pair[1]}: {trans:.1f}mm{flag}")
-
-    # Vertebral height ratios
-    vert_lines = []
-    for vname in ['L1','L2','L3','L4','L5']:
-        w = morphometrics.get(f'{vname}_Wedge_Ha_Hp')
-        g = morphometrics.get(f'{vname}_Genant_Label','')
-        if w is not None:
-            flag = ' ✗' if w < VertebralThresholds.HEIGHT_RATIO_INTERVENTION else ''
-            vert_lines.append(f"  {vname} Wedge={w:.2f}{flag} {g}")
-
-    summary = [
-        "── LSTV / Castellvi ──",
-        f"TV:          {tv_name}",
-        f"TP-L height: {_fmt(span_L)}  {'✗ TypeI' if span_L>=TP_HEIGHT_MM else '✓'}",
-        f"TP-R height: {_fmt(span_R)}  {'✗ TypeI' if span_R>=TP_HEIGHT_MM else '✓'}",
-        f"Gap L:       {_fmt(dist_L)}  {'←CONTACT' if np.isfinite(dist_L) and dist_L<=CONTACT_DIST_MM else ''}",
-        f"Gap R:       {_fmt(dist_R)}  {'←CONTACT' if np.isfinite(dist_R) and dist_R<=CONTACT_DIST_MM else ''}",
-        f"Class L:     {cls_L}",
-        f"Class R:     {cls_R}",
-        f"Castellvi:   {castellvi}",
-        "",
-        "── Central Canal Stenosis ──",
-        f"Source:      {morphometrics.get('canal_source', 'SPINEPS')}",
-        f"AP diam:     {_fmt(ap_mm)} → {ap_class}",
-        f"DSCA≈:       {_fmm2(dsca_mm2)} → {dsca_cls}",
-        (f"  ✗ ABSOLUTE STENOSIS" if morphometrics.get('canal_absolute_stenosis') else
-         f"  ✓ within limits"),
-        "  Per-level AP (TSS disc midpoint):",
-    ] + [
-        (f"  {lv}: "
-         f"{_fmt(morphometrics.get(lv.replace('-','_') + '_level_AP_mm'))} "
-         f"→ {morphometrics.get(lv.replace('-','_') + '_level_AP_class', 'N/A')} "
-         f"({morphometrics.get(lv.replace('-','_') + '_canal_shape', '')})")
-        for lv in ['L1-L2', 'L2-L3', 'L3-L4', 'L4-L5', 'L5-S1']
-        if morphometrics.get(lv.replace('-', '_') + '_level_AP_mm') is not None
-    ] + [
-        "",
-        "── Spinal Cord ──",
-        f"Cord CSA:    {_fmm2(cord_csa)}",
-        f"MSCC proxy:  {_fmt2(mscc)}",
-        "",
-        "── Ligamentum Flavum (proxy) ──",
-        f"LFT proxy:   {_fmt(lft_prox)} → {lft_cls}",
-        f"  Normal≤{LigamentumFlavumThresholds.LFT_NORMAL_BASELINE_MM}mm  Severe>{LigamentumFlavumThresholds.LFT_SEVERE_MM}mm",
-        f"  LFA cutoff: {LigamentumFlavumThresholds.LFA_STENOSIS_CUTOFF_MM2}mm²",
-        "",
-        "── Disc Height Index (DHI) ──",
-        "  DHI=(Ha+Hp)/(Ds+Di)×100  [Farfan]",
-        "  ep-ep = endplate-to-endplate dist (most precise)",
-        "  Source: VERIDAH(200+X) > TSS > SPINEPS-merged",
-        "  <50%→Severe✗, <70%→Mod⚠, <85%→Mild",
-    ] + dhi_lines + [
-        "",
-        "── Vertebral Height Ratios ──",
-        "  Wedge<0.80→fract  <0.75→interv",
-    ] + vert_lines + [
-        "",
-        "── Spondylolisthesis ──",
-        f"  Threshold: ≥{VertebralThresholds.SPONDYLOLISTHESIS_MM}mm",
-    ] + spondy_lines + [
-        "",
-        "── Baastrup Disease ──",
-        f"Spinous gap: {_fmt(bstp_gap if np.isfinite(bstp_gap) else None)}",
-        (f"  ✗ CONTACT → cortical sclerosis risk" if bstp_contact else
-         f"  ✗ Risk (gap≤2mm)" if morphometrics.get('baastrup_baastrup_risk') else
-         f"  ✓ No Baastrup contact"),
-        "",
-        "── Facet Tropism ──",
-        f"Tropism:     {_fmt2(tropism)}°",
-        f"  {ft_grade}",
-        f"  Normal≤{FacetThresholds.TROPISM_NORMAL_DEG}°  Severe≥{FacetThresholds.TROPISM_SEVERE_DEG}°",
-        "",
-        "── Canal Shapes (L1–L5) ──",
-    ] + [f"  {lvl}: {CANAL_SHAPE_BY_LEVEL[lvl][0]} ({CANAL_SHAPE_BY_LEVEL[lvl][1]})"
-         for lvl in ['L1','L2','L3','L4','L5']] + [
-        "",
-        "── Foraminal Volume Norms ──",
-    ] + [f"  {lvl}: R={v['R']:.0f}mm³ L={v['L'] or 'N/A'}"
-         for lvl, v in ForaminalThresholds.VOLUME_NORMS.items()
-         if v['R']] + [
-        "",
-        "── Pfirrmann Ref ──",
-        "  I=Normal  III=Unclear  V=Collapsed",
-        "",
-        "── Modic Change Burden ──",
-        "  A<25%  B=25-50%  C>50% vert body",
-        "",
-        "── Cervical (if applicable) ──",
-        "  MSCC: AP cord / (above+below)",
-        "  K-Line neg → anterior contact",
-    ]
-
-    if tp_L.any(): summary.append(f"TP-L: {tp_L.sum()} vox "
-                                   f"({tp_L.sum()*ISO_MM**3/1000:.2f}cm³)")
-    if tp_R.any(): summary.append(f"TP-R: {tp_R.sum()} vox "
-                                   f"({tp_R.sum()*ISO_MM**3/1000:.2f}cm³)")
-    if uncertainty_row:
-        for lvl,lbl in zip(IAN_PAN_LEVELS,IAN_PAN_LABELS):
-            v = uncertainty_row.get(f'{lvl}_confidence',float('nan'))
-            if not np.isnan(v): summary.append(f"Ian {lbl}: {v:.3f}")
+    # ── Layout ────────────────────────────────────────────────────────────────
+    ap_mm       = metrics.get('canal_ap_mm')
+    ap_cls_name = metrics.get('canal_ap_class','N/A')
+    trop        = metrics.get('facet_tropism_deg')
+    cord_cls    = (cp.get('classification','N/A') if cp else 'N/A')
 
     fig = go.Figure(data=traces)
     fig.update_layout(
         title=dict(
-            text=(f"<b>{study_id}</b>  ·  Castellvi: <b>{castellvi}</b>"
-                  f"  ·  TV: <b>{tv_name}</b>"
-                  f"  ·  L: <b>{cls_L}</b>  ·  R: <b>{cls_R}</b>"
-                  f"  ·  Canal: <b>{ap_class}</b>"
-                  f"  ·  FT: <b>{_fmt2(tropism)}°</b>"),
-            font=dict(size=13,color='#e8e8f0'), x=0.01),
+            text=(f"<b>{study_id}</b> · Castellvi: <b>{castellvi}</b>"
+                  f" · TV: <b>{tv_name}</b>"
+                  f" · L:<b>{cls_L}</b> R:<b>{cls_R}</b>"
+                  f" · Canal:<b>{ap_cls_name}</b>"
+                  f" · Cord:<b>{cord_cls}</b>"
+                  f" · FT:<b>{trop:.1f}°</b>" if trop else
+                  f"<b>{study_id}</b> · Castellvi: <b>{castellvi}</b>"),
+            font=dict(size=12, color='#e8e8f0'), x=0.01),
         paper_bgcolor='#0d0d1a', plot_bgcolor='#0d0d1a',
         scene=dict(
             bgcolor='#0d0d1a',
-            xaxis=dict(title='X (mm)',showgrid=True,gridcolor='#1a1a3e',
+            xaxis=dict(title='X',showgrid=True,gridcolor='#1a1a3e',
                        showbackground=True,backgroundcolor='#0d0d1a',
                        tickfont=dict(color='#8888aa'),
                        titlefont=dict(color='#8888aa'),zeroline=False),
-            yaxis=dict(title='Y (mm)',showgrid=True,gridcolor='#1a1a3e',
+            yaxis=dict(title='Y',showgrid=True,gridcolor='#1a1a3e',
                        showbackground=True,backgroundcolor='#0d0d1a',
                        tickfont=dict(color='#8888aa'),
                        titlefont=dict(color='#8888aa'),zeroline=False),
-            zaxis=dict(title='Z (mm)',showgrid=True,gridcolor='#1a1a3e',
+            zaxis=dict(title='Z (SI)',showgrid=True,gridcolor='#1a1a3e',
                        showbackground=True,backgroundcolor='#0d0d1a',
                        tickfont=dict(color='#8888aa'),
                        titlefont=dict(color='#8888aa'),zeroline=False),
             aspectmode='data',
             camera=dict(eye=dict(x=1.6,y=0.0,z=0.3),up=dict(x=0,y=0,z=1))),
-        legend=dict(font=dict(color='#e8e8f0',size=10),
+        legend=dict(font=dict(color='#e8e8f0',size=9),
                     bgcolor='rgba(13,13,26,0.85)',
-                    bordercolor='#2a2a4a',borderwidth=1,
-                    x=0.01,y=0.98,itemsizing='constant'),
+                    bordercolor='#2a2a4a', borderwidth=1,
+                    x=0.01, y=0.98, itemsizing='constant'),
         margin=dict(l=0,r=0,t=40,b=0),
-        annotations=[
-            dict(text='drag=rotate · scroll=zoom · legend=toggle · dbl=isolate',
-                 xref='paper',yref='paper',x=0.5,y=-0.01,
-                 xanchor='center',yanchor='top',showarrow=False,
-                 font=dict(size=10,color='#8888aa'),align='center'),
-            dict(text='<b>Morphometric Analysis</b><br>'+'<br>'.join(summary),
-                 xref='paper',yref='paper',x=0.99,y=0.98,
-                 xanchor='right',yanchor='top',showarrow=False,
-                 font=dict(size=10,color='#e8e8f0',family='monospace'),
-                 bgcolor='rgba(13,13,26,0.88)',
-                 bordercolor='#2a2a4a',borderwidth=1,align='left'),
-        ])
-    return (fig, castellvi, tv_name, cls_L, cls_R, span_L, span_R,
-            dist_L, dist_R, morphometrics)
+    )
+    return fig, castellvi, tv_name, cls_L, cls_R, span_L, span_R, dist_L, dist_R, metrics
 
-# ── HTML template ─────────────────────────────────────────────────────────────
 
-HTML = """<!DOCTYPE html><html lang="en"><head>
+# ─── HTML template ────────────────────────────────────────────────────────────
+
+_HTML = """<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>3D Spine — {study_id}</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@700&display=swap');
 *{{box-sizing:border-box;margin:0;padding:0}}
-:root{{--bg:#0d0d1a;--sf:#13132a;--bd:#2a2a4a;--tx:#e8e8f0;--mu:#6666aa;--bl:#3a86ff}}
+:root{{--bg:#0d0d1a;--sf:#13132a;--bd:#2a2a4a;--tx:#e8e8f0;--mu:#6666aa}}
 html,body{{background:var(--bg);color:var(--tx);font-family:'JetBrains Mono',monospace;
            height:100vh;display:flex;flex-direction:column;overflow:hidden}}
-header{{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:6px 12px;
+header{{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:5px 10px;
         border-bottom:1px solid var(--bd);background:var(--sf);flex-shrink:0}}
-h1{{font-family:'Syne',sans-serif;font-size:.86rem;font-weight:700;white-space:nowrap}}
-.b{{display:inline-block;padding:2px 8px;border-radius:20px;
-    font-size:.65rem;font-weight:600;letter-spacing:.05em}}
+h1{{font-family:'Syne',sans-serif;font-size:.8rem;font-weight:700}}
+.b{{display:inline-block;padding:2px 7px;border-radius:16px;
+    font-size:.62rem;font-weight:600}}
 .bs{{background:#2a2a4a;color:var(--mu)}} .bc{{background:#ff8c00;color:#0d0d1a}}
-.bt{{background:#1e6fa8;color:#fff}}     .bL{{background:#cc2222;color:#fff}}
-.bR{{background:#006688;color:#fff}}     .bi{{background:#1a3a2a;color:#2dc653;border:1px solid #2dc653}}
+.bt{{background:#1e6fa8;color:#fff}} .bL{{background:#cc2222;color:#fff}}
+.bR{{background:#006688;color:#fff}} .bi{{background:#1a3a2a;color:#2dc653;border:1px solid #2dc653}}
 .bw{{background:#553300;color:#ffaa44;border:1px solid #ffaa44}}
 .be{{background:#330011;color:#ff4466;border:1px solid #ff4466}}
+.bc2{{background:#1a1a3a;color:#8888ff;border:1px solid #4444aa}}
 .tb{{display:flex;gap:5px;align-items:center;margin-left:auto}}
-.tb span{{font-size:.59rem;color:var(--mu);text-transform:uppercase;letter-spacing:.08em}}
+.tb span{{font-size:.57rem;color:var(--mu);text-transform:uppercase}}
 button{{background:var(--bg);border:1px solid var(--bd);color:var(--tx);
-        font-family:inherit;font-size:.65rem;padding:3px 9px;border-radius:4px;cursor:pointer}}
-button:hover{{background:var(--bd)}} button.on{{background:var(--bl);border-color:var(--bl);color:#fff}}
-.mt{{display:flex;gap:16px;flex-wrap:wrap;align-items:center;padding:4px 12px;
-     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.64rem}}
-.m{{display:flex;align-items:center;gap:4px;color:var(--mu)}}
+        font-family:inherit;font-size:.62rem;padding:2px 8px;border-radius:4px;cursor:pointer}}
+button:hover{{background:var(--bd)}} button.on{{background:#3a86ff;border-color:#3a86ff;color:#fff}}
+.mt{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:3px 10px;
+     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.62rem}}
+.m{{display:flex;align-items:center;gap:3px;color:var(--mu)}}
 .v{{color:var(--tx);font-weight:600}} .ok{{color:#2dc653!important}}
 .wn{{color:#ff8800!important}} .cr{{color:#ff3333!important}}
-.mt2{{display:flex;gap:12px;flex-wrap:wrap;align-items:center;padding:3px 12px;
-      border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.62rem;color:var(--mu)}}
-.lg{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:4px 12px;
-     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.62rem}}
+/* main body row — 3D viewer + right panel */
+.main-row{{display:flex;flex:1;min-height:0;overflow:hidden}}
+/* bottom legend strip */
+.lg{{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:3px 10px;
+     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.60rem}}
 .li{{display:flex;align-items:center;gap:3px;color:var(--mu)}}
-.sw{{width:10px;height:10px;border-radius:2px;flex-shrink:0}}
-#pl{{flex:1;min-height:0}} #pl .js-plotly-plot,#pl .plot-container{{height:100%!important}}
+.sw{{width:9px;height:9px;border-radius:2px;flex-shrink:0}}
+.note{{font-size:.55rem;color:#444;margin-left:auto}}
+/* plotly container */
+#pl{{flex:1;min-width:0;min-height:0;overflow:hidden}}
+#pl .js-plotly-plot,#pl .plot-container{{height:100%!important}}
+/* ── RIGHT METRICS PANEL ── */
+#metrics-panel{{
+  width:210px;flex-shrink:0;
+  background:rgba(13,13,26,0.92);
+  border-left:1px solid var(--bd);
+  overflow-y:auto;overflow-x:hidden;
+  padding:6px 0 12px 0;
+  font-size:.60rem;
+  scrollbar-width:thin;scrollbar-color:#2a2a4a var(--bg);
+}}
+#metrics-panel::-webkit-scrollbar{{width:4px}}
+#metrics-panel::-webkit-scrollbar-track{{background:var(--bg)}}
+#metrics-panel::-webkit-scrollbar-thumb{{background:#2a2a4a;border-radius:2px}}
+/* section header */
+.ps{{
+  font-family:'Syne',sans-serif;font-size:.57rem;font-weight:700;
+  color:#6666aa;text-transform:uppercase;letter-spacing:.06em;
+  padding:5px 8px 2px 8px;margin-top:4px;
+  border-top:1px solid #1a1a3a;
+}}
+.ps:first-child{{border-top:none;margin-top:0}}
+/* key/value row */
+.pr{{display:flex;justify-content:space-between;align-items:baseline;
+     padding:1px 8px;gap:4px}}
+.pk{{color:#6666aa;white-space:nowrap;flex-shrink:0}}
+.pv{{text-align:right;color:var(--tx);font-weight:600;word-break:break-word}}
+.pv.ok{{color:#2dc653}} .pv.wn{{color:#ff8800}} .pv.cr{{color:#ff3333}}
+.pv.pm{{color:#8888aa;font-weight:400}}
 </style></head><body>
-<header><h1>3D SPINE MORPHOMETRICS</h1>
+<header><h1>3D SPINE</h1>
   <span class="b bs">{study_id}</span>
-  <span class="b bc">Castellvi: {castellvi}</span>
-  <span class="b bt">TV: {tv_name}</span>
-  <span class="b bL">L: {cls_L}</span>
-  <span class="b bR">R: {cls_R}</span>
-  <span class="b {canal_badge_cls}">Canal: {canal_class}</span>
-  <span class="b {ft_badge_cls}">FT: {ft_label}</span>
-  <span class="b {bstp_badge_cls}">Baastrup: {bstp_label}</span>
+  <span class="b bc">Castellvi:{castellvi}</span>
+  <span class="b bt">TV:{tv_name}</span>
+  <span class="b bL">L:{cls_L}</span>
+  <span class="b bR">R:{cls_R}</span>
+  <span class="b {canal_badge}">Canal:{canal_class}</span>
+  <span class="b {cord_badge}">Cord:{cord_label}</span>
+  <span class="b {ft_badge}">FT:{ft_label}</span>
+  <span class="b {bstp_badge}">Baastrup:{bstp_label}</span>
   {ian_badge}
   <div class="tb"><span>View</span>
     <button onclick="sv('oblique')"   id="b-oblique"   class="on">Oblique</button>
@@ -1979,45 +840,41 @@ button:hover{{background:var(--bd)}} button.on{{background:var(--bl);border-colo
   <div class="m">TP-R <span class="v {tpr_c}">{span_R}</span></div>
   <div class="m">Gap-L <span class="v {gl_c}">{gap_L}</span></div>
   <div class="m">Gap-R <span class="v {gr_c}">{gap_R}</span></div>
-  <div class="m">L <span class="v">{cls_L}</span></div>
-  <div class="m">R <span class="v">{cls_R}</span></div>
-  <div class="m">AP <span class="v {ap_c}">{ap_display}</span></div>
-  <div class="m">DSCA <span class="v {dsca_c}">{dsca_display}</span></div>
-  <div class="m">LFT <span class="v {lft_c}">{lft_display}</span></div>
-  <div class="m">FT <span class="v {ft_c}">{ft_display}</span></div>
-  {ian_metrics}
-  <div style="margin-left:auto;color:#333355;font-size:.58rem">drag=rotate·scroll=zoom·legend=toggle·dbl=isolate</div>
-</div>
-<div class="mt2">
-  {dhi_metrics}
-  {spondy_metrics}
-  {vert_ratio_metrics}
+  <div class="m">AP <span class="v {ap_c}">{ap_disp}</span></div>
+  <div class="m">MSCC <span class="v {mscc_c}">{mscc_disp}</span></div>
+  <div class="m">LFT <span class="v {lft_c}">{lft_disp}</span></div>
+  <div class="m">FT <span class="v {ft_c}">{ft_disp}</span></div>
+  {dhi_row}
+  <div class="note">drag=rotate · scroll=zoom · legend=toggle</div>
 </div>
 <div class="lg">
-  <div class="li"><div class="sw" style="background:#ff3333"></div>TP-L(43)</div>
-  <div class="li"><div class="sw" style="background:#00d4ff"></div>TP-R(44)</div>
+  <div class="li"><div class="sw" style="background:#ff3333"></div>TP-L</div>
+  <div class="li"><div class="sw" style="background:#00d4ff"></div>TP-R</div>
   <div class="li"><div class="sw" style="background:#ff8c00"></div>Sacrum</div>
   <div class="li"><div class="sw" style="background:#8855cc"></div>Arcus</div>
   <div class="li"><div class="sw" style="background:#e8c84a"></div>Spinous</div>
-  <div class="li"><div class="sw" style="background:#66ccaa"></div>SupArt</div>
-  <div class="li"><div class="sw" style="background:#aaddcc"></div>InfArt</div>
-  <div class="li"><div class="sw" style="background:#ffcc44"></div>IVD(spine)</div>
-  <div class="li"><div class="sw" style="background:#ffe28a"></div>IVD(vert)</div>
-  <div class="li"><div class="sw" style="background:#1e6fa8;opacity:.7"></div>L1-L6</div>
-  <div class="li"><div class="sw" style="background:#00ffb3;opacity:.5"></div>Canal</div>
   <div class="li"><div class="sw" style="background:#ffe066;opacity:.8"></div>Cord</div>
-  <div class="li"><div class="sw" style="background:#ff6b6b"></div>Endplate (SPINEPS merged)</div>
-  <div class="li"><div class="sw" style="background:#ff8888"></div>Endplate per-vertebra (VERIDAH)</div>
+  <div class="li"><div class="sw" style="background:#00ffb3;opacity:.5"></div>Canal</div>
+  <div class="li"><div class="sw" style="background:#ff6b6b"></div>Endplate(merged)</div>
+  <div class="li"><div class="sw" style="background:#ff8888"></div>Endplate(per-vert)</div>
+  <div class="li"><div class="sw" style="background:#e02020"></div>Cord severe</div>
+  <div class="li"><div class="sw" style="background:#e07800"></div>Cord moderate</div>
+  <div class="li"><div class="sw" style="background:#f0a500"></div>Cord mild</div>
   <div class="li"><div class="sw" style="background:#00e6b4;opacity:.4"></div>TV plane</div>
 </div>
-<div id="pl">{plotly_div}</div>
+<div class="main-row">
+  <div id="pl">{plotly_div}</div>
+  <div id="metrics-panel">
+    {metrics_panel_html}
+  </div>
+</div>
 <script>
 const V={{
-  oblique:  {{eye:{{x:1.6,y:0.8,z:0.4}},up:{{x:0,y:0,z:1}}}},
-  lateral:  {{eye:{{x:2.4,y:0.0,z:0.0}},up:{{x:0,y:0,z:1}}}},
+  oblique: {{eye:{{x:1.6,y:0.8,z:0.4}},up:{{x:0,y:0,z:1}}}},
+  lateral: {{eye:{{x:2.4,y:0.0,z:0.0}},up:{{x:0,y:0,z:1}}}},
   posterior:{{eye:{{x:0.0,y:2.4,z:0.0}},up:{{x:0,y:0,z:1}}}},
   anterior: {{eye:{{x:0.0,y:-2.4,z:0.0}},up:{{x:0,y:0,z:1}}}},
-  axial:    {{eye:{{x:0.0,y:0.0,z:3.0}},up:{{x:0,y:1,z:0}}}},
+  axial:   {{eye:{{x:0.0,y:0.0,z:3.0}},up:{{x:0,y:1,z:0}}}},
 }};
 function sv(n){{
   const pd=document.querySelector('#pl .js-plotly-plot');
@@ -2032,157 +889,114 @@ window.addEventListener('resize',()=>{{
 }});
 </script></body></html>"""
 
-# ── Save HTML ─────────────────────────────────────────────────────────────────
 
-def save_html(fig, study_id, output_dir, castellvi, tv_name, cls_L, cls_R,
-              span_L, span_R, dist_L, dist_R, uncertainty_row, morphometrics):
+def save_html(fig, study_id: str, output_dir: Path,
+              castellvi: str, tv_name: str, cls_L: str, cls_R: str,
+              span_L: float, span_R: float, dist_L: float, dist_R: float,
+              metrics: dict, uncertainty_row: Optional[dict]) -> Path:
     from plotly.io import to_html
     plotly_div = to_html(fig, full_html=False, include_plotlyjs='cdn',
-                         config=dict(responsive=True,displayModeBar=True,
-                                     modeBarButtonsToRemove=['toImage'],
+                         config=dict(responsive=True, displayModeBar=True,
                                      displaylogo=False))
-    def _f(v):   return f'{v:.1f} mm' if (v is not None and np.isfinite(v)) else 'N/A'
-    def _f2(v):  return f'{v:.1f}' if (v is not None and np.isfinite(v)) else 'N/A'
-    def _fmm2(v): return f'{v:.0f}mm²' if (v is not None and np.isfinite(v)) else 'N/A'
-    def _hc(v):  return 'wn' if v>=TP_HEIGHT_MM else 'ok'
-    def _gc(v):  return 'cr' if (np.isfinite(v) and v<=CONTACT_DIST_MM) else 'ok'
+    def _f(v): return f'{v:.1f} mm' if (v is not None and np.isfinite(v)) else 'N/A'
+    def _f2(v): return f'{v:.2f}' if (v is not None and np.isfinite(v)) else 'N/A'
+    def _hc(v): return 'wn' if v >= TP_HEIGHT_MM else 'ok'
+    def _gc(v): return 'cr' if (np.isfinite(v) and v <= CONTACT_DIST_MM) else 'ok'
 
-    ap_mm    = morphometrics.get('canal_AP_mm')
-    dsca_mm2 = morphometrics.get('canal_DSCA_mm2')
-    ap_class = morphometrics.get('canal_AP_class','N/A')
-    dsca_cls = morphometrics.get('canal_DSCA_class','N/A')
-    lft_prox = morphometrics.get('LFT_proxy_mm')
-    tropism  = morphometrics.get('facet_tropism_deg')
-    ft_grade = morphometrics.get('facet_tropism_grade','N/A')
-    bstp_contact = morphometrics.get('baastrup_baastrup_contact', False)
-    bstp_risk    = morphometrics.get('baastrup_baastrup_risk', False)
-    bstp_gap     = morphometrics.get('baastrup_min_inter_process_gap_mm', float('inf'))
+    ap    = metrics.get('canal_ap_mm')
+    ap_cls= metrics.get('canal_ap_class','N/A')
+    mscc  = (metrics.get('cord_compression_profile',{}).get('max_mscc')
+             if metrics.get('cord_compression_profile')
+             else metrics.get('mscc_proxy'))
+    cord_cls = (metrics.get('cord_compression_profile',{}).get('classification','N/A')
+                if metrics.get('cord_compression_profile') else 'N/A')
+    lft   = metrics.get('lft_proxy_mm')
+    lft_cls= metrics.get('lft_class','N/A')
+    trop  = metrics.get('facet_tropism_deg')
+    ft_grade= metrics.get('facet_tropism_grade','N/A')
 
-    # Canal badge
-    if 'Absolute' in ap_class:
-        canal_badge_cls, canal_class = 'be', f'Absolute ({ap_class})'
-    elif 'Relative' in ap_class:
-        canal_badge_cls, canal_class = 'bw', f'Relative ({ap_class})'
-    else:
-        canal_badge_cls, canal_class = 'bi', ap_class
-
-    # Facet tropism badge
-    if tropism is not None:
-        if 'Grade 2' in ft_grade:
-            ft_badge_cls = 'be'
-        elif 'Grade 1' in ft_grade:
-            ft_badge_cls = 'bw'
-        else:
-            ft_badge_cls = 'bi'
-        ft_label = f'{tropism:.1f}° {ft_grade.split("(")[0].strip()}'
-    else:
-        ft_badge_cls, ft_label = 'bs', 'N/A'
-
-    # Baastrup badge
-    if bstp_contact:
-        bstp_badge_cls, bstp_label = 'be', 'CONTACT'
-    elif bstp_risk:
-        bstp_badge_cls, bstp_label = 'bw', f'Risk ({bstp_gap:.1f}mm)'
-    else:
-        bstp_badge_cls, bstp_label = 'bi', 'None'
-
-    # AP/DSCA colour
-    def _apcolor(cls):
-        return 'cr' if 'Absolute' in (cls or '') else 'wn' if 'Relative' in (cls or '') else 'ok'
-    def _lftcolor(v):
+    def _bcls(cls):
+        return ('be' if 'Absolute' in (cls or '') or 'Severe' in (cls or '') or 'Grade 2' in (cls or '') else
+                'bw' if 'Relative' in (cls or '') or 'Moderate' in (cls or '') or 'Grade 1' in (cls or '') else 'bi')
+    def _col(v, crit_fn, warn_fn=None):
         if v is None: return 'ok'
-        return 'cr' if v > LigamentumFlavumThresholds.LFT_SEVERE_MM else \
-               'wn' if v > LigamentumFlavumThresholds.LFT_NORMAL_BASELINE_MM else 'ok'
-    def _ftcolor(t):
-        if t is None: return 'ok'
-        return 'cr' if t >= FacetThresholds.TROPISM_SEVERE_DEG else \
-               'wn' if t >= FacetThresholds.TROPISM_NORMAL_DEG else 'ok'
+        if crit_fn(v): return 'cr'
+        if warn_fn and warn_fn(v): return 'wn'
+        return 'ok'
 
-    ian_badge = ''; ian_metrics = ''
+    # DHI summary row in the metric strip
+    dhi_row = ''
+    for _,_,up_n,lo_n in LUMBAR_PAIRS:
+        d = metrics.get(f'{up_n}_{lo_n}_dhi_pct')
+        if d is not None:
+            col = 'cr' if d<T.DHI_SEVERE_PCT else 'wn' if d<T.DHI_MODERATE_PCT else 'ok'
+            dhi_row += f'<div class="m">DHI {up_n}-{lo_n} <span class="v {col}">{d:.0f}%</span></div>'
+
+    ian_badge = ''
     if uncertainty_row:
         c = uncertainty_row.get('l5_s1_confidence', float('nan'))
         if not np.isnan(c):
-            ian_badge = f'<span class="b bi">Ian L5-S1: {c:.3f}</span>'
-        ian_metrics = ''.join(
-            f'<div class="m">{lbl} <span class="v">'
-            f'{uncertainty_row.get(f"{lvl}_confidence",float("nan")):.2f}'
-            f'</span></div>'
-            for lvl,lbl in zip(IAN_PAN_LEVELS,IAN_PAN_LABELS)
-            if not np.isnan(uncertainty_row.get(f'{lvl}_confidence',float('nan')))
-        )
+            ian_badge = f'<span class="b bc2">Ian L5-S1:{c:.3f}</span>'
 
-    # DHI metrics row
-    dhi_metrics = ''
-    for pair in [('L1','L2'),('L2','L3'),('L3','L4'),('L4','L5'),('L5','S1')]:
-        key = f'{pair[0]}_{pair[1]}_DHI_pct'
-        dhi = morphometrics.get(key)
-        if dhi is not None:
-            col = 'cr' if dhi < 50 else 'wn' if dhi < 70 else 'ok'
-            dhi_metrics += (f'<div class="m">DHI {pair[0]}-{pair[1]} '
-                           f'<span class="v {col}">{dhi:.0f}%</span></div>')
+    # Build the right-side HTML panel
+    metrics_panel_html = build_metrics_panel_html(
+        metrics, span_L, span_R, dist_L, dist_R,
+        castellvi, cls_L, cls_R, tv_name, uncertainty_row)
 
-    # Spondylolisthesis metrics row
-    spondy_metrics = ''
-    for pair in [('L1','L2'),('L2','L3'),('L3','L4'),('L4','L5'),('L5','S1')]:
-        key = f'{pair[0]}_{pair[1]}_sagittal_translation_mm'
-        trans = morphometrics.get(key)
-        if trans is not None:
-            col = 'cr' if trans >= VertebralThresholds.SPONDYLOLISTHESIS_MM else 'ok'
-            spondy_metrics += (f'<div class="m">Spondy {pair[0]}-{pair[1]} '
-                               f'<span class="v {col}">{trans:.1f}mm</span></div>')
-
-    # Vertebral wedge ratio metrics
-    vert_ratio_metrics = ''
-    for vname in ['L1','L2','L3','L4','L5']:
-        w = morphometrics.get(f'{vname}_Wedge_Ha_Hp')
-        if w is not None:
-            col = 'cr' if w < VertebralThresholds.HEIGHT_RATIO_INTERVENTION else \
-                  'wn' if w < VertebralThresholds.WEDGE_RATIO_FRACTURE else 'ok'
-            vert_ratio_metrics += (f'<div class="m">{vname} Wedge '
-                                   f'<span class="v {col}">{w:.2f}</span></div>')
-
-    html = HTML.format(
-        study_id=study_id, castellvi=castellvi or 'N/A',
-        tv_name=tv_name or 'N/A', cls_L=cls_L or 'N/A', cls_R=cls_R or 'N/A',
-        canal_badge_cls=canal_badge_cls, canal_class=canal_class,
-        ft_badge_cls=ft_badge_cls, ft_label=ft_label,
-        bstp_badge_cls=bstp_badge_cls, bstp_label=bstp_label,
-        ian_badge=ian_badge, ian_metrics=ian_metrics,
+    html = _HTML.format(
+        study_id=study_id,
+        castellvi=castellvi or 'N/A',
+        tv_name=tv_name or 'N/A',
+        cls_L=cls_L or 'N/A', cls_R=cls_R or 'N/A',
+        canal_badge=_bcls(ap_cls), canal_class=ap_cls,
+        cord_badge=_bcls(cord_cls), cord_label=cord_cls,
+        ft_badge=_bcls(ft_grade), ft_label=f'{trop:.1f}°' if trop else 'N/A',
+        bstp_badge=('be' if metrics.get('baastrup_contact') else
+                    'bw' if metrics.get('baastrup_risk') else 'bi'),
+        bstp_label=('CONTACT' if metrics.get('baastrup_contact') else
+                    'Risk' if metrics.get('baastrup_risk') else 'None'),
+        ian_badge=ian_badge,
         span_L=_f(span_L), tpl_c=_hc(span_L),
         span_R=_f(span_R), tpr_c=_hc(span_R),
         gap_L=_f(dist_L),  gl_c=_gc(dist_L),
         gap_R=_f(dist_R),  gr_c=_gc(dist_R),
-        ap_display=f'{_f2(ap_mm)}mm ({ap_class})' if ap_mm else 'N/A',
-        ap_c=_apcolor(ap_class),
-        dsca_display=_fmm2(dsca_mm2) if dsca_mm2 else 'N/A',
-        dsca_c=_apcolor(dsca_cls),
-        lft_display=_f(lft_prox), lft_c=_lftcolor(lft_prox),
-        ft_display=f'{_f2(tropism)}°' if tropism else 'N/A',
-        ft_c=_ftcolor(tropism),
-        dhi_metrics=dhi_metrics,
-        spondy_metrics=spondy_metrics,
-        vert_ratio_metrics=vert_ratio_metrics,
-        plotly_div=plotly_div)
+        ap_disp=f'{ap:.1f}mm ({ap_cls})' if ap else 'N/A',
+        ap_c=_col(ap, lambda v: v<T.AP_ABSOLUTE_MM, lambda v: v<T.AP_NORMAL_MM),
+        mscc_disp=_f2(mscc),
+        mscc_c=_col(mscc, lambda v: v>=T.MSCC_MODERATE, lambda v: v>=T.MSCC_MILD) if mscc else 'ok',
+        lft_disp=_f(lft), lft_c=_col(lft, lambda v: v>T.LFT_SEVERE_MM,
+                                       lambda v: v>T.LFT_NORMAL_MM) if lft else 'ok',
+        ft_disp=f'{trop:.1f}°' if trop else 'N/A',
+        ft_c=_col(trop, lambda v: v>=T.TROPISM_SEVERE_DEG, lambda v: v>=T.TROPISM_NORMAL_DEG) if trop else 'ok',
+        dhi_row=dhi_row,
+        metrics_panel_html=metrics_panel_html,
+        plotly_div=plotly_div,
+    )
     out = output_dir / f"{study_id}_3d_spine.html"
     out.write_text(html, encoding='utf-8')
     logger.info(f"  → {out}  ({out.stat().st_size/1e6:.1f} MB)")
     return out
 
-# ── Save morphometrics CSV ─────────────────────────────────────────────────────
 
-def save_morphometrics_csv(all_morphometrics, output_dir):
-    """Save all per-study morphometric results to a CSV for downstream analysis."""
-    if not all_morphometrics:
-        return
-    df = pd.DataFrame(all_morphometrics)
-    out = output_dir / 'morphometrics_all_studies.csv'
-    df.to_csv(out, index=False)
-    logger.info(f"  Morphometrics CSV → {out}  ({len(df)} studies, {len(df.columns)} columns)")
+# ─── Study selection ──────────────────────────────────────────────────────────
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def select_studies(csv_path: Path, top_n: int, rank_by: str, valid_ids) -> list:
+    df = pd.read_csv(csv_path)
+    df['study_id'] = df['study_id'].astype(str)
+    if valid_ids is not None: df = df[df['study_id'].isin(valid_ids)]
+    df = df.sort_values(rank_by, ascending=False).reset_index(drop=True)
+    top = df.head(top_n)['study_id'].tolist()
+    bot = df.tail(top_n)['study_id'].tolist()
+    seen, sel = set(), []
+    for sid in top+bot:
+        if sid not in seen: sel.append(sid); seen.add(sid)
+    return sel
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description='3D spine visualiser v2 (reads morphometrics JSON)')
     ap.add_argument('--spineps_dir',    required=True)
     ap.add_argument('--totalspine_dir', required=True)
     ap.add_argument('--output_dir',     required=True)
@@ -2191,13 +1005,13 @@ def main():
     grp.add_argument('--all',      action='store_true')
     ap.add_argument('--uncertainty_csv', default=None)
     ap.add_argument('--valid_ids',       default=None)
-    ap.add_argument('--top_n',    type=int,   default=None)
-    ap.add_argument('--rank_by',  default='l5_s1_confidence')
-    ap.add_argument('--lstv_json', default=None)
-    ap.add_argument('--smooth',    type=float, default=1.5)
-    ap.add_argument('--no_tss',    action='store_true')
-    ap.add_argument('--save_morphometrics_csv', action='store_true',
-                    help='Save all morphometric values to CSV for downstream analysis')
+    ap.add_argument('--top_n',  type=int, default=None)
+    ap.add_argument('--rank_by', default='l5_s1_confidence')
+    ap.add_argument('--morphometrics_json', default=None,
+        help='Path to morphometrics_all.json from 05_morphometrics.py')
+    ap.add_argument('--lstv_json',  default=None)
+    ap.add_argument('--smooth', type=float, default=1.5)
+    ap.add_argument('--no_tss', action='store_true')
     args = ap.parse_args()
 
     spineps_dir    = Path(args.spineps_dir)
@@ -2206,71 +1020,76 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     seg_root = spineps_dir / 'segmentations'
 
-    results_by_id = {}
+    # Load pre-computed morphometrics
+    morpho_by_id: Dict[str, dict] = {}
+    if args.morphometrics_json:
+        p = Path(args.morphometrics_json)
+        if p.exists():
+            with open(p) as f:
+                data = json.load(f)
+            morpho_by_id = {str(r.get('study_id','')): r for r in data
+                            if not r.get('error')}
+            logger.info(f"Loaded morphometrics for {len(morpho_by_id)} studies")
+
+    # Load LSTV results
+    lstv_by_id: Dict[str, dict] = {}
     if args.lstv_json:
         p = Path(args.lstv_json)
         if p.exists():
             with open(p) as f:
-                results_by_id = {str(r['study_id']): r for r in json.load(f)}
-            logger.info(f"Loaded {len(results_by_id)} LSTV results")
+                lstv_by_id = {str(r['study_id']): r for r in json.load(f)}
 
-    uncertainty_by_id = {}
-    csv_path = Path(args.uncertainty_csv) if args.uncertainty_csv else None
-    if csv_path and csv_path.exists():
-        df = pd.read_csv(csv_path)
-        df['study_id'] = df['study_id'].astype(str)
-        uncertainty_by_id = {r['study_id']: r for r in df.to_dict('records')}
-        logger.info(f"Loaded uncertainty for {len(uncertainty_by_id)} studies")
+    # Load uncertainty
+    uncertainty_by_id: Dict[str, dict] = {}
+    if args.uncertainty_csv:
+        p = Path(args.uncertainty_csv)
+        if p.exists():
+            df = pd.read_csv(p)
+            df['study_id'] = df['study_id'].astype(str)
+            uncertainty_by_id = {r['study_id']:r for r in df.to_dict('records')}
 
+    # Study IDs
     if args.study_id:
         study_ids = [args.study_id]
     elif args.all:
         study_ids = sorted(d.name for d in seg_root.iterdir() if d.is_dir())
-        logger.info(f"ALL mode: {len(study_ids)} studies")
     else:
         if not args.uncertainty_csv or args.top_n is None:
-            ap.error("--uncertainty_csv and --top_n required unless --all/--study_id")
+            ap.error("--uncertainty_csv + --top_n required unless --all/--study_id")
         valid_ids = None
         if args.valid_ids:
             valid_ids = set(str(x) for x in np.load(args.valid_ids))
-        study_ids = select_studies(csv_path, args.top_n, args.rank_by, valid_ids)
+        study_ids = select_studies(Path(args.uncertainty_csv), args.top_n,
+                                   args.rank_by, valid_ids)
         study_ids = [s for s in study_ids if (seg_root/s).is_dir()]
-        logger.info(f"Selective mode: {len(study_ids)} studies")
 
     ok = 0
-    all_morphometrics_records = []
     for sid in study_ids:
         logger.info(f"\n[{sid}]")
         try:
+            pre_morpho = morpho_by_id.get(sid)
             out = build_3d_figure(
                 study_id=sid, spineps_dir=spineps_dir,
                 totalspine_dir=totalspine_dir, smooth=args.smooth,
-                lstv_result=results_by_id.get(sid),
-                uncertainty_row=uncertainty_by_id.get(sid),
-                show_tss=not args.no_tss)
+                show_tss=not args.no_tss,
+                lstv_result=lstv_by_id.get(sid),
+                morphometrics=pre_morpho,
+                uncertainty_row=uncertainty_by_id.get(sid))
+
             if out is None: continue
             (fig, castellvi, tv_name, cls_L, cls_R,
-             span_L, span_R, dist_L, dist_R, morphometrics) = out
+             span_L, span_R, dist_L, dist_R, metrics) = out
+
             save_html(fig, sid, output_dir, castellvi, tv_name, cls_L, cls_R,
-                      span_L, span_R, dist_L, dist_R,
-                      uncertainty_by_id.get(sid), morphometrics)
-            if args.save_morphometrics_csv:
-                rec = {'study_id': sid, 'castellvi': castellvi,
-                       'tv_name': tv_name,
-                       'tp_L_height_mm': span_L, 'tp_R_height_mm': span_R,
-                       'tp_L_gap_mm': dist_L,    'tp_R_gap_mm': dist_R,
-                       'cls_L': cls_L, 'cls_R': cls_R}
-                rec.update(morphometrics)
-                all_morphometrics_records.append(rec)
+                      span_L, span_R, dist_L, dist_R, metrics,
+                      uncertainty_by_id.get(sid))
             ok += 1
         except Exception as e:
             logger.error(f"  [{sid}] Failed: {e}")
             logger.debug(traceback.format_exc())
 
-    if args.save_morphometrics_csv and all_morphometrics_records:
-        save_morphometrics_csv(all_morphometrics_records, output_dir)
-
     logger.info(f"\nDone. {ok}/{len(study_ids)} HTMLs → {output_dir}")
+
 
 if __name__ == '__main__':
     main()

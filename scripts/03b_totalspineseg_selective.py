@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 03b_totalspineseg_selective.py — Run TotalSpineSeg on top-N / bottom-N studies
+                                  OR on the entire valid-ID dataset (--all flag)
 ===============================================================================
 
 Reads results/epistemic_uncertainty/lstv_uncertainty_metrics.csv, ranks studies
 by the given column, selects top N (highest) and bottom N (lowest), then runs
 TotalSpineSeg on those studies — skipping any already segmented.
+
+With --all: processes every study in valid_id.npy regardless of uncertainty CSV.
 
 NIfTI paths are identical to those used by 02b_spineps_selective.py:
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
@@ -14,15 +17,23 @@ NIfTI paths are identical to those used by 02b_spineps_selective.py:
 Fully self-contained — no imports from other local scripts.
 
 Usage:
+    # Selective (top/bottom N):
     python scripts/03b_totalspineseg_selective.py \
         --uncertainty_csv results/epistemic_uncertainty/lstv_uncertainty_metrics.csv \
         --nifti_dir       results/nifti \
         --output_dir      results/totalspineseg \
         --series_csv      data/raw/train_series_descriptions.csv \
         --valid_ids       models/valid_id.npy \
-        --top_n           1 \
-        --rank_by         l5_s1_confidence \
-        [--dry_run]
+        --top_n           10 \
+        --rank_by         l5_s1_confidence
+
+    # Full dataset:
+    python scripts/03b_totalspineseg_selective.py \
+        --nifti_dir       results/nifti \
+        --output_dir      results/totalspineseg \
+        --series_csv      data/raw/train_series_descriptions.csv \
+        --valid_ids       models/valid_id.npy \
+        --all
 """
 
 import argparse
@@ -133,11 +144,10 @@ def mark_failed(progress: dict, study_id: str):
 
 
 # ============================================================================
-# NIFTI RESOLUTION  (same logic as 03_run_totalspineseg.py)
+# NIFTI RESOLUTION
 # ============================================================================
 
 def resolve_nifti(study_dir: Path, series_id: str, study_id: str, acq: str) -> Path | None:
-    """Try standard name then dcm2niix _Eq_1 variant."""
     base   = study_dir / series_id / f"sub-{study_id}_acq-{acq}_T2w.nii.gz"
     eq_var = study_dir / series_id / f"sub-{study_id}_acq-{acq}_T2w_Eq_1.nii.gz"
     if base.exists():
@@ -184,7 +194,6 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
             logger.error(f"  TotalSpineSeg failed:\n{result.stderr[-2000:]}")
             return None
 
-        # Labeled vertebrae + discs (Step 2)
         step2_output_dir = temp_output / 'step2_output'
         if not step2_output_dir.exists():
             logger.error(f"  step2_output not found: {step2_output_dir}")
@@ -200,7 +209,6 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
         outputs['labeled'] = labeled_dest
         logger.info(f"  ✓ Labeled (Step 2): {labeled_dest.name}")
 
-        # Disc level markers
         step1_levels_dir = temp_output / 'step1_levels'
         if step1_levels_dir.exists():
             level_files = sorted(step1_levels_dir.glob("*.nii.gz"))
@@ -210,7 +218,6 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
                 outputs['levels'] = dest
                 logger.info(f"  ✓ Levels: {dest.name}")
 
-        # Spinal cord
         step1_cord_dir = temp_output / 'step1_cord'
         if step1_cord_dir.exists():
             cord_files = sorted(step1_cord_dir.glob("*.nii.gz"))
@@ -220,7 +227,6 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
                 outputs['cord'] = dest
                 logger.info(f"  ✓ Cord: {dest.name}")
 
-        # Spinal canal
         step1_canal_dir = temp_output / 'step1_canal'
         if step1_canal_dir.exists():
             canal_files = sorted(step1_canal_dir.glob("*.nii.gz"))
@@ -230,7 +236,6 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
                 outputs['canal'] = dest
                 logger.info(f"  ✓ Canal: {dest.name}")
 
-        # Uncertainty map
         step2_uncertainties_dir = temp_output / 'step2_uncertainties'
         if step2_uncertainties_dir.exists():
             unc_files = sorted(step2_uncertainties_dir.glob("*.nii.gz"))
@@ -239,8 +244,6 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
                 shutil.copy(unc_files[0], dest)
                 outputs['uncertainty'] = dest
                 logger.info(f"  ✓ Uncertainty: {dest.name}")
-            else:
-                logger.warning("  step2_uncertainties/ exists but no .nii.gz files")
         else:
             logger.warning("  step2_uncertainties/ not found")
 
@@ -266,7 +269,6 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
 # ============================================================================
 
 def already_segmented(study_id: str, output_dir: Path) -> bool:
-    """Complete if the sagittal labeled mask exists."""
     return (output_dir / study_id / 'sagittal' /
             f"{study_id}_sagittal_labeled.nii.gz").exists()
 
@@ -315,34 +317,49 @@ def select_studies(csv_path: Path, top_n: int, rank_by: str,
     return selected, df_sorted
 
 
+def select_all_studies(nifti_dir: Path, valid_ids: set | None) -> list[str]:
+    """Return all study IDs that have NIfTI data and are in valid_ids."""
+    all_ids = sorted(d.name for d in nifti_dir.iterdir() if d.is_dir())
+    if valid_ids is not None:
+        all_ids = [s for s in all_ids if s in valid_ids]
+        logger.info(f"Filtered to {len(all_ids)} studies via valid_ids")
+    return all_ids
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Run TotalSpineSeg on top-N / bottom-N uncertainty studies'
+        description='Run TotalSpineSeg on top-N / bottom-N uncertainty studies, or ALL valid studies'
     )
-    parser.add_argument('--uncertainty_csv', required=True)
+    parser.add_argument('--uncertainty_csv', default=None,
+                        help='Path to uncertainty CSV (not required with --all)')
     parser.add_argument('--nifti_dir',       required=True)
     parser.add_argument('--output_dir',      required=True)
     parser.add_argument('--series_csv',      required=True)
     parser.add_argument('--valid_ids',       default=None)
-    parser.add_argument('--top_n',           type=int, required=True)
+    parser.add_argument('--top_n',           type=int, default=None)
     parser.add_argument('--rank_by',         default='l5_s1_confidence')
+    parser.add_argument('--all',             action='store_true',
+                        help='Process every valid study regardless of uncertainty CSV')
     parser.add_argument('--dry_run',         action='store_true')
     args = parser.parse_args()
 
-    uncertainty_csv = Path(args.uncertainty_csv)
-    nifti_dir       = Path(args.nifti_dir)
-    output_dir      = Path(args.output_dir)
-    series_csv      = Path(args.series_csv)
-    progress_file   = output_dir / 'progress_selective.json'
+    if not args.all and (args.uncertainty_csv is None or args.top_n is None):
+        parser.error("--uncertainty_csv and --top_n are required unless --all is set")
+
+    nifti_dir     = Path(args.nifti_dir)
+    output_dir    = Path(args.output_dir)
+    series_csv    = Path(args.series_csv)
+    progress_file = output_dir / 'progress_selective.json'
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    mode_label = 'ALL VALID STUDIES' if args.all else f'top/bottom {args.top_n} by {args.rank_by}'
     logger.info("=" * 70)
-    logger.info(f"TOTALSPINESEG SELECTIVE — top/bottom {args.top_n} by {args.rank_by}")
+    logger.info(f"TOTALSPINESEG SEGMENTATION — {mode_label}")
     logger.info("=" * 70)
 
     # Load valid IDs
@@ -355,29 +372,32 @@ def main():
             logger.error(f"Failed to load valid_ids: {e}")
             return 1
 
-    selected_ids, df_ranked = select_studies(
-        uncertainty_csv, args.top_n, args.rank_by, valid_ids
-    )
+    # Select studies
+    if args.all:
+        selected_ids = select_all_studies(nifti_dir, valid_ids)
+        df_ranked    = None
+        logger.info(f"Total studies to process: {len(selected_ids)}")
+    else:
+        selected_ids, df_ranked = select_studies(
+            Path(args.uncertainty_csv), args.top_n, args.rank_by, valid_ids
+        )
 
     skip_already_done = [s for s in selected_ids if already_segmented(s, output_dir)]
     to_run            = [s for s in selected_ids if not already_segmented(s, output_dir)]
 
     logger.info(f"\nSelected:       {len(selected_ids)}")
-    logger.info(f"Already done:   {len(skip_already_done)} (skipping: {skip_already_done})")
+    logger.info(f"Already done:   {len(skip_already_done)} (skipping)")
     logger.info(f"To run:         {len(to_run)}")
 
     if args.dry_run:
         logger.info("\n--- DRY RUN ---")
         for sid in to_run:
-            row   = df_ranked[df_ranked['study_id'] == sid]
-            score = float(row[args.rank_by].iloc[0]) if not row.empty else float('nan')
-            logger.info(f"  {sid}  {args.rank_by}={score:.4f}")
-        logger.info("--- DRY RUN complete — nothing was run ---")
+            logger.info(f"  {sid}")
+        logger.info(f"--- DRY RUN complete — {len(to_run)} would be run ---")
         return 0
 
     if not to_run:
         logger.info("\nAll selected studies already segmented.")
-        logger.info("Edit TOP_N in the slurm script and resubmit to segment more.")
         return 0
 
     series_df = load_series_csv(series_csv)
@@ -430,10 +450,7 @@ def main():
             if any_success:
                 mark_success(progress, study_id)
                 success_count += 1
-                row = df_ranked[df_ranked['study_id'] == study_id]
-                if not row.empty:
-                    score = float(row[args.rank_by].iloc[0])
-                    logger.info(f"  ✓  {args.rank_by}={score:.4f}")
+                logger.info(f"  ✓  complete")
             else:
                 logger.warning("  No series segmented successfully")
                 mark_failed(progress, study_id)
