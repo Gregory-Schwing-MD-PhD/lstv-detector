@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -q primary 
+#SBATCH -q primary
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
@@ -17,10 +17,11 @@ set -euo pipefail
 # LSTV FULL-DATASET PIPELINE — processes every study in valid_id.npy
 #
 # Step 0: Ian-Pan uncertainty inference   (GPU)
-# Step 1: SPINEPS segmentation — ALL      (GPU, long)
-# Step 2: TotalSpineSeg — ALL             (GPU, long)
-# Step 3: Morphometrics — ALL             (CPU, parallel)
-# Step 4: Dataset summary HTML report     (CPU, fast)
+# Step 1: DICOM → NIfTI conversion        (CPU)
+# Step 2: SPINEPS segmentation — ALL      (GPU, long)  ─┐ parallel
+# Step 3: TotalSpineSeg — ALL             (GPU, long)  ─┘ after NIfTI
+# Step 4: Morphometrics — ALL             (CPU)        after both GPU steps
+# Step 5: Dataset summary HTML report     (CPU, fast)  after morphometrics
 #
 # Skips studies that are already done at each stage (safe to re-run).
 # ══════════════════════════════════════════════════════════════════════════════
@@ -67,27 +68,76 @@ N_VALID=$(python3 -c "import numpy as np; a=np.load('models/valid_id.npy'); prin
 echo "Valid study IDs: $N_VALID"
 echo ""
 echo "Pipeline will submit:"
-echo "  Step 0: Ian-Pan inference (GPU, ~1-2h)"
-echo "  Step 1: SPINEPS — ALL $N_VALID studies (GPU, long)"
-echo "  Step 2: TotalSpineSeg — ALL $N_VALID studies (GPU, very long)"
-echo "  Step 3: Morphometrics — ALL $N_VALID studies (CPU)"
-echo "  Step 4: Dataset summary HTML report (CPU, fast)"
+echo "  Step 0: Ian-Pan inference (GPU, ~1-2h)         [no dependencies]"
+echo "  Step 1: DICOM → NIfTI (CPU, ~2-8h)             [no dependencies]"
+echo "  Step 2: SPINEPS — ALL $N_VALID studies (GPU)   [after NIfTI]"
+echo "  Step 3: TotalSpineSeg — ALL $N_VALID (GPU)     [after NIfTI, parallel with SPINEPS]"
+echo "  Step 4: Morphometrics — ALL $N_VALID (CPU)     [after SPINEPS + TotalSpineSeg]"
+echo "  Step 5: Dataset summary HTML report (CPU)       [after morphometrics]"
 echo ""
 
-# ─── Step 0: Ian-Pan inference ────────────────────────────────────────────────
+# ─── Step 0: Ian-Pan inference (no dependency — runs immediately) ─────────────
 echo "Submitting: Step 0 — Ian-Pan inference"
 JOB0=$(sbatch --parsable slurm_scripts/00_ian_pan_inference.sh)
 echo "  Job ID: $JOB0"
 
-# ─── Step 1: SPINEPS — ALL ────────────────────────────────────────────────────
-# We submit a modified call that passes --all to 02b_spineps_selective.py.
-# This job does NOT depend on Ian-Pan (inference not needed for segmentation).
+# ─── Step 1: DICOM → NIfTI (no dependency — runs immediately in parallel) ─────
 echo ""
-echo "Submitting: Step 1 — SPINEPS (ALL valid studies)"
+echo "Submitting: Step 1 — DICOM → NIfTI conversion"
 JOB1=$(sbatch --parsable \
+    --job-name=dicom_nifti \
+    --time=8:00:00 \
+    --wrap="
+set -euo pipefail
+export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
+export PATH=\"\${CONDA_PREFIX}/bin:\$PATH\"
+unset JAVA_HOME
+export XDG_RUNTIME_DIR=\"\${HOME}/xdr\"
+export NXF_SINGULARITY_CACHEDIR=\"\${HOME}/singularity_cache\"
+mkdir -p \"\${XDG_RUNTIME_DIR}\" \"\${NXF_SINGULARITY_CACHEDIR}\"
+export NXF_SINGULARITY_HOME_MOUNT=true
+unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
+
+PROJECT_DIR=\"$(pwd)\"
+DATA_DIR=\"\${PROJECT_DIR}/data/raw/train_images\"
+SERIES_CSV=\"\${PROJECT_DIR}/data/raw/train_series_descriptions.csv\"
+OUTPUT_DIR=\"\${PROJECT_DIR}/results/nifti\"
+MODELS_DIR=\"\${PROJECT_DIR}/models\"
+mkdir -p logs \"\$OUTPUT_DIR\"
+
+IMG_PATH=\"\${NXF_SINGULARITY_CACHEDIR}/spineps-segmentation.sif\"
+if [[ ! -f \"\$IMG_PATH\" ]]; then
+    singularity pull \"\$IMG_PATH\" docker://go2432/spineps-segmentation:latest
+fi
+
+singularity exec \\
+    --bind \"\${PROJECT_DIR}:/work\" \\
+    --bind \"\${DATA_DIR}:/data/input\" \\
+    --bind \"\${OUTPUT_DIR}:/data/output\" \\
+    --bind \"\$(dirname \$SERIES_CSV):/data/raw\" \\
+    --bind \"\${MODELS_DIR}:/app/models\" \\
+    --env PYTHONUNBUFFERED=1 \\
+    --pwd /work \\
+    \"\$IMG_PATH\" \\
+    python /work/scripts/01_dicom_to_nifti.py \\
+        --input_dir  /data/input \\
+        --series_csv /data/raw/train_series_descriptions.csv \\
+        --output_dir /data/output \\
+        --valid_ids  /app/models/valid_id.npy \\
+        --mode prod
+" \
+    --output="logs/dicom_nifti_%j.out" \
+    --error="logs/dicom_nifti_%j.err" \
+    -q primary --cpus-per-task=4 --mem=16G)
+echo "  Job ID: $JOB1 (CPU, running in parallel with Ian-Pan)"
+
+# ─── Step 2: SPINEPS — ALL (depends on NIfTI) ────────────────────────────────
+echo ""
+echo "Submitting: Step 2 — SPINEPS (ALL valid studies)"
+JOB2=$(sbatch --parsable \
     --job-name=spineps_all \
     --time=96:00:00 \
-    --dependency=afterok:$JOB0 \
+    --dependency=afterok:$JOB1 \
     --wrap="
 set -euo pipefail
 export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
@@ -127,15 +177,15 @@ singularity exec --nv \\
     --output="logs/spineps_all_%j.out" \
     --error="logs/spineps_all_%j.err" \
     -q gpu --gres=gpu:1 --cpus-per-task=4 --mem=32G)
-echo "  Job ID: $JOB1 (GPU, after Ian-Pan)"
+echo "  Job ID: $JOB2 (GPU, after NIfTI)"
 
-# ─── Step 2: TotalSpineSeg — ALL ──────────────────────────────────────────────
+# ─── Step 3: TotalSpineSeg — ALL (depends on NIfTI, parallel with SPINEPS) ───
 echo ""
-echo "Submitting: Step 2 — TotalSpineSeg (ALL valid studies)"
-JOB2=$(sbatch --parsable \
+echo "Submitting: Step 3 — TotalSpineSeg (ALL valid studies)"
+JOB3=$(sbatch --parsable \
     --job-name=tss_all \
     --time=96:00:00 \
-    --dependency=afterok:$JOB0 \
+    --dependency=afterok:$JOB1 \
     --wrap="
 set -euo pipefail
 export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
@@ -187,15 +237,15 @@ singularity exec --nv \\
     --output="logs/tss_all_%j.out" \
     --error="logs/tss_all_%j.err" \
     -q gpu --gres=gpu:1 --constraint=v100 --cpus-per-task=4 --mem=64G)
-echo "  Job ID: $JOB2 (GPU, parallel with SPINEPS)"
+echo "  Job ID: $JOB3 (GPU, after NIfTI, parallel with SPINEPS)"
 
-# ─── Step 3: Morphometrics — ALL ──────────────────────────────────────────────
+# ─── Step 4: Morphometrics — ALL (depends on SPINEPS + TotalSpineSeg) ─────────
 echo ""
-echo "Submitting: Step 3 — Morphometrics (ALL)"
-JOB3=$(sbatch --parsable \
+echo "Submitting: Step 4 — Morphometrics (ALL)"
+JOB4=$(sbatch --parsable \
     --job-name=morpho_all \
     --time=24:00:00 \
-    --dependency=afterok:${JOB1}:${JOB2} \
+    --dependency=afterok:${JOB2}:${JOB3} \
     --wrap="
 set -euo pipefail
 export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
@@ -234,15 +284,15 @@ singularity exec \\
     --output="logs/morpho_all_%j.out" \
     --error="logs/morpho_all_%j.err" \
     -q primary --cpus-per-task=8 --mem=64G)
-echo "  Job ID: $JOB3 (CPU, after SPINEPS + TotalSpineSeg)"
+echo "  Job ID: $JOB4 (CPU, after SPINEPS + TotalSpineSeg)"
 
-# ─── Step 4: Dataset summary report ──────────────────────────────────────────
+# ─── Step 5: Dataset summary report (depends on morphometrics) ───────────────
 echo ""
-echo "Submitting: Step 4 — Dataset summary HTML report"
-JOB4=$(sbatch --parsable \
+echo "Submitting: Step 5 — Dataset summary HTML report"
+JOB5=$(sbatch --parsable \
     --job-name=dataset_report \
     --time=1:00:00 \
-    --dependency=afterok:${JOB3} \
+    --dependency=afterok:${JOB4} \
     --wrap="
 set -euo pipefail
 export CONDA_PREFIX=\"\${HOME}/mambaforge/envs/nextflow\"
@@ -292,7 +342,7 @@ echo 'Morphometrics report → results/dataset_morphometrics_report.html'
     --output="logs/dataset_report_%j.out" \
     --error="logs/dataset_report_%j.err" \
     -q primary --cpus-per-task=2 --mem=16G)
-echo "  Job ID: $JOB4 (CPU, after morphometrics)"
+echo "  Job ID: $JOB5 (CPU, after morphometrics)"
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 echo ""
@@ -301,13 +351,14 @@ echo "ALL JOBS SUBMITTED"
 echo "================================================================"
 echo ""
 echo "Dependency chain:"
-echo "  $JOB0  Ian-Pan inference      (GPU)"
-echo "    ├─→  $JOB1  SPINEPS ALL     (GPU, parallel)"
-echo "    └─→  $JOB2  TotalSpineSeg ALL (GPU, parallel)"
-echo "              ↓ (both done)"
-echo "         $JOB3  Morphometrics ALL  (CPU)"
+echo "  $JOB0  Ian-Pan inference      (GPU)  ─── (informational, no blocking deps)"
+echo "  $JOB1  DICOM → NIfTI          (CPU)  ─── (runs immediately in parallel)"
+echo "    ├─→  $JOB2  SPINEPS ALL     (GPU)  ─── after NIfTI"
+echo "    └─→  $JOB3  TotalSpineSeg ALL (GPU) ─── after NIfTI"
+echo "              ↓ (both GPU steps done)"
+echo "         $JOB4  Morphometrics ALL  (CPU)"
 echo "              ↓"
-echo "         $JOB4  Dataset report     (CPU)"
+echo "         $JOB5  Dataset report     (CPU)"
 echo ""
 echo "Monitor:"
 echo "  squeue -u $USER"
@@ -328,8 +379,8 @@ echo ""
 echo "Master job now monitoring progress..."
 echo ""
 
-ALL_JOBS=("$JOB0" "$JOB1" "$JOB2" "$JOB3" "$JOB4")
-JOB_NAMES=("Ian-Pan" "SPINEPS-ALL" "TotalSpineSeg-ALL" "Morphometrics-ALL" "Dataset-Report")
+ALL_JOBS=("$JOB0" "$JOB1" "$JOB2" "$JOB3" "$JOB4" "$JOB5")
+JOB_NAMES=("Ian-Pan" "DICOM-NIfTI" "SPINEPS-ALL" "TotalSpineSeg-ALL" "Morphometrics-ALL" "Dataset-Report")
 
 for i in "${!ALL_JOBS[@]}"; do
     job_id="${ALL_JOBS[$i]}"
