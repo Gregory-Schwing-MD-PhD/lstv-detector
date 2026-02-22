@@ -15,20 +15,18 @@ set -euo pipefail
 
 # ── Configuration — edit these to change behaviour ────────────────────────────
 STUDY_ID=""                # single study ID — leave empty to use ALL or TOP_N mode
-TOP_N=1                    # studies from each end — must match 02b + 03b + register + detect settings
+TOP_N=1                    # studies from each end — must match 02b + 03b + detect settings
 RANK_BY=l5_s1_confidence   # column to rank by — must match all upstream settings
 ALL=false                  # set to true to render every study with SPINEPS segmentation
-STEP=2                     # marching cubes subsampling step (1=full res, slower; 3=faster batch)
-SMOOTH=1.5                 # Gaussian pre-smoothing sigma for marching cubes surfaces
-SHOW_CANAL=false           # set to true to render spinal canal (label 61, translucent mint)
-SHOW_CORD=false            # set to true to render spinal cord (label 60)
+STEP=1                     # marching cubes subsampling step (1=full res, slower; 3=faster)
+SMOOTH=3                 # Gaussian pre-smoothing sigma for marching cubes surfaces
+NO_TSS=false               # set to true to skip TotalSpineSeg label rendering
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "================================================================"
-echo "LSTV 3D VISUALIZER (Interactive HTML — Marching Cubes)"
+echo "LSTV 3D VISUALIZER (All Labels + 3D Measurements)"
 echo "STUDY_ID=${STUDY_ID:-<selective/all>}  TOP_N=$TOP_N  RANK_BY=$RANK_BY"
-echo "ALL=$ALL  STEP=$STEP  SMOOTH=$SMOOTH"
-echo "SHOW_CANAL=$SHOW_CANAL  SHOW_CORD=$SHOW_CORD"
+echo "ALL=$ALL  STEP=$STEP  SMOOTH=$SMOOTH  NO_TSS=$NO_TSS"
 echo "Job: $SLURM_JOB_ID  |  Start: $(date)"
 echo "================================================================"
 
@@ -74,14 +72,12 @@ fi
 SELECTION_ARGS=()
 
 if [[ -n "$STUDY_ID" ]]; then
-    # Single study — highest priority, skip all other selection logic
     SELECTION_ARGS+=( "--study_id" "$STUDY_ID" )
     echo "Single-study mode: $STUDY_ID"
 
 elif [[ "$ALL" == "true" ]]; then
     SELECTION_ARGS+=( "--all" )
     echo "ALL mode: rendering every study with SPINEPS segmentations"
-    echo "Note: Phase 2 axial panels will be empty for studies missing TSS or registration."
 
 else
     # Selective mode — mirrors 05_visualize_lstv.sh exactly
@@ -104,25 +100,21 @@ else
 fi
 
 # --- Optional rendering flags ---
-if [[ "$SHOW_CANAL" == "true" ]]; then
-    SELECTION_ARGS+=( "--show_canal" )
-    echo "Spinal canal rendering enabled (label 61)"
+if [[ "$NO_TSS" == "true" ]]; then
+    SELECTION_ARGS+=( "--no_tss" )
+    echo "TotalSpineSeg label rendering disabled"
 fi
 
-if [[ "$SHOW_CORD" == "true" ]]; then
-    SELECTION_ARGS+=( "--show_cord" )
-    echo "Spinal cord rendering enabled (label 60)"
-fi
-
-# --- Annotation from detection results (optional but recommended) ---
+# --- Annotation from detection results ---
 if [[ -f "$LSTV_JSON" ]]; then
     SELECTION_ARGS+=( "--lstv_json" "/work/results/lstv_detection/lstv_results.json" )
-    echo "Detection results found — HTML headers will be annotated with Castellvi classification."
+    echo "Detection results found — 3D measurements + Castellvi annotations enabled."
 else
-    echo "WARNING: lstv_results.json not found — run 04_lstv_detection.sh first for annotations."
+    echo "WARNING: lstv_results.json not found — run 04_lstv_detection.sh first."
+    echo "         3D measurement rulers will still be drawn from seg-spine_msk."
 fi
 
-# --- Bind models dir only when valid_ids is needed (selective mode) ---
+# --- Bind models dir only when valid_ids is needed ---
 BIND_ARGS="--bind ${PROJECT_DIR}:/work"
 if [[ -d "$MODELS_DIR" ]]; then
     BIND_ARGS="${BIND_ARGS} --bind ${MODELS_DIR}:/app/models"
