@@ -10,6 +10,8 @@ TotalSpineSeg on those studies — skipping any already segmented.
 
 With --all: processes every study in valid_id.npy regardless of uncertainty CSV.
 
+Failed studies from a previous run are retried first before moving on to new ones.
+
 NIfTI paths are identical to those used by 02b_spineps_selective.py:
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-ax_T2w.nii.gz
@@ -385,18 +387,33 @@ def main():
     skip_already_done = [s for s in selected_ids if already_segmented(s, output_dir)]
     to_run            = [s for s in selected_ids if not already_segmented(s, output_dir)]
 
-    logger.info(f"\nSelected:       {len(selected_ids)}")
-    logger.info(f"Already done:   {len(skip_already_done)} (skipping)")
-    logger.info(f"To run:         {len(to_run)}")
+    # Load progress early so we can prioritize retrying previously-failed studies
+    progress = load_progress(progress_file)
+
+    previously_failed = [s for s in to_run if s in progress.get('failed', [])]
+    new_studies       = [s for s in to_run if s not in progress.get('failed', [])]
+    ordered_to_run    = previously_failed + new_studies
+
+    logger.info(f"\nSelected:         {len(selected_ids)}")
+    logger.info(f"Already done:     {len(skip_already_done)} (skipping)")
+    logger.info(f"To run:           {len(ordered_to_run)}")
+    if previously_failed:
+        logger.info(f"  ↺ Retrying failed: {len(previously_failed)}")
+        logger.info(f"  → New studies:     {len(new_studies)}")
 
     if args.dry_run:
         logger.info("\n--- DRY RUN ---")
-        for sid in to_run:
-            logger.info(f"  {sid}")
-        logger.info(f"--- DRY RUN complete — {len(to_run)} would be run ---")
+        if previously_failed:
+            logger.info(f"  [RETRY] {len(previously_failed)} previously-failed studies:")
+            for sid in previously_failed:
+                logger.info(f"    {sid}")
+        logger.info(f"  [NEW]   {len(new_studies)} new studies:")
+        for sid in new_studies:
+            logger.info(f"    {sid}")
+        logger.info(f"--- DRY RUN complete — {len(ordered_to_run)} would be run ---")
         return 0
 
-    if not to_run:
+    if not ordered_to_run:
         logger.info("\nAll selected studies already segmented.")
         return 0
 
@@ -405,11 +422,10 @@ def main():
         logger.error("Cannot load series CSV — aborting")
         return 1
 
-    progress      = load_progress(progress_file)
     success_count = 0
     error_count   = 0
 
-    for study_id in tqdm(to_run, desc='TotalSpineSeg'):
+    for study_id in tqdm(ordered_to_run, desc='TotalSpineSeg'):
         logger.info(f"\n[{study_id}]")
         sys.stdout.flush()
 

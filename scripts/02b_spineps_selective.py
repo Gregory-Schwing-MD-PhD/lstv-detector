@@ -10,6 +10,8 @@ runs SPINEPS on those studies — skipping any already segmented.
 
 With --all: processes every study in valid_id.npy regardless of uncertainty CSV.
 
+Failed studies from a previous run are retried first before moving on to new ones.
+
 Fully self-contained — no imports from other local scripts.
 
 Usage:
@@ -484,31 +486,50 @@ def main():
     skip_already_done = [s for s in selected_ids if already_segmented(s, spineps_dir)]
     to_run            = [s for s in selected_ids if not already_segmented(s, spineps_dir)]
 
-    logger.info(f"\nSelected:       {len(selected_ids)}")
-    logger.info(f"Already done:   {len(skip_already_done)} (skipping)")
-    logger.info(f"To run SPINEPS: {len(to_run)}")
+    # Load progress early so we can prioritize retrying previously-failed studies
+    progress = load_progress(progress_file)
+
+    previously_failed = [s for s in to_run if s in progress.get('failed', [])]
+    new_studies       = [s for s in to_run if s not in progress.get('failed', [])]
+    ordered_to_run    = previously_failed + new_studies
+
+    logger.info(f"\nSelected:         {len(selected_ids)}")
+    logger.info(f"Already done:     {len(skip_already_done)} (skipping)")
+    logger.info(f"To run SPINEPS:   {len(ordered_to_run)}")
+    if previously_failed:
+        logger.info(f"  ↺ Retrying failed: {len(previously_failed)}")
+        logger.info(f"  → New studies:     {len(new_studies)}")
 
     if args.dry_run:
         logger.info("\n--- DRY RUN ---")
-        for sid in to_run:
+        if previously_failed:
+            logger.info(f"  [RETRY] {len(previously_failed)} previously-failed studies:")
+            for sid in previously_failed:
+                if df_ranked is not None:
+                    row   = df_ranked[df_ranked['study_id'] == sid]
+                    score = float(row[args.rank_by].iloc[0]) if not row.empty else float('nan')
+                    logger.info(f"    {sid}  {args.rank_by}={score:.4f}")
+                else:
+                    logger.info(f"    {sid}")
+        logger.info(f"  [NEW]   {len(new_studies)} new studies:")
+        for sid in new_studies:
             if df_ranked is not None:
                 row   = df_ranked[df_ranked['study_id'] == sid]
                 score = float(row[args.rank_by].iloc[0]) if not row.empty else float('nan')
-                logger.info(f"  {sid}  {args.rank_by}={score:.4f}")
+                logger.info(f"    {sid}  {args.rank_by}={score:.4f}")
             else:
-                logger.info(f"  {sid}")
-        logger.info(f"--- DRY RUN complete — {len(to_run)} would be run ---")
+                logger.info(f"    {sid}")
+        logger.info(f"--- DRY RUN complete — {len(ordered_to_run)} would be run ---")
         return 0
 
-    if not to_run:
+    if not ordered_to_run:
         logger.info("\nAll selected studies already segmented.")
         return 0
 
-    progress      = load_progress(progress_file)
     success_count = 0
     error_count   = 0
 
-    for study_id in tqdm(to_run, desc='SPINEPS'):
+    for study_id in tqdm(ordered_to_run, desc='SPINEPS'):
         logger.info(f"\n[{study_id}]")
 
         if already_segmented(study_id, spineps_dir):

@@ -37,14 +37,8 @@ which singularity || echo "WARNING: singularity not found"
 export XDG_RUNTIME_DIR="${HOME}/xdr"
 export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
 
-SCRATCH_DIR="/wsu/tmp/${USER}/totalspineseg_${SLURM_JOB_ID}"
-mkdir -p "$SCRATCH_DIR"
-export SINGULARITY_TMPDIR="$SCRATCH_DIR"
-
 mkdir -p "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR"
-echo "Scratch dir: $SCRATCH_DIR"
 
-export NXF_SINGULARITY_HOME_MOUNT=true
 unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # --- Paths ---
@@ -131,6 +125,3 @@ echo "================================================================"
 echo "TotalSpineSeg complete | End: $(date)"
 echo "Already-done studies are skipped automatically."
 echo "================================================================"
-
-rm -rf "$SCRATCH_DIR"
-echo "Scratch cleanup complete."
