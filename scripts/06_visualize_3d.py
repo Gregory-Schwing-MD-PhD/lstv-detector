@@ -1,40 +1,28 @@
 #!/usr/bin/env python3
 """
-06_visualize_3d.py — LSTV-Focused Interactive 3D Spine Viewer
+06_visualize_3d.py — LSTV-Focused Interactive 3D Spine Viewer (v3)
 ==============================================================
 Renders 3D interactive HTML for LSTV cases.
 
-PHENOTYPE BANNER
-----------------
-  SACRALIZATION (red)            — L5/L4 incorporating into sacrum
-  LUMBARIZATION (orange)         — S1/L6 acquiring lumbar morphology
-  TRANSITIONAL INDETERMINATE (yellow) — Castellvi positive, ambiguous phenotype
-  NORMAL VARIANT (green)         — no LSTV criteria met
+CHANGES v3
+----------
+  • Focused view (default): L4/L5/L6/Sacrum + TPs + all rulers.
+    "Full" button reveals the rest (L1–L3, arcus, cord, canal, …).
+  • Bounding boxes: dashed wireframe around Castellvi-positive TPs,
+    L6 body (lumbarization), estimated L5 zone (4-lumbar sacralization).
+  • Increased vertebra opacity for visual clarity.
+  • Larger fonts throughout the HTML report.
+  • Dynamic clinical narrative paragraphs in the side panel.
 
-NOTE: Castellvi type and phenotype are ORTHOGONAL — both are displayed
-simultaneously if applicable. A lumbarized L6 may have Castellvi IIb
-on its TP; this is shown as both "Castellvi: Type IIb" AND
-"LUMBARIZATION" in the banner.
+TP CONCORDANCE CORRECTION
+--------------------------
+TP concordance validation (bilateral Z-centroid discordance check) is
+performed by 04_detect_lstv.py and written into the result JSON as:
+  details.tp_concordance_corrected  : bool
+  details.corrected_tv_z_range      : [z_min, z_max] or null
 
-STUDY SELECTION MODES
----------------------
-  --study_id ID               single study
-  --all                       every study with SPINEPS segmentation
-  --rank_by lstv              rank by LSTV pathology score (requires --lstv_json)
-  --top_n N                   render N most-pathologic studies  (default 5)
-  --top_normal N              render N most-normal studies       (default 2)
-  --lstv_json PATH            required for --rank_by lstv
-
-PATHOLOGY SCORE (lstv_engine.compute_lstv_pathology_score):
-  Castellvi IV=5  III=4  II=3  I=1
-  Phenotype high confidence    +3
-  Phenotype moderate           +2
-  Transitional indeterminate   +1
-  Lumbar count anomaly         +2
-  Disc below DHI < 50%         +2
-  Disc below DHI < 70%         +1
-  TV body sacral-like          +2
-  Rib anomaly                  +1
+This visualiser reads those fields to render TPs at the corrected Z range,
+so the meshes and rulers match the geometry that produced the JSON results.
 """
 
 from __future__ import annotations
@@ -62,13 +50,19 @@ from lstv_engine import (
     VD_L1, VD_L2, VD_L3, VD_L4, VD_L5, VD_L6, VD_SAC,
     VD_IVD_BASE, VD_EP_BASE,
     VERIDAH_NAMES, TV_SHAPE_LUMBAR, TV_SHAPE_SACRAL,
-    DHI_REDUCED_PCT, DHI_MODERATE_PCT,
+    DHI_REDUCED_PCT, DHI_MODERATE_PCT, DHI_MILD_PCT,
     compute_lstv_pathology_score,
 )
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s  %(levelname)-7s  %(message)s')
 logger = logging.getLogger(__name__)
+
+# ── Focused view label sets ────────────────────────────────────────────────────
+FOCUSED_VERIDAH_LABELS  = {23, 24, 25, 26}   # L4, L5, L6, Sacrum
+FOCUSED_VERIDAH_IVD     = {23, 24, 25}        # IVDs below L4, L5, L6
+FOCUSED_TSS_LABELS      = {45, 50, 95, 100}   # TSS L5, Sacrum, L4-L5 disc, L5-S1 disc
+FOCUSED_SPINE_LABELS    = {SP_SACRUM, SP_TP_L, SP_TP_R}
 
 # ── Phenotype colours ─────────────────────────────────────────────────────────
 PHENOTYPE_CONFIG = {
@@ -84,7 +78,6 @@ PHENOTYPE_CONFIG = {
         'color': '#ffe033', 'bg': '#2a2200', 'border': '#ffe066',
         'label': 'TRANSITIONAL (INDETERMINATE)', 'emoji': '🟡',
     },
-    # legacy key in case old json has 'transitional'
     'transitional': {
         'color': '#ffe033', 'bg': '#2a2200', 'border': '#ffe066',
         'label': 'TRANSITIONAL (INDETERMINATE)', 'emoji': '🟡',
@@ -95,28 +88,28 @@ PHENOTYPE_CONFIG = {
     },
 }
 
-# ── Mesh label tables ─────────────────────────────────────────────────────────
+# ── Mesh label tables — updated opacities for better clarity ──────────────────
 SPINE_LABELS: List[Tuple] = [
-    (SP_SACRUM, 'Sacrum (spine)',    '#ff8c00', 0.75, True,  1.5),
-    (SP_ARCUS,  'Arcus Vertebrae',   '#7744bb', 0.45, True,  1.5),
-    (SP_SPINOUS,'Spinous Processes', '#d4b830', 0.55, True,  1.5),
-    (SP_TP_L,   'TP Left',           '#ff3333', 0.92, False, 0.8),
-    (SP_TP_R,   'TP Right',          '#00ccff', 0.92, False, 0.8),
-    (SP_SAL,    'Sup Articular L',   '#55aa88', 0.55, True,  1.5),
-    (SP_SAR,    'Sup Articular R',   '#338866', 0.55, True,  1.5),
-    (SP_CORPUS, 'Corpus Border',     '#5588bb', 0.30, True,  1.5),
-    (SP_CORD,   'Spinal Cord',       '#ffe066', 0.60, False, 1.0),
-    (SP_CANAL,  'Spinal Canal',      '#00ffb3', 0.14, False, 0.8),
+    (SP_SACRUM, 'Sacrum (spine)',    '#ff8c00', 0.80, True,  1.5),
+    (SP_ARCUS,  'Arcus Vertebrae',   '#7744bb', 0.60, True,  1.5),
+    (SP_SPINOUS,'Spinous Processes', '#d4b830', 0.65, True,  1.5),
+    (SP_TP_L,   'TP Left',           '#ff3333', 0.95, False, 0.8),
+    (SP_TP_R,   'TP Right',          '#00ccff', 0.95, False, 0.8),
+    (SP_SAL,    'Sup Articular L',   '#55aa88', 0.60, True,  1.5),
+    (SP_SAR,    'Sup Articular R',   '#338866', 0.60, True,  1.5),
+    (SP_CORPUS, 'Corpus Border',     '#5588bb', 0.50, True,  1.5),
+    (SP_CORD,   'Spinal Cord',       '#ffe066', 0.72, False, 1.0),
+    (SP_CANAL,  'Spinal Canal',      '#00ffb3', 0.25, False, 0.8),
 ]
 
 VERIDAH_COLOURS: Dict[int, Tuple[str, float]] = {
-    20: ('#aabbcc', 0.18),  # L1
-    21: ('#99aabb', 0.18),  # L2
-    22: ('#2288cc', 0.25),  # L3
-    23: ('#2266aa', 0.30),  # L4
-    24: ('#1e6fa8', 0.45),  # L5 — often TV
-    25: ('#33aaff', 0.55),  # L6 — extra lumbar; highlighted
-    26: ('#ff8c00', 0.62),  # Sacrum
+    20: ('#aabbcc', 0.42),   # L1
+    21: ('#99aabb', 0.42),   # L2
+    22: ('#2288cc', 0.48),   # L3
+    23: ('#2266aa', 0.55),   # L4
+    24: ('#1e6fa8', 0.68),   # L5 — often TV
+    25: ('#33aaff', 0.72),   # L6 — extra lumbar; highlighted
+    26: ('#ff8c00', 0.78),   # Sacrum
 }
 VERIDAH_IVD_COLOURS: Dict[int, str] = {
     20: '#ffe28a', 21: '#ffd060', 22: '#ffb830',
@@ -124,14 +117,14 @@ VERIDAH_IVD_COLOURS: Dict[int, str] = {
 }
 
 TSS_RENDER: List[Tuple] = [
-    (50,  'TSS Sacrum',     '#ff8c00', 0.65),
-    (41,  'TSS L1',         '#aabbcc', 0.18),
-    (42,  'TSS L2',         '#99aabb', 0.18),
-    (43,  'TSS L3',         '#2288cc', 0.22),
-    (44,  'TSS L4',         '#2266aa', 0.28),
-    (45,  'TSS L5',         '#1e6fa8', 0.40),
-    (95,  'TSS disc L4-L5', '#ff9900', 0.45),
-    (100, 'TSS disc L5-S1', '#ff5500', 0.50),
+    (50,  'TSS Sacrum',     '#ff8c00', 0.72),
+    (41,  'TSS L1',         '#aabbcc', 0.35),
+    (42,  'TSS L2',         '#99aabb', 0.35),
+    (43,  'TSS L3',         '#2288cc', 0.40),
+    (44,  'TSS L4',         '#2266aa', 0.48),
+    (45,  'TSS L5',         '#1e6fa8', 0.62),
+    (95,  'TSS disc L4-L5', '#ff9900', 0.55),
+    (100, 'TSS disc L5-S1', '#ff5500', 0.58),
 ]
 
 
@@ -219,6 +212,44 @@ def _isolate_z(mask: np.ndarray, z_lo: int, z_hi: int, margin: int = 15) -> np.n
     return out
 
 
+# ── Bounding box wireframe trace ───────────────────────────────────────────────
+
+def bbox_wireframe(mask: np.ndarray, origin_mm: np.ndarray,
+                   colour: str, name: str,
+                   dash: str = 'dash', width: int = 4,
+                   margin_vox: int = 2) -> Optional[go.Scatter3d]:
+    """Dashed wireframe bounding box around a binary mask (12 edges, one trace)."""
+    if not mask.any():
+        return None
+    coords = np.array(np.where(mask))
+    x0 = max(0, coords[0].min() - margin_vox) * ISO_MM - origin_mm[0]
+    x1 = (coords[0].max() + margin_vox) * ISO_MM - origin_mm[0]
+    y0 = max(0, coords[1].min() - margin_vox) * ISO_MM - origin_mm[1]
+    y1 = (coords[1].max() + margin_vox) * ISO_MM - origin_mm[1]
+    z0 = max(0, coords[2].min() - margin_vox) * ISO_MM - origin_mm[2]
+    z1 = (coords[2].max() + margin_vox) * ISO_MM - origin_mm[2]
+
+    corners = [
+        (x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0),
+        (x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1),
+    ]
+    edges = [(0,1),(1,2),(2,3),(3,0),
+             (4,5),(5,6),(6,7),(7,4),
+             (0,4),(1,5),(2,6),(3,7)]
+    xs, ys, zs = [], [], []
+    for a, b in edges:
+        p0, p1 = corners[a], corners[b]
+        xs += [p0[0], p1[0], None]
+        ys += [p0[1], p1[1], None]
+        zs += [p0[2], p1[2], None]
+
+    return go.Scatter3d(
+        x=xs, y=ys, z=zs, mode='lines',
+        line=dict(color=colour, width=width, dash=dash),
+        name=name, showlegend=True, hoverinfo='name',
+    )
+
+
 # ── Marching cubes → Mesh3d ───────────────────────────────────────────────────
 
 def mask_to_mesh3d(iso_mask: np.ndarray,
@@ -242,8 +273,8 @@ def mask_to_mesh3d(iso_mask: np.ndarray,
         i=faces[:, 0].tolist(), j=faces[:, 1].tolist(), k=faces[:, 2].tolist(),
         color=colour, opacity=opacity, name=name,
         showlegend=True, flatshading=False,
-        lighting=dict(ambient=0.38, diffuse=0.72, specular=0.25,
-                      roughness=0.55, fresnel=0.15),
+        lighting=dict(ambient=0.40, diffuse=0.75, specular=0.28,
+                      roughness=0.50, fresnel=0.18),
         lightposition=dict(x=100, y=200, z=150),
         hoverinfo='name', showscale=False,
     )
@@ -265,7 +296,7 @@ def _marker(pos, text, colour, size=12, sym='circle') -> go.Scatter3d:
         marker=dict(size=size, color=colour, symbol=sym,
                     line=dict(color='white', width=1)),
         text=[text], textposition='top center',
-        textfont=dict(size=10, color=colour),
+        textfont=dict(size=12, color=colour),
         name=text, showlegend=False, hoverinfo='text')
 
 
@@ -286,7 +317,7 @@ def tp_ruler_traces(tp_iso: np.ndarray, origin_mm: np.ndarray,
     flag = f'✗ ≥{TP_HEIGHT_MM:.0f}mm → Type I' if span_mm >= TP_HEIGHT_MM else '✓ <19mm'
     clr  = '#ff4444' if span_mm >= TP_HEIGHT_MM else '#44ff88'
     traces = [_line(p_lo, p_hi, colour, f'TP ruler {side}', width=8)]
-    traces.append(_marker(mid, f'{side} TP: {span_mm:.1f}mm  {flag}', clr, size=10, sym='diamond'))
+    traces.append(_marker(mid, f'{side} TP: {span_mm:.1f}mm  {flag}', clr, size=11, sym='diamond'))
     off = np.array([4., 0., 0.])
     for pt in (p_lo, p_hi):
         traces.append(_line(pt - off, pt + off, colour, f'tick {side}', width=3))
@@ -307,7 +338,7 @@ def gap_ruler_traces(tp: np.ndarray, sac: np.ndarray,
     return [
         _line(p_a, p_b, colour, f'gap ruler {side}', width=5,
               dash='dot' if contact else 'dash'),
-        _marker(mid, f'{side}: {lbl}', clr, size=8, sym='square'),
+        _marker(mid, f'{side}: {lbl}', clr, size=9, sym='square'),
     ]
 
 
@@ -332,9 +363,9 @@ def tv_plane_traces(vert_iso: np.ndarray, tv_label: int,
         x=xg * ISO_MM - origin_mm[0],
         y=yg * ISO_MM - origin_mm[1],
         z=zg * ISO_MM - origin_mm[2],
-        colorscale=[[0, f"rgba({_h2r(col)},0.12)"],
-                    [1, f"rgba({_h2r(col)},0.12)"]],
-        showscale=False, opacity=0.20,
+        colorscale=[[0, f"rgba({_h2r(col)},0.14)"],
+                    [1, f"rgba({_h2r(col)},0.14)"]],
+        showscale=False, opacity=0.22,
         name=f'TV plane ({tv_name})', showlegend=True, hoverinfo='name',
     )
     ctr = _centroid(mask)
@@ -348,7 +379,7 @@ def tv_body_annotation_traces(vert_iso: np.ndarray, tv_label: int,
                                phenotype: str) -> List:
     mask = (vert_iso == tv_label)
     if not mask.any() or not shape: return []
-    cfg    = PHENOTYPE_CONFIG.get(phenotype, PHENOTYPE_CONFIG['transitional'])
+    cfg    = PHENOTYPE_CONFIG.get(phenotype, PHENOTYPE_CONFIG['normal'])
     colour = cfg['color']
     coords = np.array(np.where(mask))
     y_min  = int(coords[1].min()); y_max = int(coords[1].max())
@@ -363,8 +394,146 @@ def tv_body_annotation_traces(vert_iso: np.ndarray, tv_label: int,
     return [
         _line(p_ant, p_post, '#8888aa', 'TV AP depth ruler', width=3, dash='dot'),
         _line(p_sup, p_inf,  colour,    'TV SI height ruler', width=4),
-        _marker(midpt(p_sup, p_inf), f'TV H/AP={h_ap:.2f} ({sc})', colour, size=9, sym='diamond-open'),
+        _marker(midpt(p_sup, p_inf), f'TV H/AP={h_ap:.2f} ({sc})', colour, size=10, sym='diamond-open'),
     ]
+
+
+# ── Clinical narrative generator ───────────────────────────────────────────────
+
+def _generate_clinical_narrative(result: dict, morpho: dict) -> str:
+    """Generate HTML clinical narrative paragraphs for the side panel."""
+    phenotype    = morpho.get('lstv_phenotype', 'normal')
+    confidence   = morpho.get('phenotype_confidence', '')
+    castellvi    = result.get('castellvi_type') or ''
+    tv_name      = morpho.get('tv_name', 'L5')
+    lumbar_count = morpho.get('lumbar_count_consensus', 5) or 5
+    tv_shape     = morpho.get('tv_shape') or {}
+    disc_below   = morpho.get('disc_below') or {}
+    disc_above   = morpho.get('disc_above') or {}
+    score        = result.get('pathology_score', 0)
+    lft          = result.get('left') or {}
+    rgt          = result.get('right') or {}
+
+    h_ap    = tv_shape.get('h_ap_ratio')
+    shape_c = tv_shape.get('shape_class', '')
+    dhi_b   = disc_below.get('dhi_pct')
+    dhi_a   = disc_above.get('dhi_pct')
+    dhi_b_lvl = disc_below.get('level', 'below TV')
+    dhi_a_lvl = disc_above.get('level', 'above TV')
+    l_h   = lft.get('tp_height_mm', 0)
+    r_h   = rgt.get('tp_height_mm', 0)
+    l_d   = lft.get('dist_mm', float('inf'))
+    r_d   = rgt.get('dist_mm', float('inf'))
+    has_ct = bool(castellvi and castellvi not in ('None', 'N/A'))
+    norm_r = tv_shape.get('norm_ratio')
+
+    paras = []
+
+    # ── Opening paragraph ─────────────────────────────────────────────────────
+    conf_str = f' ({confidence} confidence)' if confidence else ''
+    if phenotype == 'lumbarization':
+        p = (f'<b>Lumbarization</b> is identified at the lumbosacral junction'
+             f'{conf_str} with a pathology score of {score:.0f}. '
+             f'Six lumbar vertebrae are present ({tv_name} is the extra mobile segment), '
+             f'representing an S1 vertebra that has separated from the sacrum and '
+             f'developed lumbar characteristics — the defining criterion for '
+             f'lumbarization (Hughes &amp; Saifuddin 2006; Konin &amp; Walz 2010).')
+    elif phenotype == 'sacralization':
+        p = (f'<b>Sacralization</b> is identified at the lumbosacral junction'
+             f'{conf_str} with a pathology score of {score:.0f}. '
+             f'The {tv_name} vertebra demonstrates evidence of progressive incorporation '
+             f'into the sacrum.')
+        if lumbar_count == 4:
+            p += (f' Vertebral counting confirms only {lumbar_count} mobile lumbar '
+                  f'segments, consistent with complete L5 sacral incorporation.')
+    elif phenotype == 'transitional_indeterminate':
+        p = (f'<b>Transitional morphology</b> is identified at the lumbosacral junction '
+             f'(pathology score {score:.0f}). The phenotype is indeterminate — '
+             f'Castellvi TP morphology is present but primary '
+             f'sacralization/lumbarization criteria are not fully met. '
+             f'Clinical correlation and/or CT is recommended.')
+    else:
+        p = (f'<b>No significant LSTV pathology</b> is identified in this study '
+             f'(pathology score {score:.0f}). Five lumbar vertebrae are present with '
+             f'normal lumbosacral junction morphology and preserved disc heights.')
+    paras.append(p)
+
+    # ── Castellvi paragraph ────────────────────────────────────────────────────
+    if has_ct:
+        sides = []
+        if l_h >= TP_HEIGHT_MM or l_d <= CONTACT_DIST_MM:
+            sides.append(f'left (h={l_h:.1f}mm, gap={l_d:.1f}mm)')
+        if r_h >= TP_HEIGHT_MM or r_d <= CONTACT_DIST_MM:
+            sides.append(f'right (h={r_h:.1f}mm, gap={r_d:.1f}mm)')
+        sides_str = ' and '.join(sides) if sides else 'bilateral'
+
+        type_desc = {
+            'IV':  'mixed morphology (Type II unilateral, Type III contralateral)',
+            'III': 'complete osseous fusion of the transverse process with the sacral ala',
+            'II':  'diarthrodial pseudo-articulation between the transverse process and sacrum (fibrocartilaginous joint)',
+            'I':   'dysplastic transverse process(es) ≥19 mm craniocaudal height without sacral contact',
+        }
+        ct_key  = next((k for k in ('IV', 'III', 'II', 'I') if k in castellvi), '')
+        desc    = type_desc.get(ct_key, 'transverse process enlargement')
+        ct_num  = castellvi.replace('Type ', '')
+
+        p = (f'<b>Castellvi Type {ct_num}</b> is present on the {sides_str}, '
+             f'demonstrating {desc} (Castellvi et al. 1984, Spine 9:31–35). '
+             f'Note that the Castellvi classification (TP morphology) and LSTV '
+             f'phenotype are orthogonal — both apply simultaneously when present.')
+        paras.append(p)
+
+    # ── Disc paragraph ─────────────────────────────────────────────────────────
+    if dhi_b is not None:
+        if dhi_b < DHI_REDUCED_PCT:
+            grade_str = f'severely reduced (DHI={dhi_b:.0f}%, threshold &lt;50%)'
+            sig = ('This is the most reliable radiologic sign of sacralization and '
+                   'constitutes a primary diagnostic criterion '
+                   '(Seyfert 1997; Quinlan et al. 1984).')
+        elif dhi_b < DHI_MODERATE_PCT:
+            grade_str = f'moderately reduced (DHI={dhi_b:.0f}%, range 50–70%)'
+            sig = 'Moderate disc height loss supports sacral incorporation of the TV.'
+        elif dhi_b < DHI_MILD_PCT:
+            grade_str = f'mildly reduced (DHI={dhi_b:.0f}%, range 70–80%)'
+            sig = 'Mild disc height loss may reflect early degeneration or partial sacralization.'
+        else:
+            grade_str = f'preserved (DHI={dhi_b:.0f}%, normal ≥80%)'
+            sig = ('A preserved mobile disc below the TV supports lumbarization — '
+                   'the hallmark of a separated S1 segment '
+                   '(Konin &amp; Walz 2010).')
+
+        p = (f'The disc <b>{dhi_b_lvl}</b> is {grade_str} '
+             f'by the Disc Height Index method (Farfan et al. 1972). {sig}')
+        if dhi_a is not None and dhi_a >= DHI_MILD_PCT:
+            p += (f' The disc above ({dhi_a_lvl}, DHI={dhi_a:.0f}%) is preserved, '
+                  f'localising pathology specifically to the lumbosacral junction.')
+        paras.append(p)
+    elif disc_below.get('is_absent'):
+        paras.append(
+            f'The disc <b>{dhi_b_lvl}</b> is absent or unmeasurable on segmentation, '
+            f'suggesting possible complete disc fusion — a primary sacralization '
+            f'criterion when confirmed on imaging.')
+
+    # ── TV body morphology paragraph ────────────────────────────────────────────
+    if h_ap and shape_c:
+        shape_str = {
+            'lumbar-like':  f'lumbar-like (H/AP={h_ap:.2f}, normal lumbar &gt;0.68)',
+            'transitional': f'transitional (H/AP={h_ap:.2f}, range 0.52–0.68)',
+            'sacral-like':  f'sacral-like (H/AP={h_ap:.2f}, &lt;0.52)',
+        }.get(shape_c, f'H/AP={h_ap:.2f}')
+
+        p = (f'The <b>{tv_name}</b> vertebral body has {shape_str} morphology '
+             f'by the H/AP ratio (Nardo et al. 2012; Panjabi et al. 1992). '
+             f'Reference: L3≈0.82, L4≈0.78, L5≈0.72.')
+        if norm_r:
+            rel = 'notably squarer than' if norm_r < 0.80 else 'similar in shape to'
+            p += (f' TV/L4 normalised H:AP={norm_r:.2f}, indicating the TV is '
+                  f'{rel} L4.')
+        paras.append(p)
+
+    # Wrap each paragraph
+    html_parts = ['<div class="narr-para">' + p + '</div>' for p in paras]
+    return '\n'.join(html_parts)
 
 
 # ── Metrics HTML panel ─────────────────────────────────────────────────────────
@@ -411,6 +580,12 @@ def build_metrics_panel(result: dict) -> str:
         f'<div class="pconf" style="color:{p_col}">'
         f'Confidence: {confidence.upper() if confidence else "—"}</div>'
     )
+
+    # ── Clinical narrative ─────────────────────────────────────────────────────
+    narrative_html = _generate_clinical_narrative(result, morpho)
+    if narrative_html:
+        lines.append(sect('Clinical Summary'))
+        lines.append(narrative_html)
 
     # ── LSTV detection basis ───────────────────────────────────────────────────
     lines.append(sect('LSTV Detection Basis'))
@@ -468,10 +643,10 @@ def build_metrics_panel(result: dict) -> str:
     shp_cls = ('cr' if shpc == 'sacral-like' else 'wn' if shpc == 'transitional' else 'ok')
     if h_ap:
         lines.append(row('Body H/AP ratio', f'{h_ap:.2f}  ({shpc})', shp_cls))
-        lines.append(row('H/AP reference (Nardo 2012)',
-                         f'Lumbar >{TV_SHAPE_LUMBAR}  '
+        lines.append(row('H/AP ref (Nardo 2012)',
+                         f'Lumbar &gt;{TV_SHAPE_LUMBAR}  '
                          f'Trans {TV_SHAPE_SACRAL}–{TV_SHAPE_LUMBAR}  '
-                         f'Sacral <{TV_SHAPE_SACRAL}', 'pm'))
+                         f'Sacral &lt;{TV_SHAPE_SACRAL}', 'pm'))
     nr = tv_shape.get('norm_ratio')
     if nr:
         lines.append(row('TV/L4 H:AP ratio',
@@ -514,10 +689,10 @@ def build_metrics_panel(result: dict) -> str:
     # ── Evidence ───────────────────────────────────────────────────────────────
     if criteria:
         lines.append(sect('Classification Evidence'))
-        for c in criteria[:6]:
+        for c in criteria[:7]:
             lines.append(crit(c))
-        if len(criteria) > 6:
-            lines.append(f'<div class="pc" style="color:#4455aa">+{len(criteria)-6} more…</div>')
+        if len(criteria) > 7:
+            lines.append(f'<div class="pc" style="color:#4455aa">+{len(criteria)-7} more…</div>')
 
     # ── Rationale ──────────────────────────────────────────────────────────────
     if rationale:
@@ -594,78 +769,153 @@ def build_3d_figure(study_id: str,
 
     tv_z = _z_range(vert_iso == tv_label) if tv_label else None
 
+    # ── Use corrected Z range from 04_detect_lstv if available ────────────────
+    # validate_tp_concordance() runs in 04 and stores the corrected range in
+    # details{}.  Use it here so mesh rendering matches the JSON results.
+    details = result.get('details', {})
+    tp_corrected = bool(details.get('tp_concordance_corrected', False))
+    if tp_corrected and details.get('corrected_tv_z_range'):
+        tv_z_for_tp = tuple(details['corrected_tv_z_range'])  # type: ignore[arg-type]
+        logger.info(f"  [{study_id}] Using corrected TP Z range from JSON: {tv_z_for_tp}")
+    else:
+        tv_z_for_tp = tv_z
+
     def _get_tp(tp_lbl):
         if tp_lbl not in sp_labels: return np.zeros(sp_iso.shape, bool)
-        if tv_z:
-            isolated = _isolate_z(sp_iso == tp_lbl, tv_z[0], tv_z[1])
+        if tv_z_for_tp:
+            isolated = _isolate_z(sp_iso == tp_lbl, tv_z_for_tp[0], tv_z_for_tp[1])
             tp       = _inferiormost_cc(isolated, sac_iso if sac_iso.any() else None)
             if not tp.any(): tp = (sp_iso == tp_lbl)
         else:
             tp = (sp_iso == tp_lbl)
         return tp
 
-    tp_L   = _get_tp(SP_TP_L);  tp_R   = _get_tp(SP_TP_R)
+    tp_L = _get_tp(SP_TP_L)
+    tp_R = _get_tp(SP_TP_R)
+
     span_L = _tp_height_mm(tp_L); span_R = _tp_height_mm(tp_R)
     dist_L = _min_dist(tp_L, sac_iso)[0]; dist_R = _min_dist(tp_R, sac_iso)[0]
     castellvi = result.get('castellvi_type') or 'None'
     cls_L  = result.get('left',  {}).get('classification', 'Normal')
     cls_R  = result.get('right', {}).get('classification', 'Normal')
 
-    traces = []
+    # ── Trace accumulator with group tags ─────────────────────────────────────
+    traces: List  = []
+    groups:  List[str] = []   # 'focused' | 'full'
+
+    def _add(t, group: str = 'focused'):
+        if t is not None:
+            traces.append(t)
+            groups.append(group)
+
+    def _add_all(lst, group: str = 'focused'):
+        for t in lst:
+            _add(t, group)
 
     # SPINEPS subregion meshes
     for lbl, name, col, op, fh, mx_s in SPINE_LABELS:
         if lbl not in sp_labels: continue
         mask = (tp_L if lbl == SP_TP_L else tp_R if lbl == SP_TP_R else (sp_iso == lbl))
         if not mask.any(): continue
-        t = mask_to_mesh3d(mask, origin_mm, name, col, op, min(smooth, mx_s), fh)
-        if t: traces.append(t)
+        grp  = 'focused' if lbl in FOCUSED_SPINE_LABELS else 'full'
+        _add(mask_to_mesh3d(mask, origin_mm, name, col, op, min(smooth, mx_s), fh), grp)
 
     # VERIDAH vertebrae
     for lbl, (col, op) in sorted(VERIDAH_COLOURS.items()):
         if lbl not in vert_labels: continue
         eff_col = cfg['color'] if lbl == tv_label else col
-        eff_op  = 0.65 if lbl == tv_label else op
-        t = mask_to_mesh3d(vert_iso == lbl, origin_mm,
-                           VERIDAH_NAMES.get(lbl, str(lbl)), eff_col, eff_op, smooth, True)
-        if t: traces.append(t)
+        eff_op  = 0.82 if lbl == tv_label else op
+        grp = 'focused' if lbl in FOCUSED_VERIDAH_LABELS else 'full'
+        _add(mask_to_mesh3d(vert_iso == lbl, origin_mm,
+                            VERIDAH_NAMES.get(lbl, str(lbl)), eff_col, eff_op, smooth, True), grp)
 
     # VERIDAH IVDs
     for base, col in VERIDAH_IVD_COLOURS.items():
         ivd_lbl = VD_IVD_BASE + base
         if ivd_lbl not in vert_labels: continue
-        t = mask_to_mesh3d(vert_iso == ivd_lbl, origin_mm,
-                           f'IVD below {VERIDAH_NAMES.get(base, str(base))}',
-                           col, 0.50, smooth, True)
-        if t: traces.append(t)
+        grp = 'focused' if base in FOCUSED_VERIDAH_IVD else 'full'
+        _add(mask_to_mesh3d(vert_iso == ivd_lbl, origin_mm,
+                            f'IVD below {VERIDAH_NAMES.get(base, str(base))}',
+                            col, 0.58, smooth, True), grp)
 
     # TSS selective
     if show_tss and tss_iso is not None:
         for lbl, name, col, op in TSS_RENDER:
             if lbl not in tss_labels: continue
-            t = mask_to_mesh3d(tss_iso == lbl, origin_mm, name, col, op,
-                               0.8 if lbl in (TSS_CORD, TSS_CANAL) else smooth,
-                               lbl not in (TSS_CORD, TSS_CANAL))
-            if t: traces.append(t)
+            grp = 'focused' if lbl in FOCUSED_TSS_LABELS else 'full'
+            _add(mask_to_mesh3d(tss_iso == lbl, origin_mm, name, col, op,
+                                0.8 if lbl in (TSS_CORD, TSS_CANAL) else smooth,
+                                lbl not in (TSS_CORD, TSS_CANAL)), grp)
 
-    # Annotation traces
+    # Annotation traces (always focused)
     if tv_label and tv_label in vert_labels:
-        traces += tv_plane_traces(vert_iso, tv_label, origin_mm, tv_name, phenotype)
+        _add_all(tv_plane_traces(vert_iso, tv_label, origin_mm, tv_name, phenotype))
     tv_shape_dict = morpho.get('tv_shape') or {}
     if tv_label and tv_label in vert_labels and tv_shape_dict:
-        traces += tv_body_annotation_traces(vert_iso, tv_label, origin_mm,
-                                             tv_shape_dict, phenotype)
-    traces += tp_ruler_traces(tp_L, origin_mm, '#ff3333', 'Left',  span_L)
-    traces += tp_ruler_traces(tp_R, origin_mm, '#00ccff', 'Right', span_R)
-    traces += gap_ruler_traces(tp_L, sac_iso, origin_mm, '#ff8800', 'Left',  dist_L)
-    traces += gap_ruler_traces(tp_R, sac_iso, origin_mm, '#00aaff', 'Right', dist_R)
+        _add_all(tv_body_annotation_traces(vert_iso, tv_label, origin_mm,
+                                            tv_shape_dict, phenotype))
+    _add_all(tp_ruler_traces(tp_L, origin_mm, '#ff3333', 'Left',  span_L))
+    _add_all(tp_ruler_traces(tp_R, origin_mm, '#00ccff', 'Right', span_R))
+    _add_all(gap_ruler_traces(tp_L, sac_iso, origin_mm, '#ff8800', 'Left',  dist_L))
+    _add_all(gap_ruler_traces(tp_R, sac_iso, origin_mm, '#00aaff', 'Right', dist_R))
+
+    # ── Bounding boxes ─────────────────────────────────────────────────────────
+    # Castellvi-positive TPs
+    ct_has = bool(castellvi and castellvi not in ('None', 'N/A'))
+    if ct_has:
+        ct_col = '#ff2222' if any(x in castellvi for x in ('III','IV')) else '#ff8800'
+        if tp_L.any() and (span_L >= TP_HEIGHT_MM or dist_L <= CONTACT_DIST_MM):
+            _add(bbox_wireframe(tp_L, origin_mm, ct_col,
+                                f'⚠ Castellvi TP Left ({castellvi})',
+                                dash='dash', width=5))
+        if tp_R.any() and (span_R >= TP_HEIGHT_MM or dist_R <= CONTACT_DIST_MM):
+            _add(bbox_wireframe(tp_R, origin_mm, ct_col,
+                                f'⚠ Castellvi TP Right ({castellvi})',
+                                dash='dash', width=5))
+
+    # L6 body bounding box (lumbarization)
+    lumbar_count = morpho.get('lumbar_count_consensus', 5) or 5
+    if lumbar_count == 6 and VD_L6 in vert_labels:
+        l6_mask = (vert_iso == VD_L6)
+        if l6_mask.any():
+            _add(bbox_wireframe(l6_mask, origin_mm, '#ff8c00',
+                                '⚠ L6 — Extra lumbar segment (LUMBARIZATION)',
+                                dash='dash', width=5, margin_vox=3))
+
+    # Estimated L5 zone for 4-lumbar sacralization
+    if lumbar_count == 4:
+        l4_mask = None
+        if tss_iso is not None and 44 in tss_labels:
+            l4_mask = (tss_iso == 44)
+        elif VD_L4 in vert_labels:
+            l4_mask = (vert_iso == VD_L4)
+
+        if l4_mask is not None and l4_mask.any() and sac_iso.any():
+            l4_z_inf  = int(np.where(l4_mask)[2].min())
+            sac_z_sup = int(np.where(sac_iso)[2].max())
+            if l4_z_inf > sac_z_sup + 8:
+                l4_coords = np.where(l4_mask)
+                pseudo = np.zeros(sp_iso.shape, bool)
+                x0 = max(0, int(l4_coords[0].min()))
+                x1 = min(sp_iso.shape[0]-1, int(l4_coords[0].max()))
+                y0 = max(0, int(l4_coords[1].min()))
+                y1 = min(sp_iso.shape[1]-1, int(l4_coords[1].max()))
+                pseudo[x0:x1+1, y0:y1+1, sac_z_sup:l4_z_inf+1] = True
+                _add(bbox_wireframe(pseudo, origin_mm, '#ff2222',
+                                    '⚠ Est. L5 zone — fused to sacrum (SACRALIZATION)',
+                                    dash='dot', width=4, margin_vox=0))
 
     if not any(isinstance(tr, go.Mesh3d) for tr in traces):
         logger.error(f"[{study_id}] Zero meshes generated"); return None
 
-    lumbar_count = morpho.get('lumbar_count_consensus', '?')
-    score        = result.get('pathology_score', 0)
-    lstv_flag    = '⚠ LSTV' if result.get('lstv_detected') else '✓ Normal'
+    # ── Build visibility arrays for focused / full toggle ─────────────────────
+    focused_vis  = [True if g == 'focused' else 'legendonly' for g in groups]
+    full_vis     = [True] * len(groups)
+    focused_vis_json = json.dumps(focused_vis)
+    full_vis_json    = json.dumps(full_vis)
+
+    score     = result.get('pathology_score', 0)
+    lstv_flag = '⚠ LSTV' if result.get('lstv_detected') else '✓ Normal'
 
     fig = go.Figure(data=traces)
     fig.update_layout(
@@ -675,22 +925,24 @@ def build_3d_figure(study_id: str,
                   f"Castellvi <b>{castellvi}</b>  ·  "
                   f"TV: <b>{tv_name}</b>  ·  "
                   f"Lumbar: <b>{lumbar_count}</b>  ·  "
-                  f"{lstv_flag}  ·  Score: <b>{score:.0f}</b>"),
-            font=dict(size=11, color='#e8e8f0'), x=0.01),
+                  f"{lstv_flag}  ·  Score: <b>{score:.0f}</b>"
+                  + (' — TP Z CORRECTED' if tp_corrected else '')),
+            font=dict(size=12, color='#e8e8f0'), x=0.01),
         paper_bgcolor='#0a0a18', plot_bgcolor='#0a0a18',
         scene=dict(
             bgcolor='#0a0a18',
             xaxis=_axis('X'), yaxis=_axis('Y'), zaxis=_axis('Z (SI)'),
             aspectmode='data',
             camera=dict(eye=dict(x=1.6, y=0.2, z=0.3), up=dict(x=0, y=0, z=1))),
-        legend=dict(font=dict(color='#e8e8f0', size=8),
+        legend=dict(font=dict(color='#e8e8f0', size=9),
                     bgcolor='rgba(10,10,24,0.88)', bordercolor='#222244', borderwidth=1,
                     x=0.01, y=0.97, itemsizing='constant'),
-        margin=dict(l=0, r=0, t=36, b=0),
+        margin=dict(l=0, r=0, t=40, b=0),
     )
 
     return (fig, castellvi, tv_name, cls_L, cls_R,
-            span_L, span_R, dist_L, dist_R, morpho, cfg)
+            span_L, span_R, dist_L, dist_R, morpho, cfg,
+            focused_vis_json, full_vis_json)
 
 
 def _axis(title: str) -> dict:
@@ -707,59 +959,65 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LSTV 3D — {study_id}</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@700;800&display=swap');
 *{{box-sizing:border-box;margin:0;padding:0}}
-:root{{--bg:#0a0a18;--sf:#11112a;--bd:#222244;--tx:#e8e8f0;--mu:#5566aa}}
+:root{{--bg:#0a0a18;--sf:#11112a;--bd:#222244;--tx:#e8e8f0;--mu:#6677bb;--base:13px}}
 html,body{{background:var(--bg);color:var(--tx);font-family:'JetBrains Mono',monospace;
-           height:100vh;display:flex;flex-direction:column;overflow:hidden}}
-header{{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:5px 10px;
+           font-size:var(--base);height:100vh;display:flex;flex-direction:column;overflow:hidden}}
+header{{display:flex;align-items:center;flex-wrap:wrap;gap:7px;padding:6px 12px;
         border-bottom:1px solid var(--bd);background:var(--sf);flex-shrink:0}}
-h1{{font-family:'Syne',sans-serif;font-size:.75rem;font-weight:700}}
-.b{{display:inline-block;padding:2px 7px;border-radius:14px;font-size:.60rem;font-weight:600;white-space:nowrap}}
+h1{{font-family:'Syne',sans-serif;font-size:.85rem;font-weight:800;letter-spacing:.02em}}
+.b{{display:inline-block;padding:3px 9px;border-radius:14px;font-size:.72rem;font-weight:600;white-space:nowrap}}
 .bs{{background:#222244;color:var(--mu)}}
-.bc{{background:{status_bg};color:{status_color};border:1px solid {status_border};font-size:.72rem;font-weight:700;padding:3px 10px;border-radius:4px}}
+.bc{{background:{status_bg};color:{status_color};border:1px solid {status_border};font-size:.80rem;font-weight:700;padding:4px 12px;border-radius:4px}}
 .bct{{background:#1a2a3a;color:#5599cc}} .bch{{background:#2a1a0a;color:#cc8833}}
 .bln{{background:#0a2a0a;color:#44cc66}} .ble{{background:#2a0a0a;color:#ff3333}}
 .bnl{{background:#0a1a0a;color:#55cc77;font-weight:600}}
 .bsc{{background:#1a1a3a;color:#aaaaff;font-weight:700}}
-.tb{{display:flex;gap:4px;align-items:center;margin-left:auto;flex-wrap:wrap}}
-.tb span{{font-size:.55rem;color:var(--mu);text-transform:uppercase}}
+.bcr{{background:#221010;color:#ff6633;border:1px solid #ff4400;font-weight:700}}
+.tb{{display:flex;gap:5px;align-items:center;margin-left:auto;flex-wrap:wrap}}
+.tb span{{font-size:.65rem;color:var(--mu);text-transform:uppercase;letter-spacing:.04em}}
 button{{background:var(--bg);border:1px solid var(--bd);color:var(--tx);
-        font-family:inherit;font-size:.60rem;padding:2px 7px;border-radius:4px;cursor:pointer}}
-button:hover{{background:var(--bd)}} button.on{{background:#3366ff;border-color:#3366ff;color:#fff}}
-.mt{{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:3px 10px;
-     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.60rem}}
-.m{{display:flex;align-items:center;gap:3px;color:var(--mu)}}
+        font-family:inherit;font-size:.68rem;padding:3px 9px;border-radius:4px;cursor:pointer;transition:background .15s}}
+button:hover{{background:var(--bd)}}
+button.on{{background:#3366ff;border-color:#3366ff;color:#fff}}
+button.on-focus{{background:#ff8c00;border-color:#ff8c00;color:#000;font-weight:700}}
+.mt{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:4px 12px;
+     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.70rem}}
+.m{{display:flex;align-items:center;gap:4px;color:var(--mu)}}
 .v{{color:var(--tx);font-weight:600}}
 .ok{{color:#2dc653!important}} .wn{{color:#ff8800!important}} .cr{{color:#ff3333!important}}
-.note{{font-size:.50rem;color:#3a3a5a;margin-left:auto}}
+.note{{font-size:.60rem;color:#3a3a5a;margin-left:auto}}
 .main-row{{display:flex;flex:1;min-height:0;overflow:hidden}}
 #pl{{flex:1;min-width:0;min-height:0;overflow:hidden}}
 #pl .js-plotly-plot,#pl .plot-container{{height:100%!important}}
-#mp{{width:250px;flex-shrink:0;background:rgba(10,10,24,0.94);
+#mp{{width:290px;flex-shrink:0;background:rgba(10,10,24,0.96);
      border-left:1px solid var(--bd);overflow-y:auto;overflow-x:hidden;
-     padding:0 0 12px 0;font-size:.59rem;scrollbar-width:thin;scrollbar-color:#222244 var(--bg)}}
-#mp::-webkit-scrollbar{{width:3px}}
+     padding:0 0 16px 0;scrollbar-width:thin;scrollbar-color:#222244 var(--bg)}}
+#mp::-webkit-scrollbar{{width:4px}}
 #mp::-webkit-scrollbar-thumb{{background:#222244;border-radius:2px}}
-.pstatus{{text-align:center;font-family:'Syne',sans-serif;font-size:.80rem;font-weight:700;
-  letter-spacing:.04em;text-transform:uppercase;padding:8px 10px;margin-bottom:2px}}
-.pconf{{text-align:center;font-size:.55rem;font-weight:600;padding:2px 10px 4px;opacity:.85}}
-.ps{{font-family:'Syne',sans-serif;font-size:.55rem;font-weight:700;color:#5566aa;
-     text-transform:uppercase;letter-spacing:.06em;padding:5px 8px 2px;margin-top:4px;
+.pstatus{{text-align:center;font-family:'Syne',sans-serif;font-size:.92rem;font-weight:800;
+  letter-spacing:.05em;text-transform:uppercase;padding:10px 12px;margin-bottom:2px}}
+.pconf{{text-align:center;font-size:.66rem;font-weight:600;padding:2px 12px 6px;opacity:.88}}
+.ps{{font-family:'Syne',sans-serif;font-size:.65rem;font-weight:700;color:#6677bb;
+     text-transform:uppercase;letter-spacing:.07em;padding:7px 10px 3px;margin-top:5px;
      border-top:1px solid #161630}}
 .ps:first-child{{border-top:none;margin-top:0}}
-.pr{{display:flex;justify-content:space-between;align-items:baseline;padding:1px 8px;gap:4px}}
-.pk{{color:#5566aa;white-space:nowrap;flex-shrink:0;max-width:52%}}
-.pv{{text-align:right;color:var(--tx);font-weight:600;word-break:break-word}}
+.pr{{display:flex;justify-content:space-between;align-items:baseline;padding:2px 10px;gap:6px}}
+.pk{{color:#6677bb;white-space:nowrap;flex-shrink:0;max-width:52%;font-size:.68rem}}
+.pv{{text-align:right;color:var(--tx);font-weight:600;word-break:break-word;font-size:.70rem}}
 .pv.ok{{color:#2dc653}} .pv.wn{{color:#ff8800}} .pv.cr{{color:#ff3333}} .pv.pm{{color:#6677aa;font-weight:400}}
-.pc{{padding:2px 10px;color:#8899bb;font-size:.56rem;line-height:1.4}}
-.preason{{padding:3px 8px 4px;color:#aabbcc;font-size:.55rem;line-height:1.5;
-          border-left:2px solid #3344aa;margin:2px 6px}}
-.pwarning{{padding:2px 8px;color:#ffaa33;font-size:.55rem}}
-.lg{{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:2px 10px;
-     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.58rem}}
-.li{{display:flex;align-items:center;gap:3px;color:var(--mu)}}
-.sw{{width:8px;height:8px;border-radius:2px;flex-shrink:0}}
+.pc{{padding:3px 12px;color:#99aabb;font-size:.66rem;line-height:1.5}}
+.preason{{padding:4px 10px 5px;color:#aabbcc;font-size:.64rem;line-height:1.55;
+          border-left:3px solid #3344aa;margin:3px 8px;background:rgba(30,40,80,.25);border-radius:0 4px 4px 0}}
+.pwarning{{padding:3px 10px;color:#ffaa33;font-size:.65rem}}
+.narr-para{{padding:4px 10px 5px;color:#c8d8e8;font-size:.68rem;line-height:1.6;
+            margin:2px 0;border-left:2px solid rgba(100,120,200,.35)}}
+.narr-para b{{color:#e8eeff}}
+.lg{{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:3px 12px;
+     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.67rem}}
+.li{{display:flex;align-items:center;gap:4px;color:var(--mu)}}
+.sw{{width:10px;height:10px;border-radius:2px;flex-shrink:0}}
 </style></head><body>
 <header>
   <h1>LSTV 3D</h1>
@@ -769,10 +1027,15 @@ button:hover{{background:var(--bd)}} button.on{{background:#3366ff;border-color:
   <span class="b bch">TV: {tv_name}</span>
   <span class="b {lc_badge}">Lumbar: {lumbar_count}</span>
   {rib_badge}
+  {tp_corrected_badge}
   {lstv_badge}
   <span class="b bsc">Score: {score:.0f}</span>
   <div class="tb">
     <span>View</span>
+    <button onclick="setFocused()" id="b-focused" class="on-focus">🎯 Focused</button>
+    <button onclick="setFull()"    id="b-full">🌐 Full</button>
+    &nbsp;
+    <span>Cam</span>
     <button onclick="sv('oblique')" id="b-oblique" class="on">Oblique</button>
     <button onclick="sv('lat')"   id="b-lat">Lat</button>
     <button onclick="sv('post')"  id="b-post">Post</button>
@@ -793,16 +1056,39 @@ button:hover{{background:var(--bd)}} button.on{{background:#3366ff;border-color:
   <div class="li"><div class="sw" style="background:#ff3333"></div>TP-Left</div>
   <div class="li"><div class="sw" style="background:#00ccff"></div>TP-Right</div>
   <div class="li"><div class="sw" style="background:#ff8c00"></div>Sacrum</div>
-  <div class="li"><div class="sw" style="background:{tv_col};opacity:.9"></div>TV ({tv_name})</div>
-  <div class="li"><div class="sw" style="background:#7744bb;opacity:.7"></div>Arcus</div>
-  <div class="li"><div class="sw" style="background:#ffe066;opacity:.8"></div>Cord</div>
-  <div class="li"><div class="sw" style="background:#00ffb3;opacity:.4"></div>Canal</div>
+  <div class="li"><div class="sw" style="background:{tv_col};opacity:.95"></div>TV ({tv_name})</div>
+  <div class="li"><div class="sw" style="background:#2266aa;opacity:.8"></div>L4/L5</div>
+  <div class="li"><div class="sw" style="background:#7744bb;opacity:.8"></div>Arcus</div>
+  <div class="li"><div class="sw" style="background:#ffe066;opacity:.9"></div>Cord</div>
+  <div class="li"><div class="sw" style="background:#00ffb3;opacity:.5"></div>Canal</div>
+  <div class="li"><div class="sw" style="background:#ff8800;border:1px dashed #ff8800"></div>LSTV bbox</div>
 </div>
 <div class="main-row">
   <div id="pl">{plotly_div}</div>
   <div id="mp">{metrics_panel}</div>
 </div>
 <script>
+const FOCUSED_VIS = {focused_vis_json};
+const FULL_VIS    = {full_vis_json};
+
+function getPlot() {{ return document.querySelector('#pl .js-plotly-plot'); }}
+
+function setFocused() {{
+  const pd = getPlot(); if (!pd) return;
+  Plotly.restyle(pd, {{visible: FOCUSED_VIS}});
+  document.getElementById('b-focused').classList.add('on-focus');
+  document.getElementById('b-focused').classList.remove('on');
+  document.getElementById('b-full').classList.remove('on','on-focus');
+}}
+
+function setFull() {{
+  const pd = getPlot(); if (!pd) return;
+  Plotly.restyle(pd, {{visible: FULL_VIS}});
+  document.getElementById('b-full').classList.add('on');
+  document.getElementById('b-full').classList.remove('on-focus');
+  document.getElementById('b-focused').classList.remove('on','on-focus');
+}}
+
 const CAM={{
   oblique:{{eye:{{x:1.6,y:0.3,z:0.35}},up:{{x:0,y:0,z:1}}}},
   lat:    {{eye:{{x:2.5,y:0.0,z:0.0}},up:{{x:0,y:0,z:1}}}},
@@ -811,15 +1097,19 @@ const CAM={{
   axial:  {{eye:{{x:0.0,y:0.0,z:3.0}},up:{{x:0,y:1,z:0}}}},
 }};
 function sv(n){{
-  const pd=document.querySelector('#pl .js-plotly-plot');
-  if(!pd)return;
+  const pd=getPlot(); if(!pd)return;
   Plotly.relayout(pd,{{'scene.camera.eye':CAM[n].eye,'scene.camera.up':CAM[n].up}});
-  document.querySelectorAll('.tb button').forEach(b=>b.classList.remove('on'));
-  const b=document.getElementById('b-'+n);if(b)b.classList.add('on');
+  document.querySelectorAll('.tb button[id^="b-oblique"],.tb button[id^="b-lat"],' +
+    '.tb button[id^="b-post"],.tb button[id^="b-ant"],.tb button[id^="b-axial"]')
+    .forEach(b=>b.classList.remove('on'));
+  const b=document.getElementById('b-'+n); if(b)b.classList.add('on');
 }}
+
+// Apply focused view on load
+window.addEventListener('load', () => {{ setTimeout(setFocused, 400); }});
+
 window.addEventListener('resize',()=>{{
-  const pd=document.querySelector('#pl .js-plotly-plot');
-  if(pd)Plotly.Plots.resize(pd);
+  const pd=getPlot(); if(pd)Plotly.Plots.resize(pd);
 }});
 </script>
 </body></html>"""
@@ -828,7 +1118,9 @@ window.addEventListener('resize',()=>{{
 def save_html(fig, study_id: str, output_dir: Path,
               castellvi: str, tv_name: str, cls_L: str, cls_R: str,
               span_L: float, span_R: float, dist_L: float, dist_R: float,
-              morpho: dict, cfg: dict, result: dict) -> Path:
+              morpho: dict, cfg: dict, result: dict,
+              focused_vis_json: str, full_vis_json: str,
+              tp_corrected: bool = False) -> Path:
     from plotly.io import to_html
 
     plotly_div = to_html(fig, full_html=False, include_plotlyjs='cdn',
@@ -853,6 +1145,8 @@ def save_html(fig, study_id: str, output_dir: Path,
     lc_badge      = 'ble' if lc_anomaly else 'bln'
     rib_badge     = ('<span class="b ble">Rib anomaly ⚠</span>'
                      if rib.get('any_anomaly') else '')
+    tp_corrected_badge = ('<span class="b bcr">TP corrected ⚙</span>'
+                          if tp_corrected else '')
     lstv_detected = result.get('lstv_detected', False)
     lstv_badge    = ('<span class="b ble">⚠ LSTV</span>'
                      if lstv_detected
@@ -866,28 +1160,31 @@ def save_html(fig, study_id: str, output_dir: Path,
     tv_col        = status_cfg['color']
 
     html = _HTML_TEMPLATE.format(
-        study_id      = study_id,
-        status_label  = status_cfg['label'],
-        status_emoji  = status_cfg['emoji'],
-        status_color  = status_cfg['color'],
-        status_bg     = status_cfg['bg'],
-        status_border = status_cfg['border'],
-        castellvi     = castellvi,
-        tv_name       = tv_name,
-        lumbar_count  = lumbar_count,
-        lc_badge      = lc_badge,
-        rib_badge     = rib_badge,
-        lstv_badge    = lstv_badge,
-        score         = score,
-        span_L        = span_L, span_R = span_R,
+        study_id          = study_id,
+        status_label      = status_cfg['label'],
+        status_emoji      = status_cfg['emoji'],
+        status_color      = status_cfg['color'],
+        status_bg         = status_cfg['bg'],
+        status_border     = status_cfg['border'],
+        castellvi         = castellvi,
+        tv_name           = tv_name,
+        lumbar_count      = lumbar_count,
+        lc_badge          = lc_badge,
+        rib_badge         = rib_badge,
+        tp_corrected_badge= tp_corrected_badge,
+        lstv_badge        = lstv_badge,
+        score             = score,
+        span_L            = span_L, span_R = span_R,
         tpl_c=_hc(span_L), tpr_c=_hc(span_R),
         gap_L=_f(dist_L),  gap_R=_f(dist_R),
         gl_c=_gc(dist_L),  gr_c=_gc(dist_R),
         hap_disp=hap_disp, hap_c=hap_c,
         dhi_disp=dhi_disp, dhi_c=dhi_c,
         tv_col=tv_col,
-        metrics_panel = build_metrics_panel(result),
-        plotly_div    = plotly_div,
+        metrics_panel     = build_metrics_panel(result),
+        plotly_div        = plotly_div,
+        focused_vis_json  = focused_vis_json,
+        full_vis_json     = full_vis_json,
     )
 
     out_path = output_dir / f"{study_id}_lstv_3d.html"
@@ -901,14 +1198,6 @@ def save_html(fig, study_id: str, output_dir: Path,
 def rank_studies(results: List[dict],
                  n_pathologic: int,
                  n_normal: int) -> Tuple[List[str], List[str]]:
-    """
-    Partition studies into pathologic (top N by score) and strict-normal (bottom N).
-    A study is STRICTLY NORMAL iff:
-      • lstv_detected = False
-      • lumbar_count_consensus = 5
-      • pathology_score = 0
-    Falls back to lowest-scored if not enough strict normals.
-    """
     scored = sorted(
         ((r['study_id'], r.get('pathology_score') or 0) for r in results),
         key=lambda t: t[1], reverse=True,
@@ -1022,11 +1311,17 @@ def main() -> int:
             if out is None: continue
 
             (fig, castellvi, tv_name, cls_L, cls_R,
-             span_L, span_R, dist_L, dist_R, morpho, cfg) = out
+             span_L, span_R, dist_L, dist_R, morpho, cfg,
+             focused_vis_json, full_vis_json) = out
+
+            # tp_corrected comes from 04's JSON result, not from figure title
+            tp_corrected = bool(result.get('details', {}).get('tp_concordance_corrected', False))
 
             save_html(fig, sid, output_dir,
                       castellvi, tv_name, cls_L, cls_R,
-                      span_L, span_R, dist_L, dist_R, morpho, cfg, result)
+                      span_L, span_R, dist_L, dist_R, morpho, cfg, result,
+                      focused_vis_json, full_vis_json,
+                      tp_corrected=tp_corrected)
             ok += 1
 
         except Exception as exc:

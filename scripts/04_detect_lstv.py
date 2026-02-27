@@ -47,6 +47,41 @@ TotalSpineSeg sagittal_labeled.nii.gz:
   41=L1  42=L2  43=L3  44=L4  45=L5  50=Sacrum
   91-100 = disc labels
   Preferred sacrum source (label 50) for Phase 1 distance measurement.
+
+TP POSITIONAL VALIDATION
+--------------------------
+After isolating both TPs at the TV level, each TP centroid is checked
+against two anatomical boundaries:
+
+  1. TV inferior boundary (tv_z[0] in voxels):
+     A TP centroid should not sit substantially below the TV's own inferior
+     endplate.  If it does, SPINEPS has isolated a fragment from the sacrum
+     or an inferior vertebra rather than the actual TV transverse process.
+     Threshold: TP_BELOW_TV_MM (default 10 mm below TV floor).
+
+  2. Sacrum superior boundary (sac_z_sup in voxels):
+     A TP centroid should not be at or below the sacrum's superior surface.
+     If it is, the "TP" is entirely within the sacrum — definitively wrong.
+     Threshold: TP_INTO_SACRUM_MM (default 5 mm — generous for partial-vol).
+
+Either condition on either side triggers re-isolation using TSS L5
+(preferred) or VERIDAH L5 Z-range as the ground truth, because TSS L5 is
+not susceptible to the L6/sacrum confusion that affects SPINEPS.
+
+WHY BILATERAL COMPARISON FAILS
+--------------------------------
+Comparing L vs R TP Z-centroids and flagging large discordance (>25 mm) is
+the wrong signal.  In the common failure mode — L6 overlapping the sacrum,
+causing SPINEPS to label the sacral ala as a costal process on one side —
+both TPs land at similar Z positions (L6 and the ala are only ~10–15 mm
+apart).  Bilateral discordance never triggers even when one TP is clearly in
+the sacrum.  Per-TP boundary checks fire as soon as a TP crosses into sacral
+territory regardless of the other side.
+
+This correction is applied before Phase 1 Castellvi measurement and before
+Phase 2 axial analysis, so the JSON results reflect the corrected geometry.
+The visualiser reads 'tp_concordance_corrected' and 'corrected_tv_z_range'
+directly from the result dict.
 """
 
 from __future__ import annotations
@@ -84,6 +119,11 @@ P2_MIN_STD_RATIO   = 0.12    # CV < 0.12 → uniform bridge → Type III
 # ── Cross-validation thresholds ───────────────────────────────────────────────
 XVAL_MIN_DICE      = 0.30
 XVAL_MAX_CENTROID  = 20.0   # mm
+
+# ── TP sacrum-overlap threshold ───────────────────────────────────────────────
+# Minimum fraction of a TP's voxels that must overlap the TSS sacrum mask
+# before the TP is considered displaced (generous for partial-volume).
+TP_SACRUM_OVERLAP_FRAC = 0.10   # 10 % of TP voxels inside TSS sacrum → displaced
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -215,6 +255,19 @@ def measure_tp_height_mm(tp_mask: np.ndarray, vox_mm: np.ndarray) -> float:
     return float((int(zc.max()) - int(zc.min()) + 1) * vox_mm[2])
 
 
+def tp_centroid_z_mm(sp_data: np.ndarray, tp_label: int,
+                     z_range: Tuple[int, int], vox_mm: np.ndarray,
+                     sac_mask: Optional[np.ndarray] = None) -> Optional[float]:
+    """
+    Return Z centroid (mm) of the inferiormost TP connected component
+    isolated at z_range.  Returns None if the label is absent.
+    """
+    isolated = isolate_tp_at_tv(sp_data, tp_label, *z_range)
+    tp       = inferiormost_tp_cc(isolated, sac_mask)
+    if not tp.any(): return None
+    return float(np.mean(np.where(tp)[2])) * vox_mm[2]
+
+
 def min_dist_3d(mask_a: np.ndarray, mask_b: np.ndarray,
                 vox_mm: np.ndarray) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
     if not mask_a.any() or not mask_b.any():
@@ -236,6 +289,119 @@ def min_dist_3d(mask_a: np.ndarray, mask_b: np.ndarray,
     d2    = ((coords.T * vox_mm - vox_a * vox_mm) ** 2).sum(axis=1)
     vox_b = coords[:, int(np.argmin(d2))]
     return dist_mm, vox_a, vox_b
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TP SACRUM-DISPLACEMENT CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
+def validate_tp_concordance(sag_sp:    np.ndarray,
+                             sag_vert:  np.ndarray,
+                             sag_tss:   Optional[np.ndarray],
+                             vox_mm:    np.ndarray,
+                             tv_z:      Tuple[int, int],
+                             sac_mask:  np.ndarray,
+                             study_id:  str) -> Tuple[bool, Tuple[int, int]]:
+    """
+    Detect a TP that was isolated from sacral tissue rather than the TV.
+
+    FAILURE MODE
+    ------------
+    SPINEPS mislabels part of the sacrum as L6, so the TP isolated on that
+    side is actually sacral tissue.  The contralateral TP is fine.
+    Bilateral comparison misses this because both sides end up at similar Z.
+
+    TWO-TEST APPROACH (both must be true to flag displacement)
+    ----------------------------------------------------------
+    Test 1 — TSS sacrum overlap (TP_SACRUM_OVERLAP_FRAC threshold):
+        >X% of the isolated TP's voxels fall inside TSS sacrum (label 50).
+        Necessary but not sufficient: a real Castellvi Type III TP that is
+        fused to the sacrum will also overlap — hence Test 2.
+
+    Test 2 — TP centroid is below the L5/S1 disc superior edge:
+        TSS labels the L5-S1 disc as label 100.  A real lumbar TP — even a
+        fused Type III — originates from the TV body and its centroid stays
+        above the disc space.  A mislabeled sacral "TP" will have its
+        centroid below the disc.  Fallback: TSS sacrum superior edge.
+
+    If either side fails both tests → re-isolate both TPs from TSS L5 Z-range
+    (VERIDAH L5 if TSS L5 absent).
+
+    Returns (corrected: bool, z_range_to_use: Tuple[int, int])
+    """
+    if sag_tss is None:
+        return False, tv_z
+
+    tss_sacrum_mask = (sag_tss == TSS_SACRUM)
+    if not tss_sacrum_mask.any():
+        return False, tv_z
+
+    # Disc floor = superior edge of TSS L5-S1 disc (label 100).
+    # Fallback to sacrum superior edge if disc label absent.
+    tss_disc = (sag_tss == 100)
+    if tss_disc.any():
+        disc_floor_z = int(np.where(tss_disc)[2].max())
+        disc_floor_src = 'TSS L5-S1 disc (label 100)'
+    elif tss_sacrum_mask.any():
+        disc_floor_z = int(np.where(tss_sacrum_mask)[2].max())
+        disc_floor_src = 'TSS sacrum superior edge (fallback)'
+    else:
+        return False, tv_z
+
+    def _is_displaced(tp_lbl: int, side: str) -> bool:
+        isolated = isolate_tp_at_tv(sag_sp, tp_lbl, *tv_z)
+        tp = inferiormost_tp_cc(isolated, tss_sacrum_mask)
+        if not tp.any():
+            return False
+
+        n_tp          = int(tp.sum())
+        overlap_frac  = int((tp & tss_sacrum_mask).sum()) / n_tp
+        centroid_z    = float(np.mean(np.where(tp)[2]))   # voxels
+        below_disc    = centroid_z < disc_floor_z
+
+        logger.info(
+            f"  [{study_id}] {side:5s} TP  sacrum_overlap={overlap_frac:.1%}  "
+            f"centroid_z={centroid_z:.1f}vox  disc_floor_z={disc_floor_z}vox "
+            f"({disc_floor_src})  below_disc={below_disc}"
+        )
+
+        if overlap_frac >= TP_SACRUM_OVERLAP_FRAC and below_disc:
+            logger.warning(
+                f"  [{study_id}] {side} TP DISPLACED IN SACRUM — "
+                f"{overlap_frac:.0%} overlap with TSS sacrum "
+                f"AND centroid ({centroid_z:.0f}) below disc floor ({disc_floor_z})"
+            )
+            return True
+        return False
+
+    displaced_L = _is_displaced(SP_TP_L, 'left')
+    displaced_R = _is_displaced(SP_TP_R, 'right')
+
+    if not displaced_L and not displaced_R:
+        return False, tv_z
+
+    # Re-isolate from TSS L5 Z-range
+    ref_z: Optional[Tuple[int, int]] = None
+    tss_l5 = (sag_tss == 45)
+    if tss_l5.any():
+        zc = np.where(tss_l5)[2]
+        ref_z = (int(zc.min()), int(zc.max()))
+        logger.info(f"  [{study_id}] Using TSS L5 Z reference: {ref_z}")
+    if ref_z is None:
+        vd_l5 = (sag_vert == VD_L5)
+        if vd_l5.any():
+            zc = np.where(vd_l5)[2]
+            ref_z = (int(zc.min()), int(zc.max()))
+            logger.info(f"  [{study_id}] Using VERIDAH L5 Z reference: {ref_z}")
+    if ref_z is None:
+        logger.warning(f"  [{study_id}] Cannot correct — no L5 reference available")
+        return False, tv_z
+
+    sides = ('left ' if displaced_L else '') + ('right' if displaced_R else '')
+    logger.info(f"  [{study_id}] TP correction: {sides.strip()} displaced → re-isolating both from {ref_z}")
+    return True, ref_z
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -345,6 +511,9 @@ def phase1_sagittal(side: str, tp_label: int,
     Phase 1: sagittal geometric Castellvi analysis.
     TP height threshold: ≥ 19 mm (Castellvi et al. 1984).
     Contact threshold: ≤ 2 mm 3D distance to sacrum.
+
+    tv_z_range may be the original VERIDAH TV Z range or the concordance-
+    corrected TSS/VERIDAH L5 Z range — caller decides which to use.
     """
     out = {
         'tp_present': False, 'tp_height_mm': 0.0, 'contact': False,
@@ -371,6 +540,8 @@ def phase1_sagittal(side: str, tp_label: int,
     out['tp_height_mm'] = measure_tp_height_mm(tp_mask, sag_vox_mm)
     out['tp_z_min_vox'] = int(np.where(tp_mask)[2].min())
     out['tp_z_max_vox'] = int(np.where(tp_mask)[2].max())
+    out['tp_centroid_z_mm'] = round(
+        float(np.mean(np.where(tp_mask)[2])) * sag_vox_mm[2], 2)
 
     if not sac_mask.any():
         return out
@@ -515,29 +686,45 @@ def classify_study(study_id:       str,
     if tv_z is None:
         out['errors'].append(f'TV label {tv_name} empty in VERIDAH mask'); return out
 
-    out['details'] = {
-        'tv_label':         tv_label,
-        'tv_name':          tv_name,
-        'has_l6':           tv_label == VD_L6,
-        'tv_z_range':       list(tv_z),
-        'sag_vox_mm':       vox_mm.tolist(),
-        'phase2_available': p2_available,
-        'tp_source':        'seg-spine_msk labels 43 (L) / 44 (R)',
-        'sacrum_source':    'TSS label 50 (preferred) / SPINEPS 26 (fallback)',
-        'label_note':       'TSS 43/44 = L3/L4 vertebrae — TP always from seg-spine_msk',
-        'tss_lumbar_labels':tss_lumbar_present,
-    }
-    logger.info(f"  [{study_id}] TV={tv_name}  z=[{tv_z[0]},{tv_z[1]}]")
+    # ── TP concordance validation ───────────────────────────────────────────────
+    # Build sacrum mask for use in concordance check and throughout Phase 1
+    tss_sac_mask = (sag_tss == TSS_SACRUM) if sag_tss is not None else None
+    sac_mask_p1  = (tss_sac_mask
+                    if tss_sac_mask is not None and tss_sac_mask.any()
+                    else (sag_sp == SP_SACRUM))
 
-    # ── Phase 1 + 2 per side ───────────────────────────────────────────────────
+    tp_corrected, tv_z_final = validate_tp_concordance(
+        sag_sp, sag_vert, sag_tss, vox_mm, tv_z, sac_mask_p1, study_id)
+
+    out['details'] = {
+        'tv_label':                   tv_label,
+        'tv_name':                    tv_name,
+        'has_l6':                     tv_label == VD_L6,
+        'tv_z_range':                 list(tv_z),
+        'tp_concordance_corrected':   tp_corrected,
+        'corrected_tv_z_range':       list(tv_z_final) if tp_corrected else None,
+        'sag_vox_mm':                 vox_mm.tolist(),
+        'phase2_available':           p2_available,
+        'tp_source':                  'seg-spine_msk labels 43 (L) / 44 (R)',
+        'sacrum_source':              'TSS label 50 (preferred) / SPINEPS 26 (fallback)',
+        'label_note':                 'TSS 43/44 = L3/L4 vertebrae — TP always from seg-spine_msk',
+        'tss_lumbar_labels':          tss_lumbar_present,
+    }
+    logger.info(
+        f"  [{study_id}] TV={tv_name}  z=[{tv_z[0]},{tv_z[1]}]"
+        + (f"  → corrected z=[{tv_z_final[0]},{tv_z_final[1]}]" if tp_corrected else "")
+    )
+
+    # ── Phase 1 + 2 per side — use corrected Z range ───────────────────────────
     for side, tp_lbl in (('left', SP_TP_L), ('right', SP_TP_R)):
         try:
-            p1 = phase1_sagittal(side, tp_lbl, sag_sp, sag_tss, vox_mm, tv_z)
+            p1 = phase1_sagittal(side, tp_lbl, sag_sp, sag_tss, vox_mm, tv_z_final)
             logger.info(
                 f"  {side:5s} P1: {p1['classification']:22s} "
                 f"h={p1['tp_height_mm']:.1f}mm  "
                 f"d={p1['dist_mm']:.1f}mm  "
                 f"z=[{p1.get('tp_z_min_vox','?')},{p1.get('tp_z_max_vox','?')}]  "
+                f"cz={p1.get('tp_centroid_z_mm','?')}mm  "
                 f"sac={p1.get('sacrum_source','?')}"
             )
 
@@ -636,6 +823,7 @@ def classify_study(study_id:       str,
             f"Castellvi={out.get('castellvi_type','None')}  "
             f"{ph_str}  "
             f"reasons={out['lstv_reason']}"
+            + (f"  [TP CORRECTED]" if tp_corrected else "")
         )
     else:
         logger.info(f"  ✗✗ [{study_id}] No LSTV (Castellvi=None, count=5, normal phenotype)")
@@ -715,6 +903,7 @@ def main() -> int:
                            ['Type Ia','Type Ib','Type IIa','Type IIb',
                             'Type IIIa','Type IIIb','Type IV']}
     phenotype_counts: Dict[str, int] = {}
+    tp_correction_count = 0
 
     for sid in study_ids:
         logger.info(f"\n{'='*60}\n[{sid}]")
@@ -725,6 +914,7 @@ def main() -> int:
             )
             results.append(r)
             if r.get('errors'): errors += 1
+            if r.get('details', {}).get('tp_concordance_corrected'): tp_correction_count += 1
             ct = r.get('castellvi_type') or ''
             for k in castellvi_counts:
                 if ct.replace(' ', '') == k.replace(' ', ''):
@@ -744,9 +934,10 @@ def main() -> int:
     )
 
     logger.info(f"\n{'='*60}")
-    logger.info(f"Studies:        {len(results)}")
-    logger.info(f"LSTV detected:  {lstv_n}  ({100*lstv_n/max(len(results),1):.1f}%)")
-    logger.info(f"Errors:         {errors}")
+    logger.info(f"Studies:              {len(results)}")
+    logger.info(f"LSTV detected:        {lstv_n}  ({100*lstv_n/max(len(results),1):.1f}%)")
+    logger.info(f"Errors:               {errors}")
+    logger.info(f"TP concordance fixes: {tp_correction_count}")
     logger.info("Castellvi breakdown:")
     for t, n in castellvi_counts.items():
         if n: logger.info(f"  {t}: {n}")
@@ -756,22 +947,24 @@ def main() -> int:
     logger.info("Top-10 pathology scores:")
     for sid, sc in scores[:10]:
         r_match = next((r for r in results if r['study_id'] == sid), {})
-        ph = (r_match.get('lstv_morphometrics') or {}).get('lstv_phenotype', '?')
-        ct = r_match.get('castellvi_type', 'None')
-        logger.info(f"  {sid}: score={sc:.1f}  phenotype={ph}  castellvi={ct}")
+        ph  = (r_match.get('lstv_morphometrics') or {}).get('lstv_phenotype', '?')
+        ct  = r_match.get('castellvi_type', 'None')
+        fix = ' [TP-FIXED]' if r_match.get('details', {}).get('tp_concordance_corrected') else ''
+        logger.info(f"  {sid}: score={sc:.1f}  phenotype={ph}  castellvi={ct}{fix}")
 
     out_json = output_dir / 'lstv_results.json'
     with open(out_json, 'w') as fh:
         json.dump(results, fh, indent=2, default=str)
 
     summary = {
-        'total':               len(results),
-        'lstv_detected':       lstv_n,
-        'lstv_rate':           round(lstv_n / max(len(results), 1), 4),
-        'errors':              errors,
-        'castellvi_breakdown': castellvi_counts,
-        'phenotype_breakdown': phenotype_counts,
-        'top_scores':          scores[:20],
+        'total':                  len(results),
+        'lstv_detected':          lstv_n,
+        'lstv_rate':              round(lstv_n / max(len(results), 1), 4),
+        'errors':                 errors,
+        'tp_concordance_fixes':   tp_correction_count,
+        'castellvi_breakdown':    castellvi_counts,
+        'phenotype_breakdown':    phenotype_counts,
+        'top_scores':             scores[:20],
     }
     with open(output_dir / 'lstv_summary.json', 'w') as fh:
         json.dump(summary, fh, indent=2, default=str)
