@@ -955,20 +955,35 @@ def classify_study(study_id:       str,
             out['errors'].append(f'lstv_engine: {exc}')
 
     # ── Final summary ───────────────────────────────────────────────────────────
+    morpho_dict = out.get('lstv_morphometrics') or {}
+    probs_dict  = morpho_dict.get('probabilities') or {}
+    sr_dict     = morpho_dict.get('surgical_relevance') or {}
+    p_sac       = probs_dict.get('p_sacralization', 0)
+    p_lumb      = probs_dict.get('p_lumbarization', 0)
+    p_norm      = probs_dict.get('p_normal', 0)
+    wl_risk     = sr_dict.get('wrong_level_risk', '?')
+    bert_prob   = sr_dict.get('bertolotti_probability', 0)
+    rdr         = morpho_dict.get('relative_disc_ratio')
+
     if out['lstv_detected']:
         ph_str = ''
-        morpho_dict = out.get('lstv_morphometrics') or {}
         if morpho_dict.get('lstv_phenotype'):
-            ph_str = f"  phenotype={morpho_dict['lstv_phenotype']} ({morpho_dict.get('phenotype_confidence','')})"
+            ph_str = (f"phenotype={morpho_dict['lstv_phenotype']} "
+                      f"({morpho_dict.get('phenotype_confidence','')})")
         logger.info(
             f"  ✓✓ [{study_id}] LSTV DETECTED  "
             f"Castellvi={out.get('castellvi_type','None')}  "
             f"{ph_str}  "
-            f"reasons={out['lstv_reason']}"
-            + (f"  [TP CORRECTED]" if tp_corrected else "")
+            f"P(sac)={p_sac:.0%}  P(lumb)={p_lumb:.0%}  P(norm)={p_norm:.0%}  "
+            f"surgical_risk={wl_risk}  bertolotti={bert_prob:.0%}"
+            + (f"  disc_ratio={rdr:.2f}" if rdr is not None else "")
+            + (f"  [TP-FIXED]" if tp_corrected else "")
         )
     else:
-        logger.info(f"  ✗✗ [{study_id}] No LSTV (Castellvi=None, count=5, normal phenotype)")
+        logger.info(
+            f"  ✗✗ [{study_id}] No LSTV  "
+            f"P(sac)={p_sac:.0%}  P(lumb)={p_lumb:.0%}  P(norm)={p_norm:.0%}"
+        )
 
     out['pathology_score'] = compute_lstv_pathology_score(
         out, out.get('lstv_morphometrics'))
@@ -1070,48 +1085,141 @@ def main() -> int:
             errors += 1
 
     lstv_n = sum(1 for r in results if r.get('lstv_detected'))
+    n      = max(len(results), 1)
     scores = sorted(
         ((r['study_id'], r.get('pathology_score') or 0) for r in results),
         key=lambda t: t[1], reverse=True,
     )
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Studies:              {len(results)}")
-    logger.info(f"LSTV detected:        {lstv_n}  ({100*lstv_n/max(len(results),1):.1f}%)")
-    logger.info(f"Errors:               {errors}")
-    logger.info(f"TP concordance fixes: {tp_correction_count}")
-    logger.info("Castellvi breakdown:")
-    for t, n in castellvi_counts.items():
-        if n: logger.info(f"  {t}: {n}")
-    logger.info("Phenotype breakdown:")
-    for t, n in phenotype_counts.items():
-        logger.info(f"  {t}: {n}")
-    logger.info("Top-10 pathology scores:")
+    # ── Probability distribution statistics ────────────────────────────────────
+    p_sac_vals  = []
+    p_lumb_vals = []
+    wl_risk_counts: Dict[str, int] = {}
+    bertolotti_ge50 = 0
+    high_cert_sac  = 0   # P(sac)  > 0.80
+    high_cert_lumb = 0   # P(lumb) > 0.80
+    nerve_ambig    = 0
+    rel_disc_low   = 0   # relative_disc_ratio < 0.65
+
+    for r in results:
+        morpho = r.get('lstv_morphometrics') or {}
+        probs  = morpho.get('probabilities') or {}
+        ps = probs.get('p_sacralization', 0)
+        pl = probs.get('p_lumbarization', 0)
+        p_sac_vals.append(ps)
+        p_lumb_vals.append(pl)
+        if ps > 0.80:  high_cert_sac  += 1
+        if pl > 0.80:  high_cert_lumb += 1
+
+        sr = morpho.get('surgical_relevance') or {}
+        wlr = sr.get('wrong_level_risk', 'low')
+        wl_risk_counts[wlr] = wl_risk_counts.get(wlr, 0) + 1
+        if sr.get('nerve_root_ambiguity'): nerve_ambig += 1
+        bp = sr.get('bertolotti_probability', 0)
+        if bp >= 0.50: bertolotti_ge50 += 1
+
+        rdr = morpho.get('relative_disc_ratio')
+        if rdr is not None and rdr < 0.65: rel_disc_low += 1
+
+    # ── Print summary ──────────────────────────────────────────────────────────
+    sep = '=' * 60
+    logger.info(f"\n{sep}")
+    logger.info(f"{'LSTV DETECTION SUMMARY':^60}")
+    logger.info(f"{sep}")
+
+    logger.info(f"Studies processed:        {len(results)}")
+    logger.info(f"LSTV detected:            {lstv_n}  ({100*lstv_n/n:.1f}%)")
+    logger.info(f"  Sacralization:          {phenotype_counts.get('sacralization',0)}")
+    logger.info(f"  Lumbarization:          {phenotype_counts.get('lumbarization',0)}")
+    n_trans = phenotype_counts.get('transitional_indeterminate', 0)
+    logger.info(f"  Transitional:           {n_trans}"
+                + ("  [NOTE: Castellvi and Transitional phenotype are orthogonal —"
+                   " Castellvi alone meets sacralization threshold via sac_score≥4]"
+                   if n_trans == 0 and sum(castellvi_counts.values()) > 0 else ""))
+    logger.info(f"  Normal:                 {phenotype_counts.get('normal',0)}")
+    logger.info(f"Errors:                   {errors}")
+    logger.info(f"TP concordance fixes:     {tp_correction_count}")
+
+    logger.info(f"\n── Castellvi Type Breakdown ──────────────────────────────")
+    for t, cnt in castellvi_counts.items():
+        if cnt: logger.info(f"  {t:12s}: {cnt}")
+    total_ct = sum(castellvi_counts.values())
+    logger.info(f"  {'TOTAL':12s}: {total_ct}  ({100*total_ct/n:.1f}%)")
+
+    logger.info(f"\n── Probability Model Statistics ──────────────────────────")
+    if p_sac_vals:
+        arr_s = [v for v in p_sac_vals if v > 0]
+        arr_l = [v for v in p_lumb_vals if v > 0]
+        logger.info(f"  P(sacralization):  mean={float(np.mean(p_sac_vals)):.2%}  "
+                    f"median={float(np.median(p_sac_vals)):.2%}  "
+                    f">80%: {high_cert_sac} studies")
+        logger.info(f"  P(lumbarization):  mean={float(np.mean(p_lumb_vals)):.2%}  "
+                    f"median={float(np.median(p_lumb_vals)):.2%}  "
+                    f">80%: {high_cert_lumb} studies")
+        logger.info(f"  Relative disc ratio < 0.65 (Farshad-Amacker):  {rel_disc_low} studies")
+
+    logger.info(f"\n── Surgical Risk Distribution ────────────────────────────")
+    for risk_lvl in ('critical', 'high', 'moderate', 'low-moderate', 'low'):
+        cnt = wl_risk_counts.get(risk_lvl, 0)
+        if cnt: logger.info(f"  {risk_lvl:14s}: {cnt} studies  ({100*cnt/n:.1f}%)")
+    logger.info(f"  Nerve root ambiguity:   {nerve_ambig} studies")
+    logger.info(f"  Bertolotti P≥50%:       {bertolotti_ge50} studies")
+
+    logger.info(f"\n── Top-10 Pathology Scores ───────────────────────────────")
     for sid, sc in scores[:10]:
         r_match = next((r for r in results if r['study_id'] == sid), {})
-        ph  = (r_match.get('lstv_morphometrics') or {}).get('lstv_phenotype', '?')
-        ct  = r_match.get('castellvi_type', 'None')
-        fix = ' [TP-FIXED]' if r_match.get('details', {}).get('tp_concordance_corrected') else ''
-        logger.info(f"  {sid}: score={sc:.1f}  phenotype={ph}  castellvi={ct}{fix}")
+        morpho  = r_match.get('lstv_morphometrics') or {}
+        probs   = morpho.get('probabilities') or {}
+        sr      = morpho.get('surgical_relevance') or {}
+        ph      = morpho.get('lstv_phenotype', '?')
+        ct      = r_match.get('castellvi_type', 'None')
+        fix     = ' [TP-FIXED]' if r_match.get('details', {}).get('tp_concordance_corrected') else ''
+        ps      = probs.get('p_sacralization', 0)
+        pl      = probs.get('p_lumbarization', 0)
+        wl      = sr.get('wrong_level_risk', '?')
+        bp      = sr.get('bertolotti_probability', 0)
+        sr_fb   = ' [SR-fallback]' if sr.get('calibration_note', '').startswith('fallback') else ''
+        rdr     = morpho.get('relative_disc_ratio')
+        rdr_str = f'  disc_ratio={rdr:.2f}' if rdr is not None else ''
+        logger.info(
+            f"  {sid}: score={sc:.1f}  {ph}  castellvi={ct}  "
+            f"P(sac)={ps:.0%}  P(lumb)={pl:.0%}  "
+            f"surgical_risk={wl}  bertolotti={bp:.0%}"
+            f"{rdr_str}{fix}{sr_fb}"
+        )
 
+    logger.info(f"\n{sep}")
+
+    # ── Write results ──────────────────────────────────────────────────────────
     out_json = output_dir / 'lstv_results.json'
     with open(out_json, 'w') as fh:
         json.dump(results, fh, indent=2, default=str)
 
     summary = {
-        'total':                  len(results),
-        'lstv_detected':          lstv_n,
-        'lstv_rate':              round(lstv_n / max(len(results), 1), 4),
-        'errors':                 errors,
-        'tp_concordance_fixes':   tp_correction_count,
-        'castellvi_breakdown':    castellvi_counts,
-        'phenotype_breakdown':    phenotype_counts,
-        'top_scores':             scores[:20],
+        'total':                        len(results),
+        'lstv_detected':                lstv_n,
+        'lstv_rate':                    round(lstv_n / n, 4),
+        'errors':                       errors,
+        'tp_concordance_fixes':         tp_correction_count,
+        'castellvi_breakdown':          castellvi_counts,
+        'phenotype_breakdown':          phenotype_counts,
+        # v4 additions
+        'probability_stats': {
+            'mean_p_sacralization':     round(float(np.mean(p_sac_vals)), 4) if p_sac_vals else None,
+            'mean_p_lumbarization':     round(float(np.mean(p_lumb_vals)), 4) if p_lumb_vals else None,
+            'high_confidence_sac':      high_cert_sac,
+            'high_confidence_lumb':     high_cert_lumb,
+            'relative_disc_ratio_low':  rel_disc_low,
+        },
+        'surgical_risk_breakdown':      wl_risk_counts,
+        'nerve_root_ambiguity_count':   nerve_ambig,
+        'bertolotti_probability_ge50':  bertolotti_ge50,
+        'top_scores':                   scores[:20],
     }
     with open(output_dir / 'lstv_summary.json', 'w') as fh:
         json.dump(summary, fh, indent=2, default=str)
 
-    logger.info(f"\nResults → {out_json}")
+    logger.info(f"Results → {out_json}")
     return 0
 
 

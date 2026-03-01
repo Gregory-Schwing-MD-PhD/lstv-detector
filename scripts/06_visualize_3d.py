@@ -558,16 +558,62 @@ def build_metrics_panel(result: dict) -> str:
     lft          = result.get('left')   or {}
     rgt          = result.get('right')  or {}
     lstv_reasons = result.get('lstv_reason', [])
+    # v4 fields
+    probs        = morpho.get('probabilities') or {}
+    rad_ev       = morpho.get('radiologic_evidence') or []
+    surg         = morpho.get('surgical_relevance') or {}
+    rdr          = morpho.get('relative_disc_ratio')
+    rdr_note     = morpho.get('relative_disc_note', '')
+    grad_note    = tv_shape.get('gradient_note', '')
+    caudal_grad  = tv_shape.get('caudal_gradient')
 
     cfg   = PHENOTYPE_CONFIG.get(phenotype, PHENOTYPE_CONFIG['normal'])
     p_col = cfg['color']; p_bg = cfg['bg']; p_bdr = cfg['border']
     p_lbl = cfg['label']; p_emj = cfg['emoji']
 
     def sect(t): return f'<div class="ps">{t}</div>'
-    def row(k, v, cls='ok'):
+    def row(k, v, cls=''):
+        cls_attr = f' {cls}' if cls else ''
         return (f'<div class="pr"><span class="pk">{k}</span>'
-                f'<span class="pv {cls}">{v}</span></div>')
+                f'<span class="pv{cls_attr}">{v}</span></div>')
     def crit(txt): return f'<div class="pc">• {txt}</div>'
+
+    def prob_bar(label, pct, color, width_cap=100):
+        """Render a labelled probability bar."""
+        w = min(pct, width_cap)
+        return (
+            f'<div class="pb-row">'
+            f'<span class="pb-label">{label}</span>'
+            f'<div class="pb-track"><div class="pb-fill" style="width:{w:.0f}%;background:{color}"></div></div>'
+            f'<span class="pb-val">{pct:.0f}%</span>'
+            f'</div>'
+        )
+
+    def risk_chip(level):
+        colours = {
+            'critical':     ('#ff2222', '#3a0000'),
+            'high':         ('#ff6633', '#2a1000'),
+            'moderate':     ('#ff8800', '#1e1000'),
+            'low-moderate': ('#ffe033', '#1a1800'),
+            'low':          ('#2dc653', '#001a06'),
+        }
+        fg, bg = colours.get(level, ('#aaaaaa', '#111'))
+        return (f'<span class="risk-chip" style="color:{fg};background:{bg};'
+                f'border-color:{fg}">{level.upper()}</span>')
+
+    def strength_tag(s):
+        s = (s or '').lower()
+        if s == 'primary':   return '<span class="ev-tag ev-primary">PRIMARY</span>'
+        if s == 'secondary': return '<span class="ev-tag ev-secondary">2°</span>'
+        if s == 'against':   return '<span class="ev-tag ev-against">AGAINST</span>'
+        return '<span class="ev-tag ev-support">SUPPORT</span>'
+
+    def dir_col(d):
+        d = (d or '').lower()
+        if 'sacral' in d:  return '#ff6633'
+        if 'lumbar' in d:  return '#ffaa33'
+        if 'normal' in d:  return '#2dc653'
+        return '#aaaacc'
 
     lines = []
 
@@ -581,11 +627,86 @@ def build_metrics_panel(result: dict) -> str:
         f'Confidence: {confidence.upper() if confidence else "—"}</div>'
     )
 
+    # ── Bayesian probability model ─────────────────────────────────────────────
+    p_sac  = probs.get('p_sacralization', 0) * 100 if probs.get('p_sacralization', 0) <= 1 else probs.get('p_sacralization', 0)
+    p_lumb = probs.get('p_lumbarization', 0) * 100 if probs.get('p_lumbarization', 0) <= 1 else probs.get('p_lumbarization', 0)
+    p_norm = probs.get('p_normal', 0) * 100        if probs.get('p_normal', 0) <= 1        else probs.get('p_normal', 0)
+    p_trans= probs.get('p_transitional', 0) * 100  if probs.get('p_transitional', 0) <= 1  else probs.get('p_transitional', 0)
+    dom    = probs.get('dominant_class', '—')
+    conf_p = probs.get('confidence_pct', 0)
+    n_crit = probs.get('n_criteria', 0)
+    cal_n  = probs.get('calibration_note', '')
+
+    if probs:
+        lines.append(sect('Bayesian Probability Model'))
+        lines.append(prob_bar('Sacralization', p_sac,  '#ff4444'))
+        lines.append(prob_bar('Lumbarization', p_lumb, '#ff8c00'))
+        lines.append(prob_bar('Normal',        p_norm, '#2dc653'))
+        if p_trans > 1:
+            lines.append(prob_bar('Transitional', p_trans, '#ffe033'))
+        dom_cls = 'cr' if dom == 'sacralization' else 'wn' if dom == 'lumbarization' else 'ok'
+        lines.append(row('Dominant class', dom, dom_cls))
+        lines.append(row('Confidence', f'{conf_p:.0f}%', 'cr' if conf_p > 85 else 'wn' if conf_p > 65 else 'ok'))
+        lines.append(row('Criteria contributing', str(n_crit), ''))
+        if cal_n:
+            lines.append(f'<div class="pc" style="color:#5566aa;font-style:italic">{cal_n}</div>')
+
     # ── Clinical narrative ─────────────────────────────────────────────────────
     narrative_html = _generate_clinical_narrative(result, morpho)
     if narrative_html:
         lines.append(sect('Clinical Summary'))
         lines.append(narrative_html)
+
+    # ── Surgical relevance ─────────────────────────────────────────────────────
+    if surg:
+        wl_risk     = surg.get('wrong_level_risk', '')
+        wl_pct      = surg.get('wrong_level_risk_pct', 0) * 100 if (surg.get('wrong_level_risk_pct', 0) or 0) <= 1 else (surg.get('wrong_level_risk_pct', 0) or 0)
+        bert        = surg.get('bertolotti_probability', 0)
+        bert_pct    = bert * 100 if bert <= 1 else bert
+        nerve_amb   = surg.get('nerve_root_ambiguity', False)
+        flags       = surg.get('surgical_flags') or []
+        approach    = surg.get('approach_considerations') or []
+        count_rec   = surg.get('recommended_counting_method', '')
+        ionm_note   = surg.get('intraop_neuromonitoring_note', '')
+        level_proto = surg.get('level_identification_protocol') or []
+
+        lines.append(sect('⚕ Surgical Relevance'))
+
+        # Wrong-level risk
+        lines.append(
+            f'<div class="pr"><span class="pk">Wrong-level risk</span>'
+            f'<span class="pv">{risk_chip(wl_risk)}</span></div>'
+        )
+        if wl_pct:
+            lines.append(prob_bar('Level-error probability', wl_pct, '#ff3333'))
+        lines.append(row('Nerve root ambiguity',
+                         '⚠ YES — dermatomal naming discrepant' if nerve_amb else 'No',
+                         'wn' if nerve_amb else 'ok'))
+        lines.append(prob_bar("Bertolotti's syndrome P", bert_pct,
+                               '#ff6633' if bert_pct >= 50 else '#ff8800'))
+
+        if flags:
+            lines.append(f'<div class="ps" style="margin-top:4px">Intraoperative Flags</div>')
+            for f in flags:
+                lines.append(f'<div class="surg-flag">⚠ {f}</div>')
+
+        if count_rec:
+            lines.append(f'<div class="ps" style="margin-top:4px">Counting Protocol</div>')
+            lines.append(f'<div class="surg-note">{count_rec}</div>')
+
+        if approach:
+            lines.append(f'<div class="ps" style="margin-top:4px">Approach Considerations</div>')
+            for a in approach:
+                lines.append(f'<div class="surg-note">• {a}</div>')
+
+        if ionm_note:
+            lines.append(f'<div class="ps" style="margin-top:4px">Neuromonitoring</div>')
+            lines.append(f'<div class="surg-note">{ionm_note}</div>')
+
+        if level_proto:
+            lines.append(f'<div class="ps" style="margin-top:4px">Level ID Protocol</div>')
+            for i, step in enumerate(level_proto, 1):
+                lines.append(f'<div class="surg-step"><span class="surg-step-n">{i}</span>{step}</div>')
 
     # ── LSTV detection basis ───────────────────────────────────────────────────
     lines.append(sect('LSTV Detection Basis'))
@@ -602,6 +723,46 @@ def build_metrics_panel(result: dict) -> str:
     lines.append(sect('Pathology Burden'))
     sc_cls = 'cr' if score >= 8 else 'wn' if score >= 3 else 'ok'
     lines.append(row('Score', f'{score:.0f}', sc_cls))
+
+    # ── Radiologic evidence (v4) ───────────────────────────────────────────────
+    if rad_ev:
+        lines.append(sect('Radiologic Evidence'))
+        lines.append('<div class="ev-table">')
+        # Group by direction for visual clarity
+        for group_dir, group_label in [
+            ('sacralization', 'Sacralization criteria'),
+            ('lumbarization', 'Lumbarization criteria'),
+            ('normal',        'Against LSTV'),
+            ('supporting',    'Supporting / ancillary'),
+        ]:
+            group_items = [e for e in rad_ev if (e.get('direction') or '').lower() == group_dir]
+            if not group_items:
+                continue
+            col = dir_col(group_dir)
+            lines.append(f'<div class="ev-group-hdr" style="color:{col}">{group_label}</div>')
+            for ev in group_items:
+                name     = ev.get('name', '')
+                finding  = ev.get('finding', '')
+                strength = ev.get('strength', '')
+                citation = ev.get('citation', '')
+                lr_sac   = ev.get('lr_sac', 0) or 0
+                lr_lumb  = ev.get('lr_lumb', 0) or 0
+                lr_str   = ''
+                if lr_sac:
+                    lr_str += f' LR(sac)={lr_sac:+.1f}'
+                if lr_lumb:
+                    lr_str += f' LR(lum)={lr_lumb:+.1f}'
+                lines.append(
+                    f'<div class="ev-row">'
+                    f'{strength_tag(strength)}'
+                    f'<div class="ev-body">'
+                    f'<div class="ev-name">{name}</div>'
+                    f'<div class="ev-finding">{finding}</div>'
+                    f'<div class="ev-meta">{citation}{lr_str}</div>'
+                    f'</div>'
+                    f'</div>'
+                )
+        lines.append('</div>')
 
     # ── Castellvi ─────────────────────────────────────────────────────────────
     lines.append(sect('Castellvi Classification (TP Morphology)'))
@@ -652,6 +813,11 @@ def build_metrics_panel(result: dict) -> str:
         lines.append(row('TV/L4 H:AP ratio',
                          f'{nr:.2f}  {"↓ squarer than L4" if nr < 0.90 else "similar to L4"}',
                          'wn' if nr < 0.80 else 'ok'))
+    if caudal_grad is not None:
+        g_cls = 'cr' if caudal_grad < -0.04 else 'wn' if caudal_grad < 0 else 'ok'
+        lines.append(row('H/AP caudal gradient', f'{caudal_grad:+.3f}/level', g_cls))
+    if grad_note:
+        lines.append(f'<div class="pc">{grad_note}</div>')
 
     # ── Adjacent disc heights ──────────────────────────────────────────────────
     lines.append(sect('Adjacent Disc Heights — DHI (Farfan 1972)'))
@@ -665,6 +831,13 @@ def build_metrics_panel(result: dict) -> str:
             lines.append(row(f'{label} ({lvl})', 'ABSENT — possible fusion', 'cr'))
         else:
             lines.append(row(f'{label} ({lvl})', 'Not detected', 'pm'))
+    # Relative disc ratio (v4)
+    if rdr is not None:
+        rdr_cls = 'cr' if rdr < 0.50 else 'wn' if rdr < 0.65 else 'ok'
+        lines.append(row('Relative disc ratio', f'{rdr:.2f}  (Farshad-Amacker 2014)', rdr_cls))
+        lines.append(row('  threshold', '&lt;0.65 = disproportionate narrowing', 'pm'))
+    if rdr_note:
+        lines.append(f'<div class="pc">{rdr_note}</div>')
 
     # ── Rib anomaly ────────────────────────────────────────────────────────────
     lines.append(sect('Rib / Thoracic Count'))
@@ -686,9 +859,9 @@ def build_metrics_panel(result: dict) -> str:
         for p in primary:
             lines.append(f'<div class="pc">✓ {p}</div>')
 
-    # ── Evidence ───────────────────────────────────────────────────────────────
+    # ── Legacy classification evidence ────────────────────────────────────────
     if criteria:
-        lines.append(sect('Classification Evidence'))
+        lines.append(sect('Classification Evidence (legacy)'))
         for c in criteria[:7]:
             lines.append(crit(c))
         if len(criteria) > 7:
@@ -991,11 +1164,44 @@ button.on-focus{{background:#ff8c00;border-color:#ff8c00;color:#000;font-weight:
 .main-row{{display:flex;flex:1;min-height:0;overflow:hidden}}
 #pl{{flex:1;min-width:0;min-height:0;overflow:hidden}}
 #pl .js-plotly-plot,#pl .plot-container{{height:100%!important}}
-#mp{{width:290px;flex-shrink:0;background:rgba(10,10,24,0.96);
+#mp{{width:340px;flex-shrink:0;background:rgba(10,10,24,0.96);
      border-left:1px solid var(--bd);overflow-y:auto;overflow-x:hidden;
      padding:0 0 16px 0;scrollbar-width:thin;scrollbar-color:#222244 var(--bg)}}
 #mp::-webkit-scrollbar{{width:4px}}
 #mp::-webkit-scrollbar-thumb{{background:#222244;border-radius:2px}}
+/* probability bars */
+.pb-row{{display:flex;align-items:center;gap:5px;padding:2px 10px}}
+.pb-label{{color:#8899bb;font-size:.63rem;width:76px;flex-shrink:0;text-align:right}}
+.pb-track{{flex:1;height:6px;background:#111130;border-radius:3px;overflow:hidden}}
+.pb-fill{{height:100%;border-radius:3px;transition:width .3s}}
+.pb-val{{color:var(--tx);font-size:.66rem;font-weight:600;width:30px;text-align:right}}
+/* risk chip */
+.risk-chip{{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.66rem;
+            font-weight:700;border:1px solid;letter-spacing:.03em}}
+/* evidence table */
+.ev-table{{padding:2px 8px}}
+.ev-group-hdr{{font-size:.60rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+               padding:4px 2px 1px;margin-top:4px;border-bottom:1px solid #161630}}
+.ev-row{{display:flex;align-items:flex-start;gap:5px;padding:3px 2px;
+         border-bottom:1px solid #0d0d22}}
+.ev-tag{{flex-shrink:0;font-size:.55rem;font-weight:700;padding:1px 4px;border-radius:2px;
+         letter-spacing:.04em;margin-top:1px}}
+.ev-primary  {{background:#3a1000;color:#ff6633;border:1px solid #ff4400}}
+.ev-secondary{{background:#2a1a00;color:#ff9900;border:1px solid #aa6600}}
+.ev-against  {{background:#001a00;color:#44cc66;border:1px solid #226622}}
+.ev-support  {{background:#1a1a3a;color:#8899cc;border:1px solid #334488}}
+.ev-body{{flex:1;min-width:0}}
+.ev-name{{color:#ccd4e8;font-size:.66rem;font-weight:600;line-height:1.3}}
+.ev-finding{{color:#8899aa;font-size:.62rem;line-height:1.4;margin-top:1px}}
+.ev-meta{{color:#445566;font-size:.58rem;margin-top:1px;font-style:italic}}
+/* surgical flags */
+.surg-flag{{padding:3px 10px;color:#ffbb44;font-size:.63rem;line-height:1.5;
+            border-left:2px solid #ff6633;margin:1px 8px;background:rgba(40,20,0,.3)}}
+.surg-note{{padding:3px 10px;color:#99aacc;font-size:.63rem;line-height:1.55;margin:1px 0}}
+.surg-step{{display:flex;gap:6px;align-items:flex-start;padding:2px 10px;font-size:.63rem;
+            color:#aabbcc;line-height:1.5}}
+.surg-step-n{{flex-shrink:0;background:#222255;color:#6677bb;font-weight:700;
+              padding:0 4px;border-radius:2px;font-size:.60rem;margin-top:1px}}
 .pstatus{{text-align:center;font-family:'Syne',sans-serif;font-size:.92rem;font-weight:800;
   letter-spacing:.05em;text-transform:uppercase;padding:10px 12px;margin-bottom:2px}}
 .pconf{{text-align:center;font-size:.66rem;font-weight:600;padding:2px 12px 6px;opacity:.88}}
@@ -1030,6 +1236,8 @@ button.on-focus{{background:#ff8c00;border-color:#ff8c00;color:#000;font-weight:
   {tp_corrected_badge}
   {lstv_badge}
   <span class="b bsc">Score: {score:.0f}</span>
+  {surgical_risk_badge}
+  {prob_badge}
   <div class="tb">
     <span>View</span>
     <button onclick="setFocused()" id="b-focused" class="on-focus">🎯 Focused</button>
@@ -1050,6 +1258,9 @@ button.on-focus{{background:#ff8c00;border-color:#ff8c00;color:#000;font-weight:
   <div class="m">Gap-R <span class="v {gr_c}">{gap_R}</span></div>
   <div class="m">H/AP <span class="v {hap_c}">{hap_disp}</span></div>
   <div class="m">DHI-below <span class="v {dhi_c}">{dhi_disp}</span></div>
+  <div class="m">P(sac) <span class="v {psac_c}">{psac_disp}</span></div>
+  <div class="m">P(lumb) <span class="v {plumb_c}">{plumb_disp}</span></div>
+  <div class="m">WL-risk <span class="v {risk_c}">{risk_disp}</span></div>
   <span class="note">drag=rotate · scroll=zoom · click legend=toggle</span>
 </div>
 <div class="lg">
@@ -1159,6 +1370,45 @@ def save_html(fig, study_id: str, output_dir: Path,
     dhi_disp      = f'{dhi_b:.0f}%' if dhi_b else 'N/A'
     tv_col        = status_cfg['color']
 
+    # v4 probability + surgical risk
+    probs  = morpho.get('probabilities') or {}
+    surg   = morpho.get('surgical_relevance') or {}
+    _n = lambda x: (x * 100 if x <= 1 else x) if x is not None else 0
+
+    p_sac_v  = _n(probs.get('p_sacralization'))
+    p_lumb_v = _n(probs.get('p_lumbarization'))
+    wl_risk  = surg.get('wrong_level_risk', '')
+
+    psac_c   = 'cr' if p_sac_v > 70 else 'wn' if p_sac_v > 40 else 'ok'
+    plumb_c  = 'cr' if p_lumb_v > 70 else 'wn' if p_lumb_v > 40 else 'ok'
+    risk_c   = ('cr' if wl_risk in ('critical', 'high')
+                else 'wn' if wl_risk == 'moderate' else 'ok')
+    psac_disp  = f'{p_sac_v:.0f}%' if probs else 'N/A'
+    plumb_disp = f'{p_lumb_v:.0f}%' if probs else 'N/A'
+    risk_disp  = wl_risk.upper() if wl_risk else 'N/A'
+
+    _risk_bg = {
+        'critical':     ('#3a0000', '#ff2222'),
+        'high':         ('#2a1000', '#ff6633'),
+        'moderate':     ('#1e1000', '#ff8800'),
+        'low-moderate': ('#1a1800', '#ffe033'),
+        'low':          ('#001a06', '#2dc653'),
+    }
+    surg_rbg, surg_rfg = _risk_bg.get(wl_risk, ('#111', '#aaaaaa'))
+    surgical_risk_badge = (
+        f'<span class="b" style="background:{surg_rbg};color:{surg_rfg};'
+        f'border:1px solid {surg_rfg}">⚕ WL-risk: {wl_risk.upper()}</span>'
+    ) if wl_risk else ''
+
+    dom_class = probs.get('dominant_class', '')
+    conf_pct  = _n(probs.get('confidence_pct'))
+    _dom_fg   = {'sacralization': '#ff6633', 'lumbarization': '#ffaa33',
+                 'normal': '#2dc653'}.get(dom_class, '#aaaacc')
+    prob_badge = (
+        f'<span class="b" style="background:#0d0d22;color:{_dom_fg};border:1px solid {_dom_fg}">'
+        f'P({dom_class[:3]})={conf_pct:.0f}%</span>'
+    ) if dom_class else ''
+
     html = _HTML_TEMPLATE.format(
         study_id          = study_id,
         status_label      = status_cfg['label'],
@@ -1181,6 +1431,11 @@ def save_html(fig, study_id: str, output_dir: Path,
         hap_disp=hap_disp, hap_c=hap_c,
         dhi_disp=dhi_disp, dhi_c=dhi_c,
         tv_col=tv_col,
+        psac_disp=psac_disp,   psac_c=psac_c,
+        plumb_disp=plumb_disp, plumb_c=plumb_c,
+        risk_disp=risk_disp,   risk_c=risk_c,
+        surgical_risk_badge=surgical_risk_badge,
+        prob_badge=prob_badge,
         metrics_panel     = build_metrics_panel(result),
         plotly_div        = plotly_div,
         focused_vis_json  = focused_vis_json,
