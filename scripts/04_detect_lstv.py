@@ -564,6 +564,116 @@ def phase1_sagittal(side: str, tp_label: int,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# L6 VERIFICATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# TSS disc label range (sagittal_labeled.nii.gz).  Labels 91–100 are IVDs
+# counted cranio-caudally; 100 is the most caudal (L5-S1 in a 5-lumbar spine,
+# L6-S1 in lumbarization).  We don't hardcode which number is which disc —
+# instead we look for disc labels that are spatially above or below the
+# candidate L6 body.
+TSS_DISC_LABELS = set(range(91, 101))
+
+
+def _verify_l6(sag_vert:  np.ndarray,
+               sag_tss:   Optional[np.ndarray],
+               vox_mm:    np.ndarray,
+               tv_z:      Tuple[int, int],
+               study_id:  str) -> Tuple[bool, str]:
+    """
+    Confirm that VERIDAH's L6 label is a genuine extra lumbar vertebra.
+
+    Three checks (all must pass):
+
+    Check 1 — Positional sanity:
+        VERIDAH L6 centroid Z must lie BELOW TSS L5 inferior edge AND
+        ABOVE TSS sacrum superior edge.  A sacrum mislabeled as L6 will
+        have its centroid inside or overlapping the TSS sacrum.
+
+    Check 2 — Disc ABOVE L6 (L5-L6 disc space):
+        At least one TSS disc label (91-100) must have its centroid Z
+        clearly above the VERIDAH L6 superior edge.  Confirms a real disc
+        exists between L5 and L6.
+
+    Check 3 — Disc BELOW L6 (L6-S1 disc space):
+        At least one TSS disc label must have its centroid Z clearly below
+        the VERIDAH L6 inferior edge AND above the TSS sacrum superior edge.
+        Confirms the lumbosacral disc is at L6-S1, not L5-S1.
+
+    Returns (verified: bool, reason: str)
+    """
+    if sag_tss is None:
+        return False, "no TSS available — cannot verify L6"
+
+    l6_z_min, l6_z_max = tv_z
+    l6_centroid_z = (l6_z_min + l6_z_max) / 2.0
+
+    # ── Check 1: positional sanity ─────────────────────────────────────────────
+    tss_l5   = (sag_tss == 45)
+    tss_sac  = (sag_tss == TSS_SACRUM)
+
+    if not tss_sac.any():
+        return False, "TSS sacrum (label 50) absent — cannot verify L6 position"
+
+    sac_z_sup = float(np.where(tss_sac)[2].max())   # superior edge of sacrum
+
+    # L6 centroid must be above the sacrum
+    if l6_centroid_z <= sac_z_sup:
+        return False, (
+            f"L6 centroid z={l6_centroid_z:.0f} ≤ TSS sacrum superior z={sac_z_sup:.0f} "
+            f"— VERIDAH L6 is inside the sacrum (mislabeled sacrum)"
+        )
+
+    # L6 must be inferior to TSS L5
+    if tss_l5.any():
+        l5_z_min = float(np.where(tss_l5)[2].min())
+        if l6_centroid_z >= l5_z_min:
+            return False, (
+                f"L6 centroid z={l6_centroid_z:.0f} ≥ TSS L5 inferior z={l5_z_min:.0f} "
+                f"— VERIDAH L6 overlaps TSS L5 (not a distinct inferior segment)"
+            )
+
+    # ── Check 2 & 3: discs above and below L6 ─────────────────────────────────
+    disc_above_z: Optional[float] = None   # centroid Z of a disc above L6
+    disc_below_z: Optional[float] = None   # centroid Z of a disc below L6
+
+    for disc_lbl in TSS_DISC_LABELS:
+        disc_mask = (sag_tss == disc_lbl)
+        if not disc_mask.any():
+            continue
+        disc_zc = float(np.mean(np.where(disc_mask)[2]))
+
+        # Disc clearly above L6 superior edge (allow 2-vox slop for partial vol)
+        if disc_zc > l6_z_max + 2:
+            if disc_above_z is None or disc_zc < disc_above_z:
+                disc_above_z = disc_zc   # take the closest disc above
+
+        # Disc clearly below L6 inferior edge, but still above sacrum
+        if disc_zc < l6_z_min - 2 and disc_zc > sac_z_sup:
+            if disc_below_z is None or disc_zc > disc_below_z:
+                disc_below_z = disc_zc   # take the closest disc below
+
+    if disc_above_z is None:
+        return False, (
+            f"no TSS disc found above VERIDAH L6 (L6 z=[{l6_z_min},{l6_z_max}]) — "
+            f"no L5-L6 disc space present"
+        )
+
+    if disc_below_z is None:
+        return False, (
+            f"no TSS disc found between VERIDAH L6 inferior (z={l6_z_min}) and "
+            f"TSS sacrum superior (z={sac_z_sup:.0f}) — no L6-S1 disc space present"
+        )
+
+    return True, (
+        f"positional OK (centroid z={l6_centroid_z:.0f}, "
+        f"sac_sup={sac_z_sup:.0f}), "
+        f"disc above z={disc_above_z:.0f}, "
+        f"disc below z={disc_below_z:.0f}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PER-STUDY CLASSIFIER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -686,6 +796,37 @@ def classify_study(study_id:       str,
     if tv_z is None:
         out['errors'].append(f'TV label {tv_name} empty in VERIDAH mask'); return out
 
+    # ── L6 verification (lumbarization cases) ─────────────────────────────────
+    # SPINEPS sometimes mislabels the sacrum as L6. VERIDAH then finds "L6"
+    # whose Z range is in the sacrum. Isolating TPs at that Z range finds no
+    # real costal process voxels and falls through to L4's TPs, producing a
+    # spurious L4-TP→sacrum Castellvi measurement.
+    #
+    # Verification requires ALL THREE of the following to pass:
+    #   1. VERIDAH L6 centroid sits between TSS sacrum superior and TSS L5 inferior
+    #      (positional sanity — a sacrum mislabeled as L6 fails immediately)
+    #   2. A TSS disc exists ABOVE VERIDAH L6 (L5-L6 disc space)
+    #   3. A TSS disc exists BELOW VERIDAH L6 (L6-S1 disc space)
+    # If any check fails, demote to VERIDAH L5 as the TV.
+    l6_verified = False
+    if tv_label == VD_L6:
+        l6_ok, l6_reason = _verify_l6(sag_vert, sag_tss, vox_mm, tv_z, study_id)
+        l6_verified = l6_ok
+        if not l6_ok:
+            logger.warning(
+                f"  [{study_id}] VERIDAH L6 FAILED verification: {l6_reason} "
+                f"— demoting TV to L5 to prevent L4-TP measurement"
+            )
+            if VD_L5 in vert_unique:
+                tv_label = VD_L5
+                tv_name  = VERIDAH_NAMES[VD_L5]
+                tv_z     = get_tv_z_range(sag_vert, VD_L5) or tv_z
+            else:
+                out['errors'].append('L6 verification failed and no VERIDAH L5 fallback')
+                return out
+        else:
+            logger.info(f"  [{study_id}] VERIDAH L6 verified ✓ — {l6_reason}")
+
     # ── TP concordance validation ───────────────────────────────────────────────
     # Build sacrum mask for use in concordance check and throughout Phase 1
     tss_sac_mask = (sag_tss == TSS_SACRUM) if sag_tss is not None else None
@@ -700,6 +841,7 @@ def classify_study(study_id:       str,
         'tv_label':                   tv_label,
         'tv_name':                    tv_name,
         'has_l6':                     tv_label == VD_L6,
+        'l6_verified':                l6_verified if tv_label == VD_L6 else None,
         'tv_z_range':                 list(tv_z),
         'tp_concordance_corrected':   tp_corrected,
         'corrected_tv_z_range':       list(tv_z_final) if tp_corrected else None,
