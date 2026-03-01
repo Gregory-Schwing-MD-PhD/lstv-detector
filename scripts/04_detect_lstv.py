@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 """
-04_detect_lstv.py — Hybrid Two-Phase LSTV Castellvi Classifier
-===============================================================
+04_detect_lstv.py — Hybrid Two-Phase LSTV Castellvi Classifier (v5)
+======================================================================
 Classifies Lumbosacral Transitional Vertebrae (LSTV) using the Castellvi
 system, then calls lstv_engine.py for radiologically-grounded phenotype
 classification (lumbarization / sacralization / transitional_indeterminate).
 
-CRITICAL DESIGN PRINCIPLE
---------------------------
-Castellvi classification and phenotype classification are ORTHOGONAL.
-A study may simultaneously have:
-  • Castellvi IIb (bilateral pseudo-articulation of L5/L6 TP with sacrum)
-  • Phenotype: lumbarization (6-lumbar count, L6 segment identified)
-A sacralizing L5 may have Castellvi I-IV AND sacralization phenotype.
-Neither classification suppresses the other.
+WHAT'S NEW IN v5
+-----------------
+Integrates lumbosacral vertebral angle measurements from:
+  Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280.
+  doi: 10.22038/ABJS.2025.83244.3790
 
-LSTV DETECTION FLAGS (lstv_detected = True when ANY of the following):
-  • Castellvi Type I-IV detected (TP morphology)
-  • Lumbar count ≠ 5 (4 → sacralization, 6 → lumbarization)
-  • Phenotype = sacralization or lumbarization (confirmed by morphometrics)
+Five sagittal angles are now computed from segmentation masks:
+
+  A-angle  : sacral superior surface vs scan vertical (Chalian 2012)
+  B-angle  : L3 superior endplate vs sacral superior surface (Chalian 2012)
+  C-angle  : largest posterior-body-line angle across TV±1 levels (novel)
+  D-angle  : superior surfaces of most cranial sacrum vs most caudal lumbar
+  delta    : D - D1  (D-angle minus angle of TV to TV-1)
+
+KEY THRESHOLDS (Seilanian Toosi 2025):
+  delta ≤ 8.5°  → Type 2 LSTV   Sens 92.3%, Spec 87.9%, NPV 99.5%
+  C    ≤ 35.5°  → any LSTV      Sens 72.2%, Spec 57.6%, NPV 91.4%
+  L4-L5 dehydrated + L5-S1 preserved → OR 19.9 for LSTV (p<0.001)
+  Increased A-angle + decreased D-angle = independent predictors (p<0.05)
+
+v5.1 FIXES
+----------
+- validate_tp_concordance now uses TSS L4-L5 disc (label 95) as an UPPER
+  boundary for TP position. A valid L5 TP must sit BELOW the L4-L5 disc
+  and ABOVE the L5-S1 disc / sacrum top. Disc labels are used as propagation
+  anchors (ground-truth).
+- All vertebral angle values are logged for every study (not just flagged ones).
 
 CASTELLVI CLASSIFICATION (Castellvi et al. 1984, Spine 9:31-35)
 -----------------------------------------------------------------
@@ -26,10 +40,8 @@ Type I   : Dysplastic TP ≥ 19 mm craniocaudal height, no sacral contact
            Ia = unilateral; Ib = bilateral
 Type II  : Pseudo-articulation (diarthrodial joint) between TP and sacrum
            IIa = unilateral; IIb = bilateral
-           MRI: heterogeneous / dark T2 signal at junction (fibrocartilage)
 Type III : Complete osseous fusion of TP with sacrum
            IIIa = unilateral; IIIb = bilateral
-           MRI: homogeneous bright T2 signal (marrow continuity)
 Type IV  : Mixed — one side Type II, other side Type III
 
 LABEL REFERENCE — SOURCE DISAMBIGUATION
@@ -46,42 +58,8 @@ SPINEPS seg-vert_msk.nii.gz  (VERIDAH per-vertebra instance labels):
 TotalSpineSeg sagittal_labeled.nii.gz:
   41=L1  42=L2  43=L3  44=L4  45=L5  50=Sacrum
   91-100 = disc labels
-  Preferred sacrum source (label 50) for Phase 1 distance measurement.
-
-TP POSITIONAL VALIDATION
---------------------------
-After isolating both TPs at the TV level, each TP centroid is checked
-against two anatomical boundaries:
-
-  1. TV inferior boundary (tv_z[0] in voxels):
-     A TP centroid should not sit substantially below the TV's own inferior
-     endplate.  If it does, SPINEPS has isolated a fragment from the sacrum
-     or an inferior vertebra rather than the actual TV transverse process.
-     Threshold: TP_BELOW_TV_MM (default 10 mm below TV floor).
-
-  2. Sacrum superior boundary (sac_z_sup in voxels):
-     A TP centroid should not be at or below the sacrum's superior surface.
-     If it is, the "TP" is entirely within the sacrum — definitively wrong.
-     Threshold: TP_INTO_SACRUM_MM (default 5 mm — generous for partial-vol).
-
-Either condition on either side triggers re-isolation using TSS L5
-(preferred) or VERIDAH L5 Z-range as the ground truth, because TSS L5 is
-not susceptible to the L6/sacrum confusion that affects SPINEPS.
-
-WHY BILATERAL COMPARISON FAILS
---------------------------------
-Comparing L vs R TP Z-centroids and flagging large discordance (>25 mm) is
-the wrong signal.  In the common failure mode — L6 overlapping the sacrum,
-causing SPINEPS to label the sacral ala as a costal process on one side —
-both TPs land at similar Z positions (L6 and the ala are only ~10–15 mm
-apart).  Bilateral discordance never triggers even when one TP is clearly in
-the sacrum.  Per-TP boundary checks fire as soon as a TP crosses into sacral
-territory regardless of the other side.
-
-This correction is applied before Phase 1 Castellvi measurement and before
-Phase 2 axial analysis, so the JSON results reflect the corrected geometry.
-The visualiser reads 'tp_concordance_corrected' and 'corrected_tv_z_range'
-directly from the result dict.
+  95  = L4-L5 disc  ← NEW: used as upper boundary for L5 TP
+  100 = L5-S1 disc  ← existing: used as lower boundary / floor
 """
 
 from __future__ import annotations
@@ -107,23 +85,31 @@ from lstv_engine import (
     VERIDAH_NAMES, VERIDAH_TV_SEARCH, EXPECTED_LUMBAR,
 )
 
+# ── Vertebral angle thresholds (Seilanian Toosi et al. 2025) ──────────────────
+DELTA_ANGLE_TYPE2_THRESHOLD = 8.5
+C_ANGLE_LSTV_THRESHOLD      = 35.5
+A_ANGLE_NORMAL_MEDIAN       = 41.0
+D_ANGLE_NORMAL_MEDIAN       = 13.5
+
+# ── TSS disc labels used as propagation anchors ───────────────────────────────
+TSS_DISC_L4L5 = 95    # L4-L5 disc — upper boundary for L5 TP
+TSS_DISC_L5S1 = 100   # L5-S1 disc — lower boundary / floor
+
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s  %(levelname)-7s  %(message)s')
 logger = logging.getLogger(__name__)
 
 # ── Phase 2 signal thresholds ─────────────────────────────────────────────────
 BBOX_HALF          = 16
-P2_DARK_CLEFT_FRAC = 0.55    # mean < 55% of p95 → dark cleft → Type II
-P2_MIN_STD_RATIO   = 0.12    # CV < 0.12 → uniform bridge → Type III
+P2_DARK_CLEFT_FRAC = 0.55
+P2_MIN_STD_RATIO   = 0.12
 
 # ── Cross-validation thresholds ───────────────────────────────────────────────
 XVAL_MIN_DICE      = 0.30
 XVAL_MAX_CENTROID  = 20.0   # mm
 
 # ── TP sacrum-overlap threshold ───────────────────────────────────────────────
-# Minimum fraction of a TP's voxels that must overlap the TSS sacrum mask
-# before the TP is considered displaced (generous for partial-volume).
-TP_SACRUM_OVERLAP_FRAC = 0.10   # 10 % of TP voxels inside TSS sacrum → displaced
+TP_SACRUM_OVERLAP_FRAC = 0.10
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -246,10 +232,6 @@ def inferiormost_tp_cc(tp_mask: np.ndarray,
 
 
 def measure_tp_height_mm(tp_mask: np.ndarray, vox_mm: np.ndarray) -> float:
-    """
-    Craniocaudal TP height = (Z_max − Z_min + 1) × vox_mm[2].
-    Spans ALL TP voxels — matches Castellvi's original criterion (1984).
-    """
     if not tp_mask.any(): return 0.0
     zc = np.where(tp_mask)[2]
     return float((int(zc.max()) - int(zc.min()) + 1) * vox_mm[2])
@@ -258,10 +240,6 @@ def measure_tp_height_mm(tp_mask: np.ndarray, vox_mm: np.ndarray) -> float:
 def tp_centroid_z_mm(sp_data: np.ndarray, tp_label: int,
                      z_range: Tuple[int, int], vox_mm: np.ndarray,
                      sac_mask: Optional[np.ndarray] = None) -> Optional[float]:
-    """
-    Return Z centroid (mm) of the inferiormost TP connected component
-    isolated at z_range.  Returns None if the label is absent.
-    """
     isolated = isolate_tp_at_tv(sp_data, tp_label, *z_range)
     tp       = inferiormost_tp_cc(isolated, sac_mask)
     if not tp.any(): return None
@@ -291,9 +269,8 @@ def min_dist_3d(mask_a: np.ndarray, mask_b: np.ndarray,
     return dist_mm, vox_a, vox_b
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# TP SACRUM-DISPLACEMENT CHECK
+# TP SACRUM-DISPLACEMENT CHECK (v5.1: uses L4-L5 disc as upper boundary)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def validate_tp_concordance(sag_sp:    np.ndarray,
@@ -304,31 +281,25 @@ def validate_tp_concordance(sag_sp:    np.ndarray,
                              sac_mask:  np.ndarray,
                              study_id:  str) -> Tuple[bool, Tuple[int, int]]:
     """
-    Detect a TP that was isolated from sacral tissue rather than the TV.
+    Verify that TP masks are correctly positioned at the TV level, using TSS
+    disc labels as propagation anchors.
 
-    FAILURE MODE
-    ------------
-    SPINEPS mislabels part of the sacrum as L6, so the TP isolated on that
-    side is actually sacral tissue.  The contralateral TP is fine.
-    Bilateral comparison misses this because both sides end up at similar Z.
+    v5.1 Logic:
+    -----------
+    A valid L5 TP should sit BETWEEN the L4-L5 disc and the L5-S1 disc:
+      - UPPER boundary: bottom of L4-L5 disc (TSS label 95)
+        → TP centroid must be BELOW this (i.e. more caudal / smaller z)
+      - LOWER boundary: top of L5-S1 disc or sacrum superior edge
+        → TP centroid must be ABOVE this (i.e. more cranial / larger z)
 
-    TWO-TEST APPROACH (both must be true to flag displacement)
-    ----------------------------------------------------------
-    Test 1 — TSS sacrum overlap (TP_SACRUM_OVERLAP_FRAC threshold):
-        >X% of the isolated TP's voxels fall inside TSS sacrum (label 50).
-        Necessary but not sufficient: a real Castellvi Type III TP that is
-        fused to the sacrum will also overlap — hence Test 2.
+    A TP is flagged as displaced if:
+      1. Its centroid is below (caudal to) the L5-S1 disc floor AND
+      2. It overlaps the sacrum mask by >= 10%
 
-    Test 2 — TP centroid is below the L5/S1 disc superior edge:
-        TSS labels the L5-S1 disc as label 100.  A real lumbar TP — even a
-        fused Type III — originates from the TV body and its centroid stays
-        above the disc space.  A mislabeled sacral "TP" will have its
-        centroid below the disc.  Fallback: TSS sacrum superior edge.
+    OR if its centroid is ABOVE the L4-L5 disc (would mean it belongs to L4,
+    not L5 — a different kind of concordance error).
 
-    If either side fails both tests → re-isolate both TPs from TSS L5 Z-range
-    (VERIDAH L5 if TSS L5 absent).
-
-    Returns (corrected: bool, z_range_to_use: Tuple[int, int])
+    Uses TSS disc labels 95 and 100 as ground-truth propagation anchors.
     """
     if sag_tss is None:
         return False, tv_z
@@ -337,17 +308,37 @@ def validate_tp_concordance(sag_sp:    np.ndarray,
     if not tss_sacrum_mask.any():
         return False, tv_z
 
-    # Disc floor = superior edge of TSS L5-S1 disc (label 100).
-    # Fallback to sacrum superior edge if disc label absent.
-    tss_disc = (sag_tss == 100)
-    if tss_disc.any():
-        disc_floor_z = int(np.where(tss_disc)[2].max())
+    # ── Establish disc boundaries ─────────────────────────────────────────────
+    # Upper boundary: bottom (most caudal z) of L4-L5 disc (TSS 95)
+    l4l5_disc_mask = (sag_tss == TSS_DISC_L4L5)
+    l4l5_disc_present = l4l5_disc_mask.any()
+    if l4l5_disc_present:
+        # The BOTTOM (most caudal = lowest z in RAS) of the L4-L5 disc
+        l4l5_disc_bottom_z = int(np.where(l4l5_disc_mask)[2].min())
+        l4l5_disc_top_z    = int(np.where(l4l5_disc_mask)[2].max())
+        logger.info(
+            f"  [{study_id}] L4-L5 disc (TSS 95): z=[{l4l5_disc_bottom_z},{l4l5_disc_top_z}]"
+        )
+    else:
+        logger.info(f"  [{study_id}] L4-L5 disc (TSS 95): absent — skipping upper-bound check")
+        l4l5_disc_bottom_z = None
+
+    # Lower boundary: floor of L5-S1 disc or sacrum top
+    l5s1_disc_mask = (sag_tss == TSS_DISC_L5S1)
+    if l5s1_disc_mask.any():
+        disc_floor_z   = int(np.where(l5s1_disc_mask)[2].max())
         disc_floor_src = 'TSS L5-S1 disc (label 100)'
     elif tss_sacrum_mask.any():
-        disc_floor_z = int(np.where(tss_sacrum_mask)[2].max())
+        disc_floor_z   = int(np.where(tss_sacrum_mask)[2].max())
         disc_floor_src = 'TSS sacrum superior edge (fallback)'
     else:
         return False, tv_z
+
+    logger.info(
+        f"  [{study_id}] TP boundaries: "
+        f"upper=L4-L5-disc-bottom(z={l4l5_disc_bottom_z}) "
+        f"lower={disc_floor_src}(z={disc_floor_z})"
+    )
 
     def _is_displaced(tp_lbl: int, side: str) -> bool:
         isolated = isolate_tp_at_tv(sag_sp, tp_lbl, *tv_z)
@@ -355,24 +346,44 @@ def validate_tp_concordance(sag_sp:    np.ndarray,
         if not tp.any():
             return False
 
-        n_tp          = int(tp.sum())
-        overlap_frac  = int((tp & tss_sacrum_mask).sum()) / n_tp
-        centroid_z    = float(np.mean(np.where(tp)[2]))   # voxels
-        below_disc    = centroid_z < disc_floor_z
+        n_tp             = int(tp.sum())
+        overlap_frac     = int((tp & tss_sacrum_mask).sum()) / n_tp
+        centroid_z       = float(np.mean(np.where(tp)[2]))
+
+        # Primary displacement check: centroid below L5-S1 disc floor AND overlaps sacrum
+        below_disc       = centroid_z < disc_floor_z
+        sacrum_displaced = (overlap_frac >= TP_SACRUM_OVERLAP_FRAC and below_disc)
+
+        # Secondary check: centroid above the L4-L5 disc bottom (wrong level — belongs to L4)
+        above_l4l5 = (l4l5_disc_bottom_z is not None and centroid_z > l4l5_disc_bottom_z)
 
         logger.info(
-            f"  [{study_id}] {side:5s} TP  sacrum_overlap={overlap_frac:.1%}  "
-            f"centroid_z={centroid_z:.1f}vox  disc_floor_z={disc_floor_z}vox "
-            f"({disc_floor_src})  below_disc={below_disc}"
+            f"  [{study_id}] {side:5s} TP  "
+            f"sacrum_overlap={overlap_frac:.1%}  "
+            f"centroid_z={centroid_z:.1f}vox  "
+            f"disc_floor_z={disc_floor_z}vox ({disc_floor_src})  "
+            f"l4l5_disc_bottom_z={l4l5_disc_bottom_z}  "
+            f"below_disc={below_disc}  "
+            f"above_l4l5={above_l4l5}  "
+            f"sacrum_displaced={sacrum_displaced}"
         )
 
-        if overlap_frac >= TP_SACRUM_OVERLAP_FRAC and below_disc:
+        if sacrum_displaced:
             logger.warning(
                 f"  [{study_id}] {side} TP DISPLACED IN SACRUM — "
                 f"{overlap_frac:.0%} overlap with TSS sacrum "
                 f"AND centroid ({centroid_z:.0f}) below disc floor ({disc_floor_z})"
             )
             return True
+
+        if above_l4l5:
+            logger.warning(
+                f"  [{study_id}] {side} TP ABOVE L4-L5 DISC — "
+                f"centroid z={centroid_z:.0f} > L4-L5 disc bottom z={l4l5_disc_bottom_z} "
+                f"— TP instance belongs to L4 level, not L5"
+            )
+            return True
+
         return False
 
     displaced_L = _is_displaced(SP_TP_L, 'left')
@@ -381,27 +392,48 @@ def validate_tp_concordance(sag_sp:    np.ndarray,
     if not displaced_L and not displaced_R:
         return False, tv_z
 
-    # Re-isolate from TSS L5 Z-range
+    # ── Find corrected TV Z reference ─────────────────────────────────────────
+    # Prefer the region between L4-L5 disc and L5-S1 disc as the "true TV zone"
     ref_z: Optional[Tuple[int, int]] = None
-    tss_l5 = (sag_tss == 45)
-    if tss_l5.any():
-        zc = np.where(tss_l5)[2]
-        ref_z = (int(zc.min()), int(zc.max()))
-        logger.info(f"  [{study_id}] Using TSS L5 Z reference: {ref_z}")
+
+    # First choice: use the inter-disc zone (between L4-L5 bottom and L5-S1 top)
+    if l4l5_disc_present and l5s1_disc_mask.any():
+        l5s1_top_z = int(np.where(l5s1_disc_mask)[2].max())
+        l4l5_bot_z = int(np.where(l4l5_disc_mask)[2].min())
+        if l4l5_bot_z > l5s1_top_z + 4:
+            ref_z = (l5s1_top_z + 1, l4l5_bot_z - 1)
+            logger.info(
+                f"  [{study_id}] Using inter-disc zone as TV Z reference: {ref_z} "
+                f"(between L5-S1 top z={l5s1_top_z} and L4-L5 bottom z={l4l5_bot_z})"
+            )
+
+    # Second choice: TSS L5 mask
     if ref_z is None:
+        tss_l5 = (sag_tss == 45)
+        if tss_l5.any():
+            zc    = np.where(tss_l5)[2]
+            ref_z = (int(zc.min()), int(zc.max()))
+            logger.info(f"  [{study_id}] Using TSS L5 Z reference: {ref_z}")
+
+    # Third choice: VERIDAH L5
+    if ref_z is None:
+        from lstv_engine import VD_L5
         vd_l5 = (sag_vert == VD_L5)
         if vd_l5.any():
-            zc = np.where(vd_l5)[2]
+            zc    = np.where(vd_l5)[2]
             ref_z = (int(zc.min()), int(zc.max()))
             logger.info(f"  [{study_id}] Using VERIDAH L5 Z reference: {ref_z}")
+
     if ref_z is None:
         logger.warning(f"  [{study_id}] Cannot correct — no L5 reference available")
         return False, tv_z
 
     sides = ('left ' if displaced_L else '') + ('right' if displaced_R else '')
-    logger.info(f"  [{study_id}] TP correction: {sides.strip()} displaced → re-isolating both from {ref_z}")
+    logger.info(
+        f"  [{study_id}] TP correction: {sides.strip()} displaced → "
+        f"re-isolating both from corrected z={ref_z}"
+    )
     return True, ref_z
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -419,13 +451,6 @@ def _extract_bbox(axial_t2w: np.ndarray, midpoint: np.ndarray,
 
 
 def _classify_signal(patch: np.ndarray, axial_t2w: np.ndarray) -> Tuple[str, dict]:
-    """
-    Classify axial T2w signal at the TP–sacrum junction.
-
-    MRI classification (Konin & Walz 2010; Nidecker et al. 2018):
-      Dark / intermediate signal → fibrocartilaginous pseudo-joint → Type II
-      Bright homogeneous signal  → osseous marrow bridge           → Type III
-    """
     vals = patch.astype(float).ravel()
     vals = vals[np.isfinite(vals)]
     if len(vals) == 0:
@@ -460,11 +485,6 @@ def _classify_signal(patch: np.ndarray, axial_t2w: np.ndarray) -> Tuple[str, dic
 def phase2_axial(side: str, tp_label: int,
                  ax_spineps: np.ndarray, ax_tss: np.ndarray,
                  ax_t2w: np.ndarray, ax_vox_mm: np.ndarray) -> dict:
-    """
-    Phase 2 using axial T2w signal at the TP–sacrum junction.
-    ax_spineps : registered SPINEPS seg-spine labels (43=TP-left, 44=TP-right)
-    ax_tss     : native TSS axial labels (50=sacrum; 43/44 = L3/L4, NOT TPs)
-    """
     out: dict = {'phase2_attempted': True, 'classification': 'Type II',
                  'midpoint_vox': None, 'p2_features': None, 'p2_valid': False}
 
@@ -507,14 +527,6 @@ def phase1_sagittal(side: str, tp_label: int,
                     sag_sp: np.ndarray, sag_tss: Optional[np.ndarray],
                     sag_vox_mm: np.ndarray,
                     tv_z_range: Tuple[int, int]) -> dict:
-    """
-    Phase 1: sagittal geometric Castellvi analysis.
-    TP height threshold: ≥ 19 mm (Castellvi et al. 1984).
-    Contact threshold: ≤ 2 mm 3D distance to sacrum.
-
-    tv_z_range may be the original VERIDAH TV Z range or the concordance-
-    corrected TSS/VERIDAH L5 Z range — caller decides which to use.
-    """
     out = {
         'tp_present': False, 'tp_height_mm': 0.0, 'contact': False,
         'dist_mm': float('inf'), 'tp_vox': None, 'sacrum_vox': None,
@@ -567,11 +579,6 @@ def phase1_sagittal(side: str, tp_label: int,
 # L6 VERIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# TSS disc label range (sagittal_labeled.nii.gz).  Labels 91–100 are IVDs
-# counted cranio-caudally; 100 is the most caudal (L5-S1 in a 5-lumbar spine,
-# L6-S1 in lumbarization).  We don't hardcode which number is which disc —
-# instead we look for disc labels that are spatially above or below the
-# candidate L6 body.
 TSS_DISC_LABELS = set(range(91, 101))
 
 
@@ -580,51 +587,26 @@ def _verify_l6(sag_vert:  np.ndarray,
                vox_mm:    np.ndarray,
                tv_z:      Tuple[int, int],
                study_id:  str) -> Tuple[bool, str]:
-    """
-    Confirm that VERIDAH's L6 label is a genuine extra lumbar vertebra.
-
-    Three checks (all must pass):
-
-    Check 1 — Positional sanity:
-        VERIDAH L6 centroid Z must lie BELOW TSS L5 inferior edge AND
-        ABOVE TSS sacrum superior edge.  A sacrum mislabeled as L6 will
-        have its centroid inside or overlapping the TSS sacrum.
-
-    Check 2 — Disc ABOVE L6 (L5-L6 disc space):
-        At least one TSS disc label (91-100) must have its centroid Z
-        clearly above the VERIDAH L6 superior edge.  Confirms a real disc
-        exists between L5 and L6.
-
-    Check 3 — Disc BELOW L6 (L6-S1 disc space):
-        At least one TSS disc label must have its centroid Z clearly below
-        the VERIDAH L6 inferior edge AND above the TSS sacrum superior edge.
-        Confirms the lumbosacral disc is at L6-S1, not L5-S1.
-
-    Returns (verified: bool, reason: str)
-    """
     if sag_tss is None:
         return False, "no TSS available — cannot verify L6"
 
     l6_z_min, l6_z_max = tv_z
     l6_centroid_z = (l6_z_min + l6_z_max) / 2.0
 
-    # ── Check 1: positional sanity ─────────────────────────────────────────────
     tss_l5   = (sag_tss == 45)
     tss_sac  = (sag_tss == TSS_SACRUM)
 
     if not tss_sac.any():
         return False, "TSS sacrum (label 50) absent — cannot verify L6 position"
 
-    sac_z_sup = float(np.where(tss_sac)[2].max())   # superior edge of sacrum
+    sac_z_sup = float(np.where(tss_sac)[2].max())
 
-    # L6 centroid must be above the sacrum
     if l6_centroid_z <= sac_z_sup:
         return False, (
             f"L6 centroid z={l6_centroid_z:.0f} ≤ TSS sacrum superior z={sac_z_sup:.0f} "
             f"— VERIDAH L6 is inside the sacrum (mislabeled sacrum)"
         )
 
-    # L6 must be inferior to TSS L5
     if tss_l5.any():
         l5_z_min = float(np.where(tss_l5)[2].min())
         if l6_centroid_z >= l5_z_min:
@@ -633,9 +615,8 @@ def _verify_l6(sag_vert:  np.ndarray,
                 f"— VERIDAH L6 overlaps TSS L5 (not a distinct inferior segment)"
             )
 
-    # ── Check 2 & 3: discs above and below L6 ─────────────────────────────────
-    disc_above_z: Optional[float] = None   # centroid Z of a disc above L6
-    disc_below_z: Optional[float] = None   # centroid Z of a disc below L6
+    disc_above_z: Optional[float] = None
+    disc_below_z: Optional[float] = None
 
     for disc_lbl in TSS_DISC_LABELS:
         disc_mask = (sag_tss == disc_lbl)
@@ -643,15 +624,13 @@ def _verify_l6(sag_vert:  np.ndarray,
             continue
         disc_zc = float(np.mean(np.where(disc_mask)[2]))
 
-        # Disc clearly above L6 superior edge (allow 2-vox slop for partial vol)
         if disc_zc > l6_z_max + 2:
             if disc_above_z is None or disc_zc < disc_above_z:
-                disc_above_z = disc_zc   # take the closest disc above
+                disc_above_z = disc_zc
 
-        # Disc clearly below L6 inferior edge, but still above sacrum
         if disc_zc < l6_z_min - 2 and disc_zc > sac_z_sup:
             if disc_below_z is None or disc_zc > disc_below_z:
-                disc_below_z = disc_zc   # take the closest disc below
+                disc_below_z = disc_zc
 
     if disc_above_z is None:
         return False, (
@@ -677,19 +656,17 @@ def _verify_l6(sag_vert:  np.ndarray,
 # PER-STUDY CLASSIFIER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _fmt_angle(v) -> str:
+    """Format an angle value for logging, returning 'N/A' if None."""
+    return f'{v:.1f}°' if v is not None else 'N/A'
+
+
 def classify_study(study_id:       str,
                    spineps_dir:    Path,
                    totalspine_dir: Path,
                    registered_dir: Path,
                    nifti_dir:      Path,
                    run_morpho:     bool = True) -> dict:
-    """
-    Full LSTV classification for one study.
-
-    Castellvi classification (TP morphology) and LSTV phenotype
-    (lumbarization / sacralization) are computed independently and both
-    reported — they may co-occur.
-    """
     out: dict = {
         'study_id':           study_id,
         'lstv_detected':      False,
@@ -705,7 +682,6 @@ def classify_study(study_id:       str,
         'errors':             [],
     }
 
-    # ── Paths ──────────────────────────────────────────────────────────────────
     seg_dir    = spineps_dir / 'segmentations' / study_id
     spine_path = seg_dir / f"{study_id}_seg-spine_msk.nii.gz"
     vert_path  = seg_dir / f"{study_id}_seg-vert_msk.nii.gz"
@@ -744,7 +720,7 @@ def classify_study(study_id:       str,
     sag_tss  = sag_tss.astype(int)
     vox_mm   = voxel_size_mm(sp_nii)
 
-    # ── Log TSS lumbar labels ──────────────────────────────────────────────────
+    # TSS lumbar label inventory
     tss_unique         = sorted(int(v) for v in np.unique(sag_tss) if v > 0)
     tss_lumbar_present = {lbl: name for lbl, name in TSS_LUMBAR.items()
                           if lbl in tss_unique}
@@ -756,12 +732,18 @@ def classify_study(study_id:       str,
         + (f"  MISSING: {list(tss_lumbar_missing.values())}" if tss_lumbar_missing else "")
     )
 
-    # ── Cross-validation ───────────────────────────────────────────────────────
+    # Log TSS disc labels present (for TP boundary verification)
+    tss_discs_present = [lbl for lbl in [TSS_DISC_L4L5, TSS_DISC_L5S1] if lbl in tss_unique]
+    logger.info(
+        f"  [{study_id}] TSS disc anchors present: "
+        f"{['L4-L5(95)' if l == TSS_DISC_L4L5 else 'L5-S1(100)' for l in tss_discs_present] or 'none'}"
+    )
+
     xval = run_cross_validation(sag_sp, sag_vert, sag_tss, vox_mm, study_id)
     out['cross_validation'] = xval
     for w in xval.get('warnings', []): out['errors'].append(f'XVAL: {w}')
 
-    # ── Axial data (Phase 2) ───────────────────────────────────────────────────
+    # Axial data (Phase 2)
     ax_tss, ax_tss_nii = _load(tss_ax, 'TSS axial')
     ax_sp,  _          = _load(sp_ax,  'registered SPINEPS axial')
     ax_t2w, ax_vox_mm  = None, None
@@ -779,7 +761,7 @@ def classify_study(study_id:       str,
     if ax_tss is not None: ax_tss = ax_tss.astype(int)
     if ax_sp  is not None: ax_sp  = ax_sp.astype(int)
 
-    # ── TV identification from VERIDAH ─────────────────────────────────────────
+    # TV identification
     vert_unique = sorted(int(v) for v in np.unique(sag_vert) if v > 0)
     named       = [VERIDAH_NAMES[l] for l in vert_unique if l in VERIDAH_NAMES]
     logger.info(f"  [{study_id}] VERIDAH labels: {named}")
@@ -796,18 +778,7 @@ def classify_study(study_id:       str,
     if tv_z is None:
         out['errors'].append(f'TV label {tv_name} empty in VERIDAH mask'); return out
 
-    # ── L6 verification (lumbarization cases) ─────────────────────────────────
-    # SPINEPS sometimes mislabels the sacrum as L6. VERIDAH then finds "L6"
-    # whose Z range is in the sacrum. Isolating TPs at that Z range finds no
-    # real costal process voxels and falls through to L4's TPs, producing a
-    # spurious L4-TP→sacrum Castellvi measurement.
-    #
-    # Verification requires ALL THREE of the following to pass:
-    #   1. VERIDAH L6 centroid sits between TSS sacrum superior and TSS L5 inferior
-    #      (positional sanity — a sacrum mislabeled as L6 fails immediately)
-    #   2. A TSS disc exists ABOVE VERIDAH L6 (L5-L6 disc space)
-    #   3. A TSS disc exists BELOW VERIDAH L6 (L6-S1 disc space)
-    # If any check fails, demote to VERIDAH L5 as the TV.
+    # L6 verification
     l6_verified = False
     if tv_label == VD_L6:
         l6_ok, l6_reason = _verify_l6(sag_vert, sag_tss, vox_mm, tv_z, study_id)
@@ -815,7 +786,7 @@ def classify_study(study_id:       str,
         if not l6_ok:
             logger.warning(
                 f"  [{study_id}] VERIDAH L6 FAILED verification: {l6_reason} "
-                f"— demoting TV to L5 to prevent L4-TP measurement"
+                f"— demoting TV to L5"
             )
             if VD_L5 in vert_unique:
                 tv_label = VD_L5
@@ -827,8 +798,7 @@ def classify_study(study_id:       str,
         else:
             logger.info(f"  [{study_id}] VERIDAH L6 verified ✓ — {l6_reason}")
 
-    # ── TP concordance validation ───────────────────────────────────────────────
-    # Build sacrum mask for use in concordance check and throughout Phase 1
+    # TP concordance validation (v5.1: uses L4-L5 disc as upper boundary)
     tss_sac_mask = (sag_tss == TSS_SACRUM) if sag_tss is not None else None
     sac_mask_p1  = (tss_sac_mask
                     if tss_sac_mask is not None and tss_sac_mask.any()
@@ -851,13 +821,17 @@ def classify_study(study_id:       str,
         'sacrum_source':              'TSS label 50 (preferred) / SPINEPS 26 (fallback)',
         'label_note':                 'TSS 43/44 = L3/L4 vertebrae — TP always from seg-spine_msk',
         'tss_lumbar_labels':          tss_lumbar_present,
+        'tss_disc_anchors_used':      {
+            'l4l5_disc_label': TSS_DISC_L4L5,
+            'l5s1_disc_label': TSS_DISC_L5S1,
+        },
     }
     logger.info(
         f"  [{study_id}] TV={tv_name}  z=[{tv_z[0]},{tv_z[1]}]"
         + (f"  → corrected z=[{tv_z_final[0]},{tv_z_final[1]}]" if tp_corrected else "")
     )
 
-    # ── Phase 1 + 2 per side — use corrected Z range ───────────────────────────
+    # Phase 1 + 2 per side
     for side, tp_lbl in (('left', SP_TP_L), ('right', SP_TP_R)):
         try:
             p1 = phase1_sagittal(side, tp_lbl, sag_sp, sag_tss, vox_mm, tv_z_final)
@@ -890,7 +864,7 @@ def classify_study(study_id:       str,
             logger.error(f"  {side} failed: {exc}")
             logger.debug(traceback.format_exc())
 
-    # ── Final Castellvi type ────────────────────────────────────────────────────
+    # Final Castellvi type
     l_cls = out['left'].get('classification',  'Normal')
     r_cls = out['right'].get('classification', 'Normal')
     valid = {l_cls, r_cls} - {'Normal', 'CONTACT_PENDING_P2'}
@@ -910,15 +884,13 @@ def classify_study(study_id:       str,
     else:
         logger.info(f"  ✗ [{study_id}] No Castellvi finding")
 
-    # ── Extended LSTV morphometrics ─────────────────────────────────────────────
-    # Run regardless of Castellvi — count anomaly and disc metrics may detect LSTV
+    # Extended LSTV morphometrics + angle analysis
     if run_morpho:
         try:
             masks  = load_lstv_masks(study_id, spineps_dir, totalspine_dir)
             morpho = analyze_lstv(masks, castellvi_result=out)
             out['lstv_morphometrics'] = morpho.to_dict()
 
-            # ── Count-anomaly and phenotype-based LSTV flags ────────────────────
             consensus = morpho.lumbar_count_consensus
             phenotype = morpho.lstv_phenotype or 'normal'
 
@@ -938,10 +910,71 @@ def classify_study(study_id:       str,
                 reason  = (f"Phenotype: {phenotype.upper()} "
                            f"({morpho.phenotype_confidence} confidence) — "
                            f"criteria: {'; '.join(primary)}")
-                # Only add if not already captured by count anomaly
                 if not any('Phenotype' in r for r in out['lstv_reason']):
                     out['lstv_reason'].append(reason)
                 logger.info(f"  ✓ [{study_id}] LSTV: {reason}")
+
+            # v5: Angle-based LSTV detection (Seilanian Toosi 2025)
+            morpho_dict   = out['lstv_morphometrics'] or {}
+            va_dict       = morpho_dict.get('vertebral_angles') or {}
+            va_delta      = va_dict.get('delta_angle')
+            va_delta_flag = va_dict.get('delta_le8p5', False)
+            va_c_flag     = va_dict.get('c_le35p5', False)
+            va_disc_pat   = va_dict.get('disc_pattern_lstv', False)
+            va_a_increased= va_dict.get('a_increased', False)
+            va_d_decreased= va_dict.get('d_decreased', False)
+            va_c_angle    = va_dict.get('c_angle')
+            va_a_angle    = va_dict.get('a_angle')
+            va_b_angle    = va_dict.get('b_angle')
+            va_d_angle    = va_dict.get('d_angle')
+            va_d1_angle   = va_dict.get('d1_angle')
+            va_summary    = va_dict.get('summary', '')
+
+            # ── Always log all angle values (v5.1 fix) ────────────────────────
+            logger.info(
+                f"  [{study_id}] Angles (Seilanian Toosi 2025): "
+                f"A={_fmt_angle(va_a_angle)}  "
+                f"B={_fmt_angle(va_b_angle)}  "
+                f"C={_fmt_angle(va_c_angle)}  "
+                f"D={_fmt_angle(va_d_angle)}  "
+                f"D1={_fmt_angle(va_d1_angle)}  "
+                f"delta={_fmt_angle(va_delta)}  "
+                f"[delta_flag={va_delta_flag}  c_flag={va_c_flag}  "
+                f"disc_pattern={va_disc_pat}  "
+                f"A_elevated={va_a_increased}  D_decreased={va_d_decreased}]"
+            )
+            if va_summary:
+                logger.info(f"  [{study_id}] Angles summary: {va_summary}")
+
+            if va_delta_flag:
+                out['lstv_detected'] = True
+                reason = (f"Angle: delta={va_delta:.1f}° ≤ {DELTA_ANGLE_TYPE2_THRESHOLD}° — "
+                          f"predicts Castellvi Type 2 LSTV (sens 92.3%, spec 87.9%, "
+                          f"NPV 99.5%; Seilanian Toosi 2025)")
+                if not any('delta' in r.lower() and 'Angle' in r for r in out['lstv_reason']):
+                    out['lstv_reason'].append(reason)
+                logger.info(f"  ✓ [{study_id}] LSTV (angle/delta): {reason}")
+
+            elif va_c_flag and (va_disc_pat or va_a_increased or va_d_decreased):
+                out['lstv_detected'] = True
+                corroboration = (
+                    'disc pattern' if va_disc_pat
+                    else 'A↑' if va_a_increased else 'D↓'
+                )
+                reason = (f"Angle: C={va_c_angle:.1f}° ≤ {C_ANGLE_LSTV_THRESHOLD}° "
+                          f"+ {corroboration} — supports LSTV "
+                          f"(sens 72.2%, spec 57.6%; Seilanian Toosi 2025)")
+                if not any('C=' in r and 'Angle' in r for r in out['lstv_reason']):
+                    out['lstv_reason'].append(reason)
+                logger.info(f"  ✓ [{study_id}] LSTV (angle/C+): {reason}")
+
+            elif va_disc_pat and not out['lstv_detected']:
+                out['lstv_detected'] = True
+                reason = ("Disc pattern: L4-L5 dehydrated + L5-S1 preserved "
+                          "(OR 19.9 in multivariate; Seilanian Toosi 2025)")
+                if not any('Disc pattern' in r for r in out['lstv_reason']):
+                    out['lstv_reason'].append(reason)
+                logger.info(f"  ✓ [{study_id}] LSTV (disc pattern): {reason}")
 
             logger.info(
                 f"  [{study_id}] Morphometrics: "
@@ -954,16 +987,33 @@ def classify_study(study_id:       str,
             logger.error(f"  [{study_id}] lstv_engine error: {exc}")
             out['errors'].append(f'lstv_engine: {exc}')
 
-    # ── Final summary ───────────────────────────────────────────────────────────
+    # ── Final summary log — always includes all angle values (v5.1) ──────────
     morpho_dict = out.get('lstv_morphometrics') or {}
     probs_dict  = morpho_dict.get('probabilities') or {}
     sr_dict     = morpho_dict.get('surgical_relevance') or {}
+    va_dict     = morpho_dict.get('vertebral_angles') or {}
     p_sac       = probs_dict.get('p_sacralization', 0)
     p_lumb      = probs_dict.get('p_lumbarization', 0)
     p_norm      = probs_dict.get('p_normal', 0)
     wl_risk     = sr_dict.get('wrong_level_risk', '?')
     bert_prob   = sr_dict.get('bertolotti_probability', 0)
     rdr         = morpho_dict.get('relative_disc_ratio')
+
+    # Build full angle string — always, regardless of LSTV status
+    delta_val = va_dict.get('delta_angle')
+    c_val     = va_dict.get('c_angle')
+    a_val     = va_dict.get('a_angle')
+    d_val     = va_dict.get('d_angle')
+    d1_val    = va_dict.get('d1_angle')
+    b_val     = va_dict.get('b_angle')
+    angle_str = (
+        f"  A={_fmt_angle(a_val)}"
+        f"  B={_fmt_angle(b_val)}"
+        f"  C={_fmt_angle(c_val)}{'⚠' if va_dict.get('c_le35p5') else ''}"
+        f"  D={_fmt_angle(d_val)}{'↓' if va_dict.get('d_decreased') else ''}"
+        f"  D1={_fmt_angle(d1_val)}"
+        f"  delta={_fmt_angle(delta_val)}{'⚠' if va_dict.get('delta_le8p5') else ''}"
+    ) if (delta_val is not None or c_val is not None) else "  [angles not computed]"
 
     if out['lstv_detected']:
         ph_str = ''
@@ -977,12 +1027,14 @@ def classify_study(study_id:       str,
             f"P(sac)={p_sac:.0%}  P(lumb)={p_lumb:.0%}  P(norm)={p_norm:.0%}  "
             f"surgical_risk={wl_risk}  bertolotti={bert_prob:.0%}"
             + (f"  disc_ratio={rdr:.2f}" if rdr is not None else "")
+            + angle_str
             + (f"  [TP-FIXED]" if tp_corrected else "")
         )
     else:
         logger.info(
             f"  ✗✗ [{study_id}] No LSTV  "
             f"P(sac)={p_sac:.0%}  P(lumb)={p_lumb:.0%}  P(norm)={p_norm:.0%}"
+            + angle_str
         )
 
     out['pathology_score'] = compute_lstv_pathology_score(
@@ -1015,7 +1067,7 @@ def select_studies_csv(csv_path: Path, top_n: int, rank_by: str,
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='Hybrid Two-Phase LSTV Castellvi Classifier + Morphometrics',
+        description='Hybrid Two-Phase LSTV Castellvi Classifier + Morphometrics (v5.1)',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--spineps_dir',      required=True)
     parser.add_argument('--totalspine_dir',   required=True)
@@ -1061,6 +1113,10 @@ def main() -> int:
                             'Type IIIa','Type IIIb','Type IV']}
     phenotype_counts: Dict[str, int] = {}
     tp_correction_count = 0
+    delta_le8p5_count   = 0
+    c_le35p5_count      = 0
+    disc_pattern_count  = 0
+    angle_only_lstv     = 0
 
     for sid in study_ids:
         logger.info(f"\n{'='*60}\n[{sid}]")
@@ -1079,6 +1135,16 @@ def main() -> int:
             morpho = r.get('lstv_morphometrics') or {}
             ph = morpho.get('lstv_phenotype', 'normal')
             phenotype_counts[ph] = phenotype_counts.get(ph, 0) + 1
+
+            va = morpho.get('vertebral_angles') or {}
+            if va.get('delta_le8p5'):      delta_le8p5_count += 1
+            if va.get('c_le35p5'):         c_le35p5_count += 1
+            if va.get('disc_pattern_lstv'):disc_pattern_count += 1
+            has_ct   = bool(ct and ct not in ('None', None))
+            va_flags = va.get('delta_le8p5') or va.get('c_le35p5') or va.get('disc_pattern_lstv')
+            if va_flags and not has_ct:
+                angle_only_lstv += 1
+
         except Exception as exc:
             logger.error(f"  Unhandled: {exc}")
             logger.debug(traceback.format_exc())
@@ -1091,15 +1157,14 @@ def main() -> int:
         key=lambda t: t[1], reverse=True,
     )
 
-    # ── Probability distribution statistics ────────────────────────────────────
     p_sac_vals  = []
     p_lumb_vals = []
     wl_risk_counts: Dict[str, int] = {}
     bertolotti_ge50 = 0
-    high_cert_sac  = 0   # P(sac)  > 0.80
-    high_cert_lumb = 0   # P(lumb) > 0.80
+    high_cert_sac  = 0
+    high_cert_lumb = 0
     nerve_ambig    = 0
-    rel_disc_low   = 0   # relative_disc_ratio < 0.65
+    rel_disc_low   = 0
 
     for r in results:
         morpho = r.get('lstv_morphometrics') or {}
@@ -1111,7 +1176,7 @@ def main() -> int:
         if ps > 0.80:  high_cert_sac  += 1
         if pl > 0.80:  high_cert_lumb += 1
 
-        sr = morpho.get('surgical_relevance') or {}
+        sr  = morpho.get('surgical_relevance') or {}
         wlr = sr.get('wrong_level_risk', 'low')
         wl_risk_counts[wlr] = wl_risk_counts.get(wlr, 0) + 1
         if sr.get('nerve_root_ambiguity'): nerve_ambig += 1
@@ -1121,21 +1186,15 @@ def main() -> int:
         rdr = morpho.get('relative_disc_ratio')
         if rdr is not None and rdr < 0.65: rel_disc_low += 1
 
-    # ── Print summary ──────────────────────────────────────────────────────────
     sep = '=' * 60
     logger.info(f"\n{sep}")
     logger.info(f"{'LSTV DETECTION SUMMARY':^60}")
     logger.info(f"{sep}")
-
     logger.info(f"Studies processed:        {len(results)}")
     logger.info(f"LSTV detected:            {lstv_n}  ({100*lstv_n/n:.1f}%)")
     logger.info(f"  Sacralization:          {phenotype_counts.get('sacralization',0)}")
     logger.info(f"  Lumbarization:          {phenotype_counts.get('lumbarization',0)}")
-    n_trans = phenotype_counts.get('transitional_indeterminate', 0)
-    logger.info(f"  Transitional:           {n_trans}"
-                + ("  [NOTE: Castellvi and Transitional phenotype are orthogonal —"
-                   " Castellvi alone meets sacralization threshold via sac_score≥4]"
-                   if n_trans == 0 and sum(castellvi_counts.values()) > 0 else ""))
+    logger.info(f"  Transitional:           {phenotype_counts.get('transitional_indeterminate',0)}")
     logger.info(f"  Normal:                 {phenotype_counts.get('normal',0)}")
     logger.info(f"Errors:                   {errors}")
     logger.info(f"TP concordance fixes:     {tp_correction_count}")
@@ -1146,24 +1205,24 @@ def main() -> int:
     total_ct = sum(castellvi_counts.values())
     logger.info(f"  {'TOTAL':12s}: {total_ct}  ({100*total_ct/n:.1f}%)")
 
+    logger.info(f"\n── Vertebral Angle Statistics (Seilanian Toosi 2025) ─────")
+    logger.info(f"  delta ≤ {DELTA_ANGLE_TYPE2_THRESHOLD}° (Type 2 predictor): {delta_le8p5_count} ({100*delta_le8p5_count/n:.1f}%)")
+    logger.info(f"  C ≤ {C_ANGLE_LSTV_THRESHOLD}° (any LSTV):         {c_le35p5_count} ({100*c_le35p5_count/n:.1f}%)")
+    logger.info(f"  L4-L5 dehyd + L5-S1 preserved:      {disc_pattern_count} ({100*disc_pattern_count/n:.1f}%)")
+    logger.info(f"  Angle-only LSTV (no Castellvi):      {angle_only_lstv}")
+
     logger.info(f"\n── Probability Model Statistics ──────────────────────────")
     if p_sac_vals:
-        arr_s = [v for v in p_sac_vals if v > 0]
-        arr_l = [v for v in p_lumb_vals if v > 0]
-        logger.info(f"  P(sacralization):  mean={float(np.mean(p_sac_vals)):.2%}  "
-                    f"median={float(np.median(p_sac_vals)):.2%}  "
-                    f">80%: {high_cert_sac} studies")
-        logger.info(f"  P(lumbarization):  mean={float(np.mean(p_lumb_vals)):.2%}  "
-                    f"median={float(np.median(p_lumb_vals)):.2%}  "
-                    f">80%: {high_cert_lumb} studies")
-        logger.info(f"  Relative disc ratio < 0.65 (Farshad-Amacker):  {rel_disc_low} studies")
+        logger.info(f"  P(sacralization): mean={float(np.mean(p_sac_vals)):.2%}  >80%: {high_cert_sac}")
+        logger.info(f"  P(lumbarization): mean={float(np.mean(p_lumb_vals)):.2%}  >80%: {high_cert_lumb}")
+        logger.info(f"  Relative disc ratio < 0.65: {rel_disc_low}")
 
     logger.info(f"\n── Surgical Risk Distribution ────────────────────────────")
     for risk_lvl in ('critical', 'high', 'moderate', 'low-moderate', 'low'):
         cnt = wl_risk_counts.get(risk_lvl, 0)
-        if cnt: logger.info(f"  {risk_lvl:14s}: {cnt} studies  ({100*cnt/n:.1f}%)")
-    logger.info(f"  Nerve root ambiguity:   {nerve_ambig} studies")
-    logger.info(f"  Bertolotti P≥50%:       {bertolotti_ge50} studies")
+        if cnt: logger.info(f"  {risk_lvl:14s}: {cnt} ({100*cnt/n:.1f}%)")
+    logger.info(f"  Nerve root ambiguity: {nerve_ambig}")
+    logger.info(f"  Bertolotti P≥50%:     {bertolotti_ge50}")
 
     logger.info(f"\n── Top-10 Pathology Scores ───────────────────────────────")
     for sid, sc in scores[:10]:
@@ -1171,6 +1230,7 @@ def main() -> int:
         morpho  = r_match.get('lstv_morphometrics') or {}
         probs   = morpho.get('probabilities') or {}
         sr      = morpho.get('surgical_relevance') or {}
+        va      = morpho.get('vertebral_angles') or {}
         ph      = morpho.get('lstv_phenotype', '?')
         ct      = r_match.get('castellvi_type', 'None')
         fix     = ' [TP-FIXED]' if r_match.get('details', {}).get('tp_concordance_corrected') else ''
@@ -1178,43 +1238,58 @@ def main() -> int:
         pl      = probs.get('p_lumbarization', 0)
         wl      = sr.get('wrong_level_risk', '?')
         bp      = sr.get('bertolotti_probability', 0)
-        sr_fb   = ' [SR-fallback]' if sr.get('calibration_note', '').startswith('fallback') else ''
         rdr     = morpho.get('relative_disc_ratio')
         rdr_str = f'  disc_ratio={rdr:.2f}' if rdr is not None else ''
+        # Always include all angles in top-10 listing
+        delta_v = va.get('delta_angle')
+        c_v     = va.get('c_angle')
+        a_v     = va.get('a_angle')
+        d_v     = va.get('d_angle')
+        angle_line = (
+            f"  A={_fmt_angle(a_v)}"
+            f"  C={_fmt_angle(c_v)}{'⚠' if va.get('c_le35p5') else ''}"
+            f"  D={_fmt_angle(d_v)}{'↓' if va.get('d_decreased') else ''}"
+            f"  delta={_fmt_angle(delta_v)}{'⚠' if va.get('delta_le8p5') else ''}"
+        ) if (delta_v is not None or c_v is not None) else ''
         logger.info(
             f"  {sid}: score={sc:.1f}  {ph}  castellvi={ct}  "
             f"P(sac)={ps:.0%}  P(lumb)={pl:.0%}  "
             f"surgical_risk={wl}  bertolotti={bp:.0%}"
-            f"{rdr_str}{fix}{sr_fb}"
+            f"{rdr_str}{angle_line}{fix}"
         )
 
     logger.info(f"\n{sep}")
 
-    # ── Write results ──────────────────────────────────────────────────────────
     out_json = output_dir / 'lstv_results.json'
     with open(out_json, 'w') as fh:
         json.dump(results, fh, indent=2, default=str)
 
     summary = {
-        'total':                        len(results),
-        'lstv_detected':                lstv_n,
-        'lstv_rate':                    round(lstv_n / n, 4),
-        'errors':                       errors,
-        'tp_concordance_fixes':         tp_correction_count,
-        'castellvi_breakdown':          castellvi_counts,
-        'phenotype_breakdown':          phenotype_counts,
-        # v4 additions
+        'total':                       len(results),
+        'lstv_detected':               lstv_n,
+        'lstv_rate':                   round(lstv_n / n, 4),
+        'errors':                      errors,
+        'tp_concordance_fixes':        tp_correction_count,
+        'castellvi_breakdown':         castellvi_counts,
+        'phenotype_breakdown':         phenotype_counts,
         'probability_stats': {
-            'mean_p_sacralization':     round(float(np.mean(p_sac_vals)), 4) if p_sac_vals else None,
-            'mean_p_lumbarization':     round(float(np.mean(p_lumb_vals)), 4) if p_lumb_vals else None,
-            'high_confidence_sac':      high_cert_sac,
-            'high_confidence_lumb':     high_cert_lumb,
-            'relative_disc_ratio_low':  rel_disc_low,
+            'mean_p_sacralization':    round(float(np.mean(p_sac_vals)), 4) if p_sac_vals else None,
+            'mean_p_lumbarization':    round(float(np.mean(p_lumb_vals)), 4) if p_lumb_vals else None,
+            'high_confidence_sac':     high_cert_sac,
+            'high_confidence_lumb':    high_cert_lumb,
+            'relative_disc_ratio_low': rel_disc_low,
         },
-        'surgical_risk_breakdown':      wl_risk_counts,
-        'nerve_root_ambiguity_count':   nerve_ambig,
-        'bertolotti_probability_ge50':  bertolotti_ge50,
-        'top_scores':                   scores[:20],
+        'surgical_risk_breakdown':     wl_risk_counts,
+        'nerve_root_ambiguity_count':  nerve_ambig,
+        'bertolotti_probability_ge50': bertolotti_ge50,
+        'angle_stats': {
+            'delta_le8p5_count':       delta_le8p5_count,
+            'c_le35p5_count':          c_le35p5_count,
+            'disc_pattern_count':      disc_pattern_count,
+            'angle_only_lstv':         angle_only_lstv,
+            'reference':               'Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280',
+        },
+        'top_scores': scores[:20],
     }
     with open(output_dir / 'lstv_summary.json', 'w') as fh:
         json.dump(summary, fh, indent=2, default=str)
