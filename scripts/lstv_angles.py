@@ -1,1152 +1,1039 @@
-#!/usr/bin/env python3
 """
-lstv_angles.py — Vertebral Angle Analysis for LSTV Detection (Seilanian Toosi et al. 2025)
-============================================================================================
-v2 ADDITIONS:
-  - Sanity checking for all computed angles with physiological plausibility bounds
-  - TP height now computed via PCA principal axis (not naive Z-span) to handle
-    angled transverse processes correctly
-  - Endplate normal fitting improved: uses centroid-regression across CC slices
-    to capture tilt direction correctly; falls back to PCA on raw slab voxels only
-    when slice count is insufficient
-  - All angle computations validated against published normal/LSTV medians;
-    out-of-range results are flagged with notes rather than silently returned
+lstv_angles_v4.py – Seilanian Toosi 2025 angle calculations via midline sagittal slice
+========================================================================================
+All five paper angles (A, B, C, D, D1) are defined on lines drawn in a midsagittal view
+(lateral radiograph or sagittal MRI).  Rather than fighting 3D plane-fitting instability
+we reconstruct an optimal midsagittal 2D slice from the 3D segmentation and measure
+every angle directly in that plane – exactly as the paper figures illustrate.
 
-ANGLE DEFINITIONS  (Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280)
----------------------
-A-angle  : angle between sacral superior surface and vertical axis of scanner
-           (Chalian 2012; OR 1.141 per degree, p=0.023)
-           Normal median ≈37°, LSTV median ≈41.5°
-B-angle  : angle between L3 superior endplate and sacral superior surface
-           (Chalian 2012; not independently significant)
-           Normal median ≈43°
-C-angle  : largest angle formed by posterior-body lines of TV±1 and sacrum±1
-           (≤35.5° → any LSTV; sens 72.2%, spec 57.6%, NPV 91.4%)
-           Normal median ≈37°, LSTV median ≈31°
-D-angle  : angle between superior surface of most cranial sacrum and most caudal lumbar
-           Normal median ≈26°, LSTV type2 median ≈22°
-D1-angle : angle between superior surface of TV and TV-1 (supra-adjacent)
-           Normal ≈14°
-delta    : D − D1   ← PRIMARY criterion
-           ≤8.5°  → Type 2 LSTV:  sens 92.3%, spec 87.9%, NPV 99.5%
-           ≤14.5° → any LSTV:     sens 66.7%, spec 52.2%
-           Normal median ≈15°, LSTV type2 median ≈2°
+Coordinate conventions in the 2D working slice
+------------------------------------------------
+  x-axis  = AP direction, increasing anterior
+  y-axis  = CC direction, increasing cranial
+Slopes are expressed as  m = ΔCC / ΔAP  (rise / run in the sagittal plane).
 
-SANITY BOUNDS (from Table 2/3, Seilanian Toosi 2025 + Chalian 2012)
---------------------------------------------------------------------
-A-angle : [15°, 70°]   — sacrum always tilted, but not extreme
-B-angle : [10°, 80°]   — L3 relative to sacrum
-C-angle : [5°, 65°]    — posterior body line angle
-D-angle : [5°, 55°]    — lumbosacral junction angle
-D1-angle: [0°, 45°]    — adjacent lumbar intervertebral angle
-delta   : [-15°, 35°]  — D - D1; negative possible in severe LSTV
+Angle helpers
+  _angle_from_horizontal(m)  → angle of a line from horizontal [0°,90°], = arctan(|m|)
+  _angle_between_lines(m1,m2) → acute inter-line angle [0°,90°]
+  For A-angle: angle of sacral endplate from horizontal  (paper Fig 2a; Ferguson angle)
+  For B, D, D1: acute angle between two surface lines
+  For C: largest angle between posterior-body lines of {TV-1, TV, TV+1} and {S1, S2}
 
-TP HEIGHT VIA PRINCIPAL AXIS (craniocaudal component)
-------------------------------------------------------
-The naive max_z - min_z measurement is wrong when the TP is angled. But naively
-using the *longest* PCA axis is also wrong: the TP extends primarily mediolaterally,
-so its longest axis is roughly horizontal — that would measure TP reach, not height.
-
-Correct approach:
-  1. Extract TP voxel coordinates
-  2. PCA → get all 3 eigenvectors
-  3. Identify the reference craniocaudal direction:
-       - Preferred: vector from L5-S1 disc centroid (TSS 100) → L4-L5 disc centroid
-         (TSS 95). This captures lumbosacral lordotic tilt.
-       - Fallback: detected global CC axis unit vector
-  4. Pick the PCA component with the highest dot-product alignment with that reference
-  5. Span = (max_proj - min_proj) along that component × voxel_size = CC height
-
-This is exported as measure_tp_height_pca() for use by 04_detect_lstv.py.
+Labels (TotalSpineSeg TSS):
+  Sacrum = 50 | Lumbar L5..L1 = 20..24 | Transitional = 25 (if renumbered externally)
+TSS instance labels passed in  masks  dict  are already resolved by the caller.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
 import numpy as np
+from scipy import ndimage
 
 logger = logging.getLogger(__name__)
 
-# ── Thresholds (Seilanian Toosi et al. 2025) ──────────────────────────────────
-DELTA_TYPE2_THRESHOLD    = 8.5    # delta ≤ 8.5°  → Castellvi Type 2 LSTV
-DELTA_ANY_LSTV_THRESHOLD = 14.5   # delta ≤ 14.5° → any LSTV (AUC 0.658)
-C_LSTV_THRESHOLD         = 35.5   # C     ≤ 35.5° → any LSTV (AUC 0.688)
-A_INCREASED_THRESHOLD    = 43.0   # A-angle > 43° → elevated (LSTV type 2 median)
-D_DECREASED_THRESHOLD    = 22.0   # D-angle < 22° → decreased (LSTV type 2 median)
 
-# ── Physiological sanity bounds ────────────────────────────────────────────────
-_SANITY: Dict[str, Tuple[float, float]] = {
-    'a_angle':     (12.0, 72.0),
-    'b_angle':     (8.0,  82.0),
-    'c_angle':     (3.0,  68.0),
-    'd_angle':     (3.0,  58.0),
-    'd1_angle':    (0.0,  48.0),
-    'delta_angle': (-18.0, 38.0),
-}
-
-# ── Published medians for reference logging ────────────────────────────────────
-_NORMAL_MEDIANS = {
-    'a_angle': 37.0, 'b_angle': 43.0, 'c_angle': 37.0,
-    'd_angle': 26.0, 'd1_angle': 14.0, 'delta_angle': 15.0,
-}
-_LSTV_MEDIANS = {
-    'a_angle': 41.5, 'c_angle': 31.1, 'd_angle': 23.5,
-    'delta_angle': 11.5,
-}
-
-# ── Bayesian LR entries for lstv_engine._LR dict ─────────────────────────────
-_ANGLE_LR: Dict[str, Tuple[float, float, float, float]] = {
-    # key:                         (LR+sac, LR-sac, LR+lumb, LR-lumb)
-    'angle_delta_type2':     (7.63,  0.64, 1.0, 1.0),
-    'angle_delta_any_lstv':  (1.39,  0.64, 1.0, 1.0),
-    'angle_c_lstv':          (1.70,  0.47, 1.0, 1.0),
-    'angle_a_elevated':      (1.55,  0.82, 1.0, 1.0),
-    'angle_d_decreased':     (1.45,  0.88, 1.0, 1.0),
-}
-
-# ── VERIDAH / TSS label constants ─────────────────────────────────────────────
-VD_L1=20; VD_L2=21; VD_L3=22; VD_L4=23; VD_L5=24; VD_L6=25; VD_SAC=26
-TSS_L1=41; TSS_L2=42; TSS_L3=43; TSS_L4=44; TSS_L5=45; TSS_SAC=50
-SP_CORPUS = 49
-
-# TSS disc labels — used for TP concordance verification
-TSS_DISC_L4L5 = 95   # L4-L5 disc
-TSS_DISC_L5S1 = 100  # L5-S1 disc
-
-VERIDAH_CAUDAL_TO_CRANIAL = [26, 25, 24, 23, 22, 21, 20]
-TSS_CAUDAL_TO_CRANIAL     = [50, 45, 44, 43, 42, 41]
-
-MIN_VOXELS_FOR_PCA = 20
-SURFACE_SLAB_VOXELS = 5
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RESULT DATACLASS
-# ══════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Public result type
+# ---------------------------------------------------------------------------
 
 @dataclass
-class VertebralAnglesResult:
-    a_angle_deg:     Optional[float] = None
-    b_angle_deg:     Optional[float] = None
-    c_angle_deg:     Optional[float] = None
-    d_angle_deg:     Optional[float] = None
-    d1_angle_deg:    Optional[float] = None
-    delta_angle_deg: Optional[float] = None
+class LSTVAngles:
+    """Measured angles (degrees) for one case."""
+    A: Optional[float] = None   # sacral superior surface vs horizontal
+    B: Optional[float] = None   # L3 superior endplate vs sacral superior surface
+    C: Optional[float] = None   # largest posterior-body line angle (TV±1 / sacrum±1)
+    D: Optional[float] = None   # sacrum sup vs TV sup (lumbosacral angle)
+    D1: Optional[float] = None  # TV sup vs TV-1 sup
+    delta: Optional[float] = None  # D − D1  (signed; ≤8.5° → Type-2 LSTV)
 
-    delta_positive:    bool = False
-    delta_any_lstv:    bool = False
-    c_positive:        bool = False
-    a_angle_elevated:  bool = False
-    d_angle_decreased: bool = False
-    disc_pattern_lstv: bool = False
-
-    angle_lr_keys_fired: List[str] = field(default_factory=list)
-
-    angles_available:  bool = False
-    computation_notes: List[str] = field(default_factory=list)
-    sanity_warnings:   List[str] = field(default_factory=list)
-
-    detected_cc_axis:     Optional[int]  = None
-    detected_si_positive: Optional[bool] = None
-    orientation_method:   Optional[str]  = None
-
-    summary: str = ''
+    # Sanity flags  (True = value present AND within physiologic range)
+    flags: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        d['delta_angle']    = self.delta_angle_deg
-        d['c_angle']        = self.c_angle_deg
-        d['a_angle']        = self.a_angle_deg
-        d['b_angle']        = self.b_angle_deg
-        d['d_angle']        = self.d_angle_deg
-        d['d1_angle']       = self.d1_angle_deg
-        d['delta_le8p5']    = self.delta_positive
-        d['c_le35p5']       = self.c_positive
-        d['a_increased']    = self.a_angle_elevated
-        d['d_decreased']    = self.d_angle_decreased
-        d['delta_any_lstv'] = self.delta_any_lstv
-        return d
+        return {
+            "A": self.A, "B": self.B, "C": self.C,
+            "D": self.D, "D1": self.D1, "delta": self.delta,
+            "flags": self.flags,
+        }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SANITY CHECKING
-# ══════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Sanity bounds (Seilanian Toosi 2025, Table 1 + Fig discussion)
+# ---------------------------------------------------------------------------
 
-def _sanity_check_angle(name: str, value: Optional[float],
-                         notes: List[str]) -> Optional[float]:
+BOUNDS = {
+    "A":  (12.0,  55.0),
+    "B":  (20.0,  70.0),
+    "C":  (10.0,  60.0),
+    "D":  (5.0,   50.0),
+    "D1": (0.0,   48.0),
+    "delta": (-18.0, 40.0),
+}
+
+
+# ============================================================
+# Primary entry point
+# ============================================================
+
+def compute_angles(
+    label_volume: np.ndarray,
+    *,
+    tv_label: int,
+    tv_minus1_label: int,
+    sacrum_label: int = 50,
+    l3_label: Optional[int] = None,
+    sp_corpus_volume: Optional[np.ndarray] = None,
+    voxel_spacing_mm: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> LSTVAngles:
     """
-    Validate a computed angle against physiological plausibility bounds.
-    Returns the value if plausible, None if implausible (with note added).
-    Logs a warning for borderline but technically valid values.
-    """
-    if value is None:
-        return None
+    Compute LSTV classification angles from a 3D integer label volume.
 
-    lo, hi = _SANITY.get(name, (-999, 999))
-    if not (lo <= value <= hi):
-        msg = (f"SANITY FAIL: {name}={value:.1f}° outside plausible range "
-               f"[{lo}°, {hi}°] — discarded")
-        notes.append(msg)
-        logger.warning(f"  {msg}")
-        return None
-
-    # Warn if very far from both normal and LSTV medians
-    norm_med = _NORMAL_MEDIANS.get(name)
-    if norm_med is not None:
-        deviation = abs(value - norm_med)
-        if deviation > 25:
-            notes.append(f"SANITY WARN: {name}={value:.1f}° deviates "
-                         f"{deviation:.0f}° from normal median {norm_med}°")
-    return value
-
-
-def _run_sanity_checks(res: 'VertebralAnglesResult') -> None:
-    """
-    Run all angle sanity checks after computation, flagging suspicious values.
-    Also cross-checks internal consistency (delta = D - D1).
-    """
-    warnings = res.sanity_warnings
-    notes    = res.computation_notes
-
-    # Individual bounds
-    for name, attr in [
-        ('a_angle',     'a_angle_deg'),
-        ('b_angle',     'b_angle_deg'),
-        ('c_angle',     'c_angle_deg'),
-        ('d_angle',     'd_angle_deg'),
-        ('d1_angle',    'd1_angle_deg'),
-        ('delta_angle', 'delta_angle_deg'),
-    ]:
-        val = getattr(res, attr)
-        checked = _sanity_check_angle(name, val, notes)
-        if checked is None and val is not None:
-            # Sanity check failed — null out the value
-            setattr(res, attr, None)
-            warnings.append(f"Angle {name} failed sanity check (was {val:.1f}°)")
-
-    # Cross-check: delta should equal D - D1 (within floating point)
-    if (res.d_angle_deg is not None and res.d1_angle_deg is not None
-            and res.delta_angle_deg is not None):
-        expected_delta = res.d_angle_deg - res.d1_angle_deg
-        if abs(res.delta_angle_deg - expected_delta) > 1.5:
-            warnings.append(
-                f"CONSISTENCY WARN: delta={res.delta_angle_deg:.1f}° but "
-                f"D={res.d_angle_deg:.1f}° - D1={res.d1_angle_deg:.1f}° = "
-                f"{expected_delta:.1f}° (discrepancy {abs(res.delta_angle_deg-expected_delta):.1f}°)"
-            )
-
-    # Cross-check: D1 should be smaller than D in normal anatomy
-    # (the lumbosacral junction has a larger angle than adjacent lumbar levels)
-    # In LSTV type 2, D ≈ D1 (hence small delta)
-    if res.d_angle_deg is not None and res.d1_angle_deg is not None:
-        if res.d_angle_deg < res.d1_angle_deg - 15:
-            warnings.append(
-                f"ANATOMY WARN: D={res.d_angle_deg:.1f}° << D1={res.d1_angle_deg:.1f}° — "
-                f"lumbosacral angle smaller than supra-adjacent; check TV labeling"
-            )
-
-    # Cross-check: A-angle should be > C-angle in most cases
-    # (sacral tilt > posterior body angle differential)
-    if res.a_angle_deg is not None and res.c_angle_deg is not None:
-        if res.a_angle_deg < res.c_angle_deg * 0.4:
-            warnings.append(
-                f"ANATOMY WARN: A={res.a_angle_deg:.1f}° << C={res.c_angle_deg:.1f}° — "
-                f"sacral tilt implausibly smaller than C-angle"
-            )
-
-    if warnings:
-        logger.warning(f"  Angle sanity warnings ({len(warnings)}): "
-                       + "; ".join(warnings[:3])
-                       + (f" ... +{len(warnings)-3} more" if len(warnings) > 3 else ""))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TP HEIGHT VIA PRINCIPAL AXIS (craniocaudal component, not longest axis)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _disc_to_disc_axis(tss_iso: Optional[np.ndarray]) -> Optional[np.ndarray]:
-    """
-    Compute the unit vector from the centroid of the L5-S1 disc (TSS label 100)
-    to the centroid of the L4-L5 disc (TSS label 95).
-
-    This gives the local craniocaudal direction at the lumbosacral junction,
-    which is the correct reference axis for measuring TP craniocaudal height
-    (Castellvi criterion: ≥19 mm craniocaudal dimension).
-
-    Returns None if either disc label is absent.
-    """
-    if tss_iso is None:
-        return None
-
-    l4l5_mask = (tss_iso == TSS_DISC_L4L5)   # label 95
-    l5s1_mask = (tss_iso == TSS_DISC_L5S1)   # label 100
-
-    if not l4l5_mask.any() or not l5s1_mask.any():
-        return None
-
-    c_l4l5 = np.array(np.where(l4l5_mask), dtype=float).mean(axis=1)  # more cranial
-    c_l5s1 = np.array(np.where(l5s1_mask), dtype=float).mean(axis=1)  # more caudal
-
-    vec = c_l4l5 - c_l5s1   # points cranially (L5-S1 → L4-L5)
-    norm = float(np.linalg.norm(vec))
-    if norm < 1e-6:
-        return None
-
-    axis = vec / norm
-    logger.debug(f"  Disc-to-disc CC axis: {axis.round(3)}  "
-                 f"(L5-S1→L4-L5, sep={norm:.1f}vox)")
-    return axis
-
-
-def measure_tp_height_pca(
-        tp_mask:  np.ndarray,
-        vox_mm:   float = 1.0,
-        tss_iso:  Optional[np.ndarray] = None,
-        cc_axis:  int  = 2,
-        si_positive: bool = True,
-) -> Tuple[float, np.ndarray]:
-    """
-    Compute the craniocaudal height of a transverse process by projecting its
-    voxel coordinates onto the local craniocaudal axis — NOT the longest PCA axis.
-
-    WHY NOT THE LONGEST AXIS
-    ------------------------
-    A transverse process extends primarily in the mediolateral direction (left/right).
-    Its longest PCA component is therefore roughly horizontal (ML axis), NOT
-    craniocaudal.  The Castellvi criterion measures the *craniocaudal* (SI) dimension
-    only.  Using the longest PCA axis would measure TP lateral reach, not height.
-
-    AXIS SELECTION PRIORITY
-    -----------------------
-    1. Disc-to-disc axis: vector from centroid of L5-S1 disc (TSS 100) to centroid
-       of L4-L5 disc (TSS 95).  This is the most anatomically accurate local CC
-       direction at the lumbosacral junction, accounting for any lordotic tilt.
-       Requires tss_iso to contain both disc labels.
-
-    2. If disc labels unavailable: use the detected global CC axis (cc_axis /
-       si_positive from detect_cranio_caudal_axis).  This is a unit vector along
-       the appropriate array axis.
-
-    For each candidate axis from PCA (all 3 components), we choose the one whose
-    dot product with the reference CC direction is largest — i.e. the component
-    most aligned with craniocaudal.  We then project all voxel coordinates onto
-    that component to get the SI span.
+    Parameters
+    ----------
+    label_volume : 3-D integer array of segmentation labels (voxel space, any orientation)
+    tv_label : label id of the transitional vertebra (TV / most caudal lumbar)
+    tv_minus1_label : label id of the vertebra immediately cranial to TV
+    sacrum_label : label id of the sacrum (default 50 for TSS)
+    l3_label : label id of L3 (for B-angle); if None B is skipped
+    sp_corpus_volume : optional SPINEPS corpus sub-label volume for refined body masks
+    voxel_spacing_mm : (d0, d1, d2) voxel size along each array axis in mm
 
     Returns
     -------
-    height_mm : float — CC extent of the TP * vox_mm
-    axis      : np.ndarray shape (3,) — unit vector used for measurement
+    LSTVAngles
     """
-    if not tp_mask.any():
-        return 0.0, np.array([0., 0., 1.])
+    spacing = np.array(voxel_spacing_mm, dtype=float)
 
-    coords = np.array(np.where(tp_mask), dtype=float).T  # (N, 3)
-    if len(coords) < MIN_VOXELS_FOR_PCA:
-        # Too few voxels for PCA — fall back to naive span along the CC axis
-        cc_coords = coords[:, cc_axis]
-        span_vox  = float(cc_coords.max() - cc_coords.min() + 1)
-        fallback_axis = _make_cc_unit_vector(cc_axis, si_positive)
-        return span_vox * vox_mm, fallback_axis
+    # -----------------------------------------------------------------------
+    # 1.  Identify anatomical axes
+    # -----------------------------------------------------------------------
+    cc_axis, ap_axis, ml_axis = _identify_axes(label_volume, sacrum_label, tv_minus1_label)
+    logger.debug("Axes — CC:%d  AP:%d  ML:%d", cc_axis, ap_axis, ml_axis)
 
-    # Determine the reference craniocaudal direction
-    ref_cc = _disc_to_disc_axis(tss_iso)
-    if ref_cc is None:
-        # Fall back to the global CC unit vector
-        ref_cc = _make_cc_unit_vector(cc_axis, si_positive)
-        ref_source = f"global-cc-axis (axis={cc_axis})"
-    else:
-        ref_source = "disc-to-disc (L5-S1→L4-L5)"
+    # -----------------------------------------------------------------------
+    # 2.  Find the optimal midline ML slice column
+    # -----------------------------------------------------------------------
+    all_spine_labels = [sacrum_label, tv_label, tv_minus1_label]
+    if l3_label is not None:
+        all_spine_labels.append(l3_label)
 
-    # Run PCA to get all 3 principal components
-    centred = coords - coords.mean(axis=0)
-    _, s, vt = np.linalg.svd(centred, full_matrices=False)
-    # vt rows are the principal axes, ordered by descending variance
-    # (vt[0] = longest, vt[2] = shortest)
+    # For C-angle we also need TV+1 (one cranial to TV-1); try tv_minus1_label-1
+    # if available (caller should pass as separate param in production; for now infer)
+    tv_plus1_label: Optional[int] = None  # will be handled if present
 
-    # Pick the PCA component most aligned with the craniocaudal direction
-    alignments  = [abs(float(np.dot(vt[i], ref_cc))) for i in range(3)]
-    best_idx    = int(np.argmax(alignments))
-    height_axis = vt[best_idx]
+    ml_center, ml_band = _optimal_midline(
+        label_volume, all_spine_labels, ml_axis, spacing
+    )
+    logger.debug("Optimal midline: ML index %d (band ±%d)", ml_center, ml_band)
 
-    # Ensure the axis points cranially (positive dot with ref_cc)
-    if np.dot(height_axis, ref_cc) < 0:
-        height_axis = -height_axis
+    # -----------------------------------------------------------------------
+    # 3.  Extract 2D sagittal slices for each vertebra
+    # -----------------------------------------------------------------------
+    slice_info = _extract_sagittal_slices(
+        label_volume,
+        labels=all_spine_labels,
+        cc_axis=cc_axis,
+        ap_axis=ap_axis,
+        ml_axis=ml_axis,
+        ml_center=ml_center,
+        ml_band=ml_band,
+        sp_corpus=sp_corpus_volume,
+    )
+    # slice_info[label] = 2D binary array, axes = (ap_idx, cc_idx)
+    # Physical size per pixel: (spacing[ap_axis], spacing[cc_axis])
 
-    # Project all voxel coordinates onto the height axis
-    projections = centred @ height_axis
-    span_vox    = float(projections.max() - projections.min())
-    height_mm   = span_vox * vox_mm
+    # -----------------------------------------------------------------------
+    # 4.  Fit endplate lines in 2D and compute angles
+    # -----------------------------------------------------------------------
+    result = LSTVAngles()
+
+    # Precompute sacrum superior slope (needed for A, B, D)
+    m_s_sup: Optional[float] = None
+    s_mask = slice_info.get(sacrum_label)
+    if s_mask is not None and s_mask.any():
+        m_s_sup = _fit_endplate_2d(s_mask, surface="superior",
+                                    sp_ap=spacing[ap_axis], sp_cc=spacing[cc_axis])
+
+    # A-angle ------------------------------------------------------------------
+    if m_s_sup is not None:
+        result.A = _angle_from_horizontal(m_s_sup)
+        logger.debug("A-angle m=%.3f  →  A=%.1f°", m_s_sup, result.A)
+
+    # B-angle ------------------------------------------------------------------
+    if l3_label is not None:
+        l3_mask = slice_info.get(l3_label)
+        if l3_mask is not None and l3_mask.any() and m_s_sup is not None:
+            m_l3_sup = _fit_endplate_2d(l3_mask, surface="superior",
+                                         sp_ap=spacing[ap_axis], sp_cc=spacing[cc_axis])
+            if m_l3_sup is not None:
+                result.B = _angle_between_lines(m_l3_sup, m_s_sup)
+                logger.debug("B-angle m_L3=%.3f m_S=%.3f  →  B=%.1f°",
+                              m_l3_sup, m_s_sup, result.B)
+
+    # D & D1 angles ------------------------------------------------------------
+    tv_mask = slice_info.get(tv_label)
+    tv1_mask = slice_info.get(tv_minus1_label)
+
+    m_tv_sup = None
+    m_tv1_sup = None
+
+    if tv_mask is not None and tv_mask.any():
+        m_tv_sup = _fit_endplate_2d(tv_mask, surface="superior",
+                                     sp_ap=spacing[ap_axis], sp_cc=spacing[cc_axis])
+    if tv1_mask is not None and tv1_mask.any():
+        m_tv1_sup = _fit_endplate_2d(tv1_mask, surface="superior",
+                                      sp_ap=spacing[ap_axis], sp_cc=spacing[cc_axis])
+
+    if m_s_sup is not None and m_tv_sup is not None:  # noqa: F821
+        result.D = _angle_between_lines(m_s_sup, m_tv_sup)
+        logger.debug("D-angle m_S=%.3f m_TV=%.3f  →  D=%.1f°",
+                      m_s_sup, m_tv_sup, result.D)
+
+    if m_tv_sup is not None and m_tv1_sup is not None:
+        result.D1 = _angle_between_lines(m_tv_sup, m_tv1_sup)
+        logger.debug("D1-angle m_TV=%.3f m_TV1=%.3f  →  D1=%.1f°",
+                      m_tv_sup, m_tv1_sup, result.D1)
+
+    if result.D is not None and result.D1 is not None:
+        result.delta = result.D - result.D1
+        logger.debug("delta = D(%.1f) − D1(%.1f) = %.1f°", result.D, result.D1, result.delta)
+
+    # C-angle ------------------------------------------------------------------
+    # Posterior body lines of TV-1 and sacrum (and TV if available)
+    # C = largest angle among pairs of posterior-margin lines
+    c_labels = [tv_minus1_label, sacrum_label]
+    if tv_label in slice_info:
+        c_labels.append(tv_label)
+    c_slopes = []
+    for lbl in c_labels:
+        msk = slice_info.get(lbl)
+        if msk is not None and msk.any():
+            m_post = _fit_posterior_wall_2d(msk, sp_ap=spacing[ap_axis], sp_cc=spacing[cc_axis])
+            if m_post is not None:
+                c_slopes.append(m_post)
+                logger.debug("C posterior slope label=%d  m=%.3f", lbl, m_post)
+
+    if len(c_slopes) >= 2:
+        from itertools import combinations
+        result.C = max(
+            _angle_between_lines(m1, m2)
+            for m1, m2 in combinations(c_slopes, 2)
+        )
+        logger.debug("C-angle = %.1f°", result.C)
+
+    # -----------------------------------------------------------------------
+    # 5.  Sanity checks
+    # -----------------------------------------------------------------------
+    _apply_sanity_flags(result)
+
+    return result
+
+
+# ============================================================
+# Axis identification
+# ============================================================
+
+def _identify_axes(
+    vol: np.ndarray,
+    sacrum_label: int,
+    cranial_label: int,
+) -> Tuple[int, int, int]:
+    """
+    Determine which array axis is CC, AP, ML.
+
+    Strategy:
+      CC: axis along which the sacrum centroid and the cranial-label centroid
+          are maximally separated (normalised by array extent).
+      ML: of the remaining two axes, the one along which the combined spine
+          mask has the greatest normalised extent (spine wider in ML).
+      AP: the remaining axis.
+    """
+    ndim = vol.ndim
+    assert ndim == 3, "Volume must be 3-D"
+
+    def centroid1d(mask: np.ndarray, axis: int) -> float:
+        coords = np.where(mask)[axis]
+        return float(coords.mean()) if len(coords) else 0.0
+
+    sac_mask = vol == sacrum_label
+    cra_mask = vol == cranial_label
+
+    if not sac_mask.any() or not cra_mask.any():
+        # fallback: assume standard (ML, AP, CC) = (0, 1, 2)
+        logger.warning("Cannot detect axes – defaulting to (CC=2, AP=1, ML=0)")
+        return 2, 1, 0
+
+    separations = []
+    for ax in range(3):
+        c_s = centroid1d(sac_mask, ax)
+        c_c = centroid1d(cra_mask, ax)
+        sep = abs(c_s - c_c) / vol.shape[ax]
+        separations.append(sep)
+
+    cc_axis = int(np.argmax(separations))
+
+    # Among the remaining two axes, ML = axis with greatest normalised extent
+    remaining = [ax for ax in range(3) if ax != cc_axis]
+    combined = sac_mask | cra_mask
+    extents = []
+    for ax in remaining:
+        proj = combined.any(axis=tuple(a for a in range(3) if a != ax))
+        occupied = int(np.sum(proj))
+        extents.append(occupied / vol.shape[ax])
+
+    ml_axis = remaining[int(np.argmax(extents))]
+    ap_axis = [ax for ax in remaining if ax != ml_axis][0]
+
+    return cc_axis, ap_axis, ml_axis
+
+
+# ============================================================
+# Optimal midline detection
+# ============================================================
+
+def _optimal_midline(
+    vol: np.ndarray,
+    labels: list,
+    ml_axis: int,
+    spacing: np.ndarray,
+    band_mm: float = 10.0,
+) -> Tuple[int, int]:
+    """
+    Find the ML index that maximises bone coverage across all spine labels.
+
+    Returns (ml_center_index, half_band_voxels)
+    where  ±half_band  defines the thick slab used for the slice projection.
+
+    'Optimal midline' is determined by:
+      1. Build a combined mask of all relevant spine labels.
+      2. Sum voxels along each ML column (collapsing AP and CC).
+      3. Smooth that 1-D profile with a Gaussian (σ = 3 voxels) to find the
+         centre of the bone column rather than a noisy peak.
+      4. ml_center = argmax of the smoothed profile.
+    """
+    combined = np.zeros(vol.shape, dtype=bool)
+    for lbl in labels:
+        combined |= (vol == lbl)
+
+    if not combined.any():
+        logger.warning("No spine voxels found for midline detection – using centre of volume")
+        return vol.shape[ml_axis] // 2, 2
+
+    # Sum along all axes except ml_axis
+    sum_axes = tuple(ax for ax in range(vol.ndim) if ax != ml_axis)
+    profile = combined.sum(axis=sum_axes).astype(float)
+
+    # Smooth
+    from scipy.ndimage import gaussian_filter1d
+    smoothed = gaussian_filter1d(profile, sigma=3.0)
+    ml_center = int(np.argmax(smoothed))
+
+    # Half-band in voxels from physical band_mm
+    ml_spacing = float(spacing[ml_axis])
+    half_band = max(1, int(np.round(band_mm / (2.0 * ml_spacing))))
 
     logger.debug(
-        f"  TP PCA height: {height_mm:.1f}mm  "
-        f"axis_idx={best_idx} (PCA component {best_idx}, alignment={alignments[best_idx]:.3f})  "
-        f"ref={ref_source}  axis={height_axis.round(3)}"
+        "Midline profile peak at ML=%d (band ±%d vox = ±%.1fmm); "
+        "profile max=%.0f vox",
+        ml_center, half_band, half_band * ml_spacing, smoothed[ml_center],
     )
-    return height_mm, height_axis
+    return ml_center, half_band
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ORIENTATION DETECTION
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# Sagittal slice extraction
+# ============================================================
 
-def detect_cranio_caudal_axis(
-        vert_iso: np.ndarray,
-        tss_iso:  Optional[np.ndarray] = None,
-) -> Tuple[int, bool, str]:
+def _extract_sagittal_slices(
+    vol: np.ndarray,
+    labels: list,
+    *,
+    cc_axis: int,
+    ap_axis: int,
+    ml_axis: int,
+    ml_center: int,
+    ml_band: int,
+    sp_corpus: Optional[np.ndarray] = None,
+) -> Dict[int, np.ndarray]:
     """
-    Detect which array axis is the cranio-caudal (S-I) axis without relying
-    on DICOM headers or NIfTI orientation metadata.
+    For each label, extract a 2-D binary mask in the midline slab.
+
+    The slab spans ml_center ± ml_band along ml_axis.
+    Within the slab we take a MAX projection along ml_axis  → any voxel of
+    that label present anywhere in the slab appears in the 2-D slice.
+    (This is equivalent to what you'd see on a thick-slab MIP.)
+
+    The returned 2-D arrays have axes (ap_idx, cc_idx) regardless of the
+    input volume's axis ordering.
     """
-    # Method 1: sacrum vs cranial-lumbar centroid separation
-    for iso, sacrum_lbl, cranial_lbls in [
-        (vert_iso, VD_SAC,  [VD_L1, VD_L2, VD_L3]),
-        (tss_iso,  TSS_SAC, [TSS_L1, TSS_L2, TSS_L3]),
-    ]:
-        if iso is None:
-            continue
-        sac_mask = (iso == sacrum_lbl)
-        if not sac_mask.any():
-            continue
-        sac_centroid = np.array(np.where(sac_mask), dtype=float).mean(axis=1)
+    lo = max(0, ml_center - ml_band)
+    hi = min(vol.shape[ml_axis] - 1, ml_center + ml_band) + 1
 
-        for cranial_lbl in cranial_lbls:
-            cran_mask = (iso == cranial_lbl)
-            if not cran_mask.any():
-                continue
-            cran_centroid = np.array(np.where(cran_mask), dtype=float).mean(axis=1)
+    # Slicing helper: build a tuple of slices that grabs the ML band
+    def ml_slab(v: np.ndarray) -> np.ndarray:
+        slc = [slice(None)] * v.ndim
+        slc[ml_axis] = slice(lo, hi)
+        return v[tuple(slc)]
 
-            diff = cran_centroid - sac_centroid
-            cc_axis = int(np.argmax(np.abs(diff)))
-            si_positive = bool(diff[cc_axis] > 0)
-            sep_mm = float(np.abs(diff[cc_axis]))
+    result: Dict[int, np.ndarray] = {}
 
-            if sep_mm > 15.0:
-                lbl_name = 'VERIDAH' if iso is vert_iso else 'TSS'
-                method = (f"centroid-separation: sacrum→L{cranial_lbl % 10 or 3} "
-                          f"axis={cc_axis} sep={sep_mm:.0f}mm [{lbl_name}]")
-                logger.debug(f"  Orientation: {method}")
-                return cc_axis, si_positive, method
+    for lbl in labels:
+        mask = vol == lbl
+        if sp_corpus is not None:
+            # Refine: keep only voxels that are also in corpus
+            mask = mask & (sp_corpus > 0)
+            if not mask.any():
+                mask = vol == lbl  # fall back if corpus stripped too much
 
-    # Method 2: largest bounding-box extent
-    for iso in [vert_iso, tss_iso]:
-        if iso is None:
-            continue
-        spine_mask = iso > 0
-        if not spine_mask.any():
-            continue
-        coords = np.array(np.where(spine_mask), dtype=float)
-        extents = coords.max(axis=1) - coords.min(axis=1)
-        cc_axis = int(np.argmax(extents))
+        slab = ml_slab(mask)  # shape still 3-D
 
-        for sacrum_lbl in [VD_SAC, TSS_SAC]:
-            sac_mask = (iso == sacrum_lbl)
-            if not sac_mask.any():
-                continue
-            sac_centroid = np.array(np.where(sac_mask), dtype=float).mean(axis=1)
-            all_centroid = coords.mean(axis=1)
-            si_positive = bool(sac_centroid[cc_axis] < all_centroid[cc_axis])
-            method = (f"largest-extent: axis={cc_axis} extent={extents[cc_axis]:.0f}vox "
-                      f"si_positive={si_positive}")
-            logger.debug(f"  Orientation: {method}")
-            return cc_axis, si_positive, method
+        # Max-project along the slab's ml_axis position
+        slab_2d = slab.any(axis=ml_axis)  # True wherever any slab voxel is present
+        # slab_2d has the two remaining axes in their original order
 
-        cc_axis = int(np.argmax(extents))
-        method = f"largest-extent (no sacrum): axis={cc_axis} extent={extents[cc_axis]:.0f}vox"
-        logger.debug(f"  Orientation: {method}")
-        return cc_axis, True, method
+        # Reorder to (ap, cc)
+        remaining_axes = [ax for ax in range(3) if ax != ml_axis]
+        # remaining_axes[i] → physical axis; we want order (ap_axis, cc_axis)
+        pos_ap = remaining_axes.index(ap_axis)
+        pos_cc = remaining_axes.index(cc_axis)
+        if pos_ap == 0 and pos_cc == 1:
+            result[lbl] = slab_2d
+        else:
+            result[lbl] = slab_2d.T  # swap to (ap, cc)
 
-    logger.warning("  Orientation detection failed — falling back to axis=2")
-    return 2, True, "fallback-axis2 (detection failed)"
+    return result
 
 
-def _make_cc_unit_vector(cc_axis: int, si_positive: bool) -> np.ndarray:
-    v = np.zeros(3)
-    v[cc_axis] = 1.0 if si_positive else -1.0
-    return v
+# ============================================================
+# 2-D line fitting helpers
+# ============================================================
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GEOMETRY PRIMITIVES
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _fit_endplate_plane(
-        mask:        np.ndarray,
-        surface:     str,
-        cc_axis:     int  = 2,
-        si_positive: bool = True,
-) -> Optional[np.ndarray]:
+def _fit_endplate_2d(
+    mask_2d: np.ndarray,
+    surface: str = "superior",
+    sp_ap: float = 1.0,
+    sp_cc: float = 1.0,
+) -> Optional[float]:
     """
-    Fit a plane to the superior or inferior surface of a vertebral body mask.
+    Fit a line to the superior or inferior endplate of a vertebra in 2-D.
 
-    Returns the plane normal vector (unit length), oriented to point cranially.
-    Returns None on failure.
+    mask_2d : (n_ap, n_cc) binary array, axes = (AP, CC)
+    surface : 'superior' → upper (cranial) boundary  |  'inferior' → lower boundary
 
-    METHOD: centroid-regression across slices
-    -----------------------------------------
-    For each CC slice in the surface slab, compute the centroid (AP, ML).
-    Regress centroids against CC position using SVD (line fit).
-    The endplate normal is perpendicular to this line in the CC-AP plane.
+    Returns the slope  m = ΔCC_mm / ΔAP_mm  of the fitted line, or None if
+    there are fewer than 4 usable points.
 
-    This correctly captures the physical tilt of the endplate, unlike PCA
-    on raw voxels which is dominated by the in-plane rectangular cross-section
-    of the vertebral body rather than its tilt across CC slices.
-
-    NARROW MASK HANDLING:
-    Endplate masks may be very thin (1-3 voxels in CC). We use a slab of
-    max(3, CC_span // 4) slices, with a minimum of 3 slices required for
-    regression. If fewer slices available, fall back to full-body PCA.
+    Method:
+      For each AP column, find the extreme CC index (max for superior, min for
+      inferior).  Convert to physical coordinates (mm).  Ordinary least-squares
+      linear regression of CC_mm on AP_mm.  Outlier-resistant: points >2 std
+      from the fitted line are removed and the fit is repeated once.
     """
-    if not mask.any():
+    n_ap, n_cc = mask_2d.shape
+    ap_pts: list = []
+    cc_pts: list = []
+
+    for ap_i in range(n_ap):
+        col = np.where(mask_2d[ap_i, :])[0]
+        if len(col) == 0:
+            continue
+        cc_i = int(col.max()) if surface == "superior" else int(col.min())
+        ap_pts.append(ap_i * sp_ap)
+        cc_pts.append(cc_i * sp_cc)
+
+    if len(ap_pts) < 4:
         return None
 
-    axes = [0, 1, 2]
-    cc_coords_all = np.where(mask)[cc_axis]
-    cc_lo = int(cc_coords_all.min())
-    cc_hi = int(cc_coords_all.max())
-    cc_span = cc_hi - cc_lo + 1
+    ap_arr = np.array(ap_pts)
+    cc_arr = np.array(cc_pts)
 
-    if cc_span < 2:
-        # Completely flat mask — use the CC axis as the normal directly
-        normal = np.zeros(3)
-        normal[cc_axis] = 1.0
-        cranial_unit = _make_cc_unit_vector(cc_axis, si_positive)
-        if np.dot(normal, cranial_unit) < 0:
-            normal = -normal
-        return normal
+    m, _ = _ols_slope(ap_arr, cc_arr)
 
-    # Select slab: top or bottom quarter, at least 3 slices
-    slab_n = max(3, min(cc_span // 4, SURFACE_SLAB_VOXELS * 2))
+    # One pass of outlier rejection (|residual| > 2σ)
+    residuals = cc_arr - (m * ap_arr + _ols_intercept(ap_arr, cc_arr, m))
+    std = residuals.std()
+    if std > 0:
+        keep = np.abs(residuals) <= 2.0 * std
+        if keep.sum() >= 4:
+            m, _ = _ols_slope(ap_arr[keep], cc_arr[keep])
 
-    if surface == 'superior':
-        if si_positive:
-            cc_start = max(cc_lo, cc_hi - slab_n + 1)
-            cc_end   = cc_hi
-        else:
-            cc_start = cc_lo
-            cc_end   = min(cc_hi, cc_lo + slab_n - 1)
-    else:  # inferior
-        if si_positive:
-            cc_start = cc_lo
-            cc_end   = min(cc_hi, cc_lo + slab_n - 1)
-        else:
-            cc_start = max(cc_lo, cc_hi - slab_n + 1)
-            cc_end   = cc_hi
+    return m
 
-    non_cc_axes = [a for a in axes if a != cc_axis]
 
-    # Compute per-slice centroid
-    slice_centroids = []
-    for cc_val in range(cc_start, cc_end + 1):
-        idx = [slice(None), slice(None), slice(None)]
-        idx[cc_axis] = cc_val
-        sl = mask[tuple(idx)]
-        if not sl.any():
+def _fit_posterior_wall_2d(
+    mask_2d: np.ndarray,
+    sp_ap: float = 1.0,
+    sp_cc: float = 1.0,
+) -> Optional[float]:
+    """
+    Fit a line to the posterior vertebral wall (posterior body margin).
+
+    The posterior wall is the most-posterior (minimum AP index) occupied voxel
+    at each CC level.  Assumes AP index increases anteriorly.
+
+    Returns slope  m = ΔCC_mm / ΔAP_mm  (same convention as endplate fitter).
+    """
+    n_ap, n_cc = mask_2d.shape
+    ap_pts: list = []
+    cc_pts: list = []
+
+    for cc_i in range(n_cc):
+        row = np.where(mask_2d[:, cc_i])[0]
+        if len(row) == 0:
             continue
-        ax0_coords = np.where(sl)[0]
-        ax1_coords = np.where(sl)[1]
-        c = np.zeros(3)
-        c[cc_axis]         = float(cc_val)
-        c[non_cc_axes[0]]  = float(ax0_coords.mean())
-        c[non_cc_axes[1]]  = float(ax1_coords.mean())
-        slice_centroids.append(c)
+        ap_i = int(row.min())  # most posterior
+        ap_pts.append(ap_i * sp_ap)
+        cc_pts.append(cc_i * sp_cc)
 
-    if len(slice_centroids) < 3:
-        # Not enough CC slices in slab → expand to full mask
-        # This handles very thin endplate masks
-        for cc_val in range(cc_lo, cc_hi + 1):
-            idx = [slice(None), slice(None), slice(None)]
-            idx[cc_axis] = cc_val
-            sl = mask[tuple(idx)]
-            if not sl.any():
-                continue
-            ax0_coords = np.where(sl)[0]
-            ax1_coords = np.where(sl)[1]
-            c = np.zeros(3)
-            c[cc_axis]         = float(cc_val)
-            c[non_cc_axes[0]]  = float(ax0_coords.mean())
-            c[non_cc_axes[1]]  = float(ax1_coords.mean())
-            slice_centroids.append(c)
+    if len(ap_pts) < 4:
+        return None
 
-    if len(slice_centroids) < 2:
-        # Ultimate fallback: use all voxels with PCA
-        slab_voxels = np.array(np.where(mask), dtype=float).T
-        if len(slab_voxels) < MIN_VOXELS_FOR_PCA:
-            return None
-        centred = slab_voxels - slab_voxels.mean(axis=0)
-        _, s, vt = np.linalg.svd(centred, full_matrices=False)
-        normal = vt[-1]
+    ap_arr = np.array(ap_pts)
+    cc_arr = np.array(cc_pts)
+    m, _ = _ols_slope(ap_arr, cc_arr)
+    return m
+
+
+# ============================================================
+# Angle calculation from slopes
+# ============================================================
+
+def _angle_from_horizontal(m: float) -> float:
+    """
+    Angle of a line from the horizontal axis, degrees [0°, 90°].
+
+    With x=AP, y=CC:  a horizontal endplate has m=0 → 0°.
+    The sacral endplate at ~37° from horizontal has m = tan(37°) ≈ 0.75.
+    """
+    return float(np.degrees(np.arctan(abs(m))))
+
+
+def _angle_between_lines(m1: float, m2: float) -> float:
+    """
+    Acute angle between two lines with slopes m1, m2 (degrees, [0°, 90°]).
+
+    Uses the standard formula:  tan θ = |m1-m2| / (1 + m1·m2)
+    Falls back to 90° if lines are perpendicular (denominator ≈ 0).
+    """
+    denom = 1.0 + m1 * m2
+    if abs(denom) < 1e-6:
+        return 90.0
+    angle = float(np.degrees(np.arctan(abs(m1 - m2) / abs(denom))))
+    return angle
+
+
+# ============================================================
+# OLS helpers
+# ============================================================
+
+def _ols_slope(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """
+    Ordinary least-squares: returns (slope m, slope_se) for y ~ m*x + b.
+    """
+    x = x - x.mean()
+    y = y - y.mean()
+    ss_xx = float((x * x).sum())
+    ss_xy = float((x * y).sum())
+    if ss_xx < 1e-12:
+        return 0.0, np.inf
+    m = ss_xy / ss_xx
+    residuals = y - m * x
+    n = len(x)
+    se = float(np.sqrt((residuals ** 2).sum() / max(n - 2, 1) / ss_xx)) if n > 2 else np.inf
+    return m, se
+
+
+def _ols_intercept(x: np.ndarray, y: np.ndarray, m: float) -> float:
+    return float(y.mean() - m * x.mean())
+
+
+# ============================================================
+# Sanity checks
+# ============================================================
+
+def _apply_sanity_flags(result: LSTVAngles) -> None:
+    for name, (lo, hi) in BOUNDS.items():
+        val = getattr(result, name, None)
+        if val is None:
+            result.flags[name] = "MISSING"
+        elif not (lo <= val <= hi):
+            result.flags[name] = f"OUT_OF_RANGE [{lo},{hi}] got {val:.1f}"
+        else:
+            result.flags[name] = "OK"
+
+    # Anatomy cross-check: D should exceed D1 in most normal anatomy
+    if result.D is not None and result.D1 is not None:
+        if result.D < result.D1:
+            result.flags["D<<D1"] = (
+                f"ANATOMY WARN: D({result.D:.1f}) < D1({result.D1:.1f}) — check TV labeling"
+            )
+
+
+# ============================================================
+# Diagnostic / visualisation helpers
+# ============================================================
+
+def debug_slice_figure(
+    slice_dict: Dict[int, np.ndarray],
+    angles: LSTVAngles,
+    label_names: Optional[Dict[int, str]] = None,
+    out_path: Optional[str] = None,
+) -> None:
+    """
+    Render the midline sagittal slices overlaid with fitted endplate lines.
+    Saves or shows the figure (requires matplotlib).
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg" if out_path else "TkAgg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from matplotlib.lines import Line2D
+    except ImportError:
+        logger.warning("matplotlib not available – skipping debug figure")
+        return
+
+    colours = {
+        50: "#FF6B6B",   # sacrum – red
+        20: "#4ECDC4",   # L5 – teal
+        21: "#45B7D1",   # L4 – blue
+        22: "#96CEB4",   # L3 – green
+        23: "#FFEAA7",   # L2 – yellow
+        24: "#DDA0DD",   # L1 – plum
+        25: "#FFA500",   # TV – orange (if renumbered)
+    }
+
+    fig, ax = plt.subplots(figsize=(7, 12))
+    ax.set_facecolor("#1a1a2e")
+
+    for lbl, mask in slice_dict.items():
+        if not mask.any():
+            continue
+        colour = colours.get(lbl, "#AAAAAA")
+        # Overlay semitransparent filled region
+        rgba = np.zeros((*mask.shape, 4), dtype=float)
+        import matplotlib.colors as mcolors
+        rgb = mcolors.to_rgb(colour)
+        rgba[mask, 0] = rgb[0]
+        rgba[mask, 1] = rgb[1]
+        rgba[mask, 2] = rgb[2]
+        rgba[mask, 3] = 0.55
+        ax.imshow(rgba.T, origin="lower", aspect="auto")
+
+    ax.set_xlabel("AP →")
+    ax.set_ylabel("CC (cranial) →")
+    angle_text = (
+        f"A={angles.A:.1f}°  B={angles.B or '–'}°  C={angles.C or '–'}°\n"
+        f"D={angles.D or '–'}°  D1={angles.D1 or '–'}°  δ={angles.delta or '–'}°"
+    )
+    ax.set_title(f"Midline sagittal slice\n{angle_text}", fontsize=10)
+
+    if out_path:
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        logger.info("Debug figure saved to %s", out_path)
     else:
-        pts = np.array(slice_centroids)
-        centred = pts - pts.mean(axis=0)
-        _, s, vt = np.linalg.svd(centred, full_matrices=False)
-
-        # Primary singular vector = direction of centroid drift across CC slices
-        # = "down-slope" direction of the endplate
-        # Normal = perpendicular to this, in the sagittal (CC-AP) plane
-        line_dir = vt[0]
-        non_cc = [a for a in axes if a != cc_axis]
-
-        # AP-like axis = non-CC axis with larger component in the primary direction
-        ap_candidates = [(abs(line_dir[a]), a) for a in non_cc]
-        ap_axis = max(ap_candidates)[1]
-
-        cc_comp = line_dir[cc_axis]
-        ap_comp = line_dir[ap_axis]
-
-        line_mag = np.sqrt(cc_comp**2 + ap_comp**2)
-        if line_mag < 1e-9:
-            # No CC-AP drift → flat endplate → normal points along CC
-            normal = np.zeros(3)
-            normal[cc_axis] = 1.0
-        else:
-            # Rotate (cc_comp, ap_comp) by 90° to get the normal
-            normal = np.zeros(3)
-            normal[cc_axis] = -ap_comp / line_mag
-            normal[ap_axis] =  cc_comp / line_mag
-
-    # Orient to point cranially
-    cranial_unit = _make_cc_unit_vector(cc_axis, si_positive)
-    if np.dot(normal, cranial_unit) < 0:
-        normal = -normal
-
-    mag = np.linalg.norm(normal)
-    if mag < 1e-9:
-        return None
-    return normal / mag
+        plt.show()
+    plt.close(fig)
 
 
-def _angle_between_normals(
-        n1:      np.ndarray,
-        n2:      np.ndarray,
-        cc_axis: int = 2,
-) -> float:
+# ============================================================
+# Pipeline convenience wrapper (called from 04_detect_lstv.py)
+# ============================================================
+
+def compute_angles_from_spineps(
+    tss_label_path: str,
+    sp_corpus_path: Optional[str],
+    tv_label: int,
+    tv_minus1_label: int,
+    sacrum_label: int = 50,
+    l3_label: Optional[int] = None,
+    *,
+    verbose: bool = False,
+) -> LSTVAngles:
     """
-    Angle (degrees) between two endplate normals, projected onto the
-    midsagittal plane (contains CC and AP axes; drops ML component).
-    Matches the 2D sagittal measurement convention of Seilanian Toosi 2025.
+    Drop-in replacement for the old lstv_angles.compute_angles().
+
+    Parameters
+    ----------
+    tss_label_path  : path to TotalSpineSeg NIfTI label map
+    sp_corpus_path  : path to SPINEPS sub-corpus label NIfTI (or None)
+    tv_label        : integer label of the transitional vertebra in tss_label_path
+    tv_minus1_label : integer label of the supra-adjacent vertebra
+    sacrum_label    : TSS sacrum label (default 50)
+    l3_label        : TSS L3 label (for B-angle; None to skip)
+    verbose         : enable DEBUG logging
     """
-    axes = [0, 1, 2]
-    non_cc = [a for a in axes if a != cc_axis]
+    import nibabel as nib
 
-    # ML axis = non-CC axis with smallest mean absolute component
-    comp = [0.5 * (abs(n1[a]) + abs(n2[a])) for a in non_cc]
-    ml_axis = non_cc[int(np.argmin(comp))]
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
-    def _project_sagittal(n):
-        p = n.copy()
-        p[ml_axis] = 0.0
-        mag = np.linalg.norm(p)
-        return p / mag if mag > 1e-9 else None
+    nii = nib.load(tss_label_path)
+    vol = np.asarray(nii.dataobj, dtype=np.int32)
+    spacing = np.abs(np.diag(nii.affine)[:3])  # voxel sizes in mm
 
-    n1_sag = _project_sagittal(n1)
-    n2_sag = _project_sagittal(n2)
+    sp_corpus_vol = None
+    if sp_corpus_path is not None:
+        try:
+            sp_corpus_vol = np.asarray(nib.load(sp_corpus_path).dataobj, dtype=np.int32)
+        except Exception as exc:
+            logger.warning("Could not load sp_corpus_path %s: %s", sp_corpus_path, exc)
 
-    if n1_sag is None or n2_sag is None:
-        cos_a = float(np.clip(np.dot(n1, n2), -1.0, 1.0))
-        return float(np.degrees(np.arccos(cos_a)))
-
-    cos_a = float(np.clip(np.dot(n1_sag, n2_sag), -1.0, 1.0))
-    angle = float(np.degrees(np.arccos(cos_a)))
-    return min(angle, 180.0 - angle)
-
-
-def _angle_vs_vertical(
-        normal:      np.ndarray,
-        cc_axis:     int  = 2,
-        si_positive: bool = True,
-) -> float:
-    """
-    Angle (degrees) between the endplate surface and the horizontal plane.
-    = angle between the endplate normal and the cranio-caudal axis.
-    = arccos(|n · ẑ_cc|)
-
-    Definition: A-angle = angle between sacral superior surface and
-    a line perpendicular to the scan table (vertical axis).
-    Normal ≈ 37°, LSTV ≈ 41.5° (Seilanian Toosi 2025).
-    """
-    cranial_unit = _make_cc_unit_vector(cc_axis, si_positive)
-    cos_a = float(np.clip(abs(np.dot(normal, cranial_unit)), 0.0, 1.0))
-    return float(np.degrees(np.arccos(cos_a)))
+    return compute_angles(
+        vol,
+        tv_label=tv_label,
+        tv_minus1_label=tv_minus1_label,
+        sacrum_label=sacrum_label,
+        l3_label=l3_label,
+        sp_corpus_volume=sp_corpus_vol,
+        voxel_spacing_mm=tuple(float(s) for s in spacing),
+    )
 
 
-def _posterior_body_normal(
-        mask:    np.ndarray,
-        cc_axis: int = 2,
-) -> Optional[np.ndarray]:
-    """
-    Fit a plane through the posterior third of the vertebral body.
-    Posterior = smaller AP-axis coordinate (anterior is forward/larger Y in RAS).
-    """
-    if not mask.any():
-        return None
+# ============================================================
+# lstv_engine.py compatibility layer
+# ============================================================
+# lstv_engine.py expects:
+#   from lstv_angles import compute_vertebral_angles, apply_angle_lr_updates
+# and an angle_result object with specific attributes.
+# This shim bridges the v4 API to that interface.
 
-    axes = [0, 1, 2]
-    non_cc = [a for a in axes if a != cc_axis]
-    extents = [int(np.where(mask)[a].max()) - int(np.where(mask)[a].min()) for a in non_cc]
-    ap_axis = non_cc[int(np.argmax(extents))]
-
-    ap_coords = np.where(mask)[ap_axis]
-    ap_lo = int(ap_coords.min())
-    ap_hi = int(ap_coords.max())
-    slab_ap = max(1, (ap_hi - ap_lo) // 3)
-    ap_end = min(ap_hi, ap_lo + slab_ap)
-
-    idx = [slice(None), slice(None), slice(None)]
-    idx[ap_axis] = slice(ap_lo, ap_end + 1)
-    post = np.zeros_like(mask)
-    post[tuple(idx)] = mask[tuple(idx)]
-
-    coords = np.array(np.where(post), dtype=float).T
-    if len(coords) < MIN_VOXELS_FOR_PCA:
-        coords = np.array(np.where(mask), dtype=float).T
-        if len(coords) < MIN_VOXELS_FOR_PCA:
-            return None
-
-    centred = coords - coords.mean(axis=0)
-    _, _, vt = np.linalg.svd(centred, full_matrices=False)
-    normal = vt[-1]
-    cranial_unit = _make_cc_unit_vector(cc_axis, True)
-    if np.dot(normal, cranial_unit) < 0:
-        normal = -normal
-    mag = np.linalg.norm(normal)
-    return normal / mag if mag > 1e-9 else None
+@dataclass
+class RadiologicCriterion:
+    """Minimal criterion record (mirrors lstv_engine.py RadiologicCriterion)."""
+    name:      str
+    value:     str
+    direction: str
+    strength:  str
+    lr_sac:    float
+    lr_lumb:   float
+    citation:  str
+    finding:   str
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MASK EXTRACTION HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class VertebralAnglesResult:
+    """Result object compatible with lstv_engine.py step 8.5."""
+    angles_available:      bool              = False
+    angle_lr_keys_fired:   list              = field(default_factory=list)
 
-def _get_mask(vert_iso: np.ndarray, tss_iso: Optional[np.ndarray],
-              sp_iso: Optional[np.ndarray],
-              veridah_label: int,
-              tss_label: Optional[int],
-              sp_corpus_label: Optional[int] = SP_CORPUS) -> np.ndarray:
-    mask = None
-    if tss_iso is not None and tss_label is not None:
-        candidate = (tss_iso == tss_label)
-        if candidate.any():
-            mask = candidate
-    if mask is None or not mask.any():
-        candidate = (vert_iso == veridah_label)
-        if candidate.any():
-            mask = candidate
-    if mask is None or not mask.any():
-        return np.zeros(vert_iso.shape, bool)
-    if sp_iso is not None and sp_corpus_label is not None:
-        corpus = (sp_iso == sp_corpus_label)
-        if corpus.any():
-            refined = mask & corpus
-            if refined.sum() >= MIN_VOXELS_FOR_PCA:
-                return refined.astype(bool)
-    return mask.astype(bool)
+    a_angle_deg:           Optional[float]   = None
+    b_angle_deg:           Optional[float]   = None
+    c_angle_deg:           Optional[float]   = None
+    d_angle_deg:           Optional[float]   = None
+    d1_angle_deg:          Optional[float]   = None
+    delta_angle_deg:       Optional[float]   = None
+
+    # Positive classification flags
+    delta_positive:        bool  = False   # delta ≤ 8.5° → Type-2 LSTV
+    delta_any_lstv:        bool  = False   # delta ≤ 15°  (borderline)
+    c_positive:            bool  = False   # C ≤ 35.5°    → LSTV signal
+    a_angle_elevated:      bool  = False   # A > 41°      → sacralization signal
+
+    # Sanity flags forwarded from LSTVAngles.flags
+    angle_flags:           dict  = field(default_factory=dict)
+    computation_notes:     list  = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            'angles_available':    self.angles_available,
+            'a_angle_deg':         self.a_angle_deg,
+            'b_angle_deg':         self.b_angle_deg,
+            'c_angle_deg':         self.c_angle_deg,
+            'd_angle_deg':         self.d_angle_deg,
+            'd1_angle_deg':        self.d1_angle_deg,
+            'delta_angle_deg':     self.delta_angle_deg,
+            'delta_positive':      self.delta_positive,
+            'delta_any_lstv':      self.delta_any_lstv,
+            'c_positive':          self.c_positive,
+            'a_angle_elevated':    self.a_angle_elevated,
+            'angle_lr_keys_fired': self.angle_lr_keys_fired,
+            'angle_flags':         self.angle_flags,
+            'computation_notes':   self.computation_notes,
+        }
 
 
-def _sacrum_mask(vert_iso: np.ndarray,
-                 tss_iso:  Optional[np.ndarray]) -> np.ndarray:
-    if tss_iso is not None:
-        s = (tss_iso == TSS_SAC)
-        if s.any():
-            return s.astype(bool)
-    s = (vert_iso == VD_SAC)
-    return s.astype(bool)
+# VERIDAH → TSS label mapping (mirrors lstv_engine.py VD_TO_TSS_VERT)
+_VD_TO_TSS = {20: 41, 21: 42, 22: 43, 23: 44, 24: 45, 25: 45}
+# TSS L3 label (for B-angle)
+_TSS_L3 = 43
+# TSS sacrum
+_TSS_SACRUM = 50
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN COMPUTATION
-# ══════════════════════════════════════════════════════════════════════════════
 
 def compute_vertebral_angles(
-        sp_iso:           np.ndarray,
-        vert_iso:         np.ndarray,
-        tss_iso:          Optional[np.ndarray],
-        tv_veridah_label: int,
-        vox_mm:           float = 1.0,
-        sp_corpus_label:  int   = SP_CORPUS,
-        disc_above_dhi:   Optional[float] = None,
-        disc_below_dhi:   Optional[float] = None,
-        dhi_moderate_pct: float = 70.0,
-        dhi_mild_pct:     float = 80.0,
+    sp_iso:           np.ndarray,
+    vert_iso:         np.ndarray,
+    tss_iso:          Optional[np.ndarray],
+    tv_veridah_label: int,
+    vox_mm:           float = 1.0,
+    sp_corpus_label:  int   = 49,
+    disc_above_dhi:   Optional[float] = None,
+    disc_below_dhi:   Optional[float] = None,
 ) -> VertebralAnglesResult:
     """
-    Compute all five vertebral angles from 3D segmentation masks.
-    Includes sanity checking, cross-validation, and physiological plausibility
-    filtering on all computed angles.
+    Wrapper called by lstv_engine.py step 8.5.
+
+    Uses tss_iso (preferred) or vert_iso as the label volume.
+    tv_veridah_label is converted to TSS label for tss_iso lookups.
     """
-    res   = VertebralAnglesResult()
-    notes = res.computation_notes
+    result = VertebralAnglesResult()
 
-    # Step 0: Detect cranio-caudal axis
-    cc_axis, si_positive, orient_method = detect_cranio_caudal_axis(vert_iso, tss_iso)
-    res.detected_cc_axis     = cc_axis
-    res.detected_si_positive = si_positive
-    res.orientation_method   = orient_method
-    logger.info(f"  Orientation detected: cc_axis={cc_axis} si_positive={si_positive} "
-                f"({orient_method})")
+    # Pick the volume to operate on
+    if tss_iso is not None and tss_iso.any():
+        vol      = tss_iso
+        tv_label = _VD_TO_TSS.get(tv_veridah_label, 45)  # default to L5
+        # tv-1 = one cranial: tv_label + 1 in TSS (L5=45 → L4=44, etc.)
+        tv_minus1_label = tv_label - 1  # TSS decreases cranially: L5=45, L4=44
+        l3_label = _TSS_L3 if _TSS_L3 in np.unique(vol) else None
+    else:
+        result.computation_notes.append("TSS not available — falling back to vert_iso")
+        vol             = vert_iso
+        tv_label        = tv_veridah_label
+        tv_minus1_label = tv_veridah_label - 1  # VERIDAH also decreases cranially
+        l3_label        = None  # VERIDAH L3 = label 22
 
-    # Map TV to neighbours
-    VERIDAH_TO_TSS = {20:41, 21:42, 22:43, 23:44, 24:45, 25:45}
-    tv_lbl  = tv_veridah_label
-    tv_tss  = VERIDAH_TO_TSS.get(tv_lbl)
-    tv1_lbl = tv_lbl - 1
-    tv1_tss = VERIDAH_TO_TSS.get(tv1_lbl)
-    l3_lbl  = VD_L3;  l3_tss = TSS_L3
+    # Check minimum required labels are present
+    labels_present = set(np.unique(vol).tolist()) - {0}
+    missing = []
+    for lbl, name in [(tv_label, 'TV'), (tv_minus1_label, 'TV-1'), (_TSS_SACRUM, 'sacrum')]:
+        if lbl not in labels_present:
+            missing.append(f"{name}(lbl={lbl})")
+    if missing:
+        result.computation_notes.append(f"Missing required labels: {missing}")
+        logger.warning("compute_vertebral_angles: missing labels %s — skipping", missing)
+        return result
 
-    def _m(vd, tss_lbl):
-        return _get_mask(vert_iso, tss_iso, sp_iso, vd, tss_lbl, sp_corpus_label)
+    # Build sp_corpus_volume if available
+    sp_corpus_vol = None
+    if sp_corpus_label and sp_corpus_label in np.unique(sp_iso):
+        sp_corpus_vol = (sp_iso == sp_corpus_label).astype(np.int32)
 
-    sac_mask = _sacrum_mask(vert_iso, tss_iso)
-    tv_mask  = _m(tv_lbl,  tv_tss)
-    tv1_mask = _m(tv1_lbl, tv1_tss)
-    l3_mask  = _m(l3_lbl,  l3_tss)
+    spacing = (vox_mm, vox_mm, vox_mm)
 
-    # Log mask sizes for diagnostics
-    logger.debug(f"  Mask voxels: sac={sac_mask.sum()} tv={tv_mask.sum()} "
-                 f"tv1={tv1_mask.sum()} l3={l3_mask.sum()}")
-
-    def _fit(mask, surf):
-        return _fit_endplate_plane(mask, surf, cc_axis=cc_axis, si_positive=si_positive)
-
-    n_sac = _fit(sac_mask, 'superior')
-    n_tv  = _fit(tv_mask,  'superior')
-    n_tv1 = _fit(tv1_mask, 'superior')
-    n_l3  = _fit(l3_mask,  'superior')
-
-    if n_sac is None: notes.append('Sacrum endplate fit failed')
-    if n_tv  is None: notes.append(f'TV (label {tv_lbl}) endplate fit failed')
-    if n_tv1 is None: notes.append(f'TV-1 (label {tv1_lbl}) endplate fit failed')
-
-    # A-angle
-    if n_sac is not None:
-        try:
-            res.a_angle_deg = round(
-                _angle_vs_vertical(n_sac, cc_axis=cc_axis, si_positive=si_positive), 1)
-        except Exception as exc:
-            notes.append(f'A-angle computation failed: {exc}')
-
-    # B-angle
-    if n_sac is not None and n_l3 is not None:
-        try:
-            res.b_angle_deg = round(
-                _angle_between_normals(n_l3, n_sac, cc_axis=cc_axis), 1)
-        except Exception as exc:
-            notes.append(f'B-angle computation failed: {exc}')
-
-    # D-angle
-    if n_sac is not None and n_tv is not None:
-        try:
-            res.d_angle_deg = round(
-                _angle_between_normals(n_tv, n_sac, cc_axis=cc_axis), 1)
-        except Exception as exc:
-            notes.append(f'D-angle computation failed: {exc}')
-
-    # D1-angle
-    if n_tv is not None and n_tv1 is not None:
-        try:
-            res.d1_angle_deg = round(
-                _angle_between_normals(n_tv, n_tv1, cc_axis=cc_axis), 1)
-        except Exception as exc:
-            notes.append(f'D1-angle computation failed: {exc}')
-
-    # delta-angle = D - D1
-    if res.d_angle_deg is not None and res.d1_angle_deg is not None:
-        res.delta_angle_deg = round(res.d_angle_deg - res.d1_angle_deg, 1)
-
-    # C-angle
     try:
-        junction_masks = [
-            (tv1_mask, f'TV-1 (label {tv1_lbl})'),
-            (tv_mask,  f'TV   (label {tv_lbl})'),
-            (sac_mask, 'Sacrum'),
-        ]
-        pb_normals = []
-        for jmask, jname in junction_masks:
-            pbn = _posterior_body_normal(jmask, cc_axis=cc_axis)
-            if pbn is not None:
-                pb_normals.append(pbn)
-            else:
-                notes.append(f'C-angle: posterior-body normal unavailable for {jname}')
-
-        if len(pb_normals) >= 2:
-            angles_computed = [
-                _angle_between_normals(pb_normals[i], pb_normals[j], cc_axis=cc_axis)
-                for i in range(len(pb_normals))
-                for j in range(i + 1, len(pb_normals))
-            ]
-            res.c_angle_deg = round(max(angles_computed), 1)
-        else:
-            notes.append('C-angle: insufficient posterior-body normals (need ≥2)')
-    except Exception as exc:
-        notes.append(f'C-angle computation failed: {exc}')
-
-    # Run sanity checks — may null out implausible angles
-    _run_sanity_checks(res)
-
-    # Re-compute delta after sanity checks (D or D1 may have been nulled)
-    if res.d_angle_deg is not None and res.d1_angle_deg is not None:
-        res.delta_angle_deg = round(res.d_angle_deg - res.d1_angle_deg, 1)
-    elif res.delta_angle_deg is not None and (res.d_angle_deg is None or res.d1_angle_deg is None):
-        res.delta_angle_deg = None  # delta is invalid if either component was nulled
-
-    # Diagnostic flags
-    if res.delta_angle_deg is not None:
-        res.delta_positive = (res.delta_angle_deg <= DELTA_TYPE2_THRESHOLD)
-        res.delta_any_lstv = (res.delta_angle_deg <= DELTA_ANY_LSTV_THRESHOLD)
-
-    if res.c_angle_deg is not None:
-        res.c_positive = (res.c_angle_deg <= C_LSTV_THRESHOLD)
-
-    if res.a_angle_deg is not None:
-        res.a_angle_elevated = (res.a_angle_deg > A_INCREASED_THRESHOLD)
-
-    if res.d_angle_deg is not None:
-        res.d_angle_decreased = (res.d_angle_deg < D_DECREASED_THRESHOLD)
-
-    if disc_above_dhi is not None and disc_below_dhi is not None:
-        res.disc_pattern_lstv = (
-            disc_above_dhi < dhi_moderate_pct and
-            disc_below_dhi >= dhi_mild_pct
+        angles: LSTVAngles = compute_angles(
+            vol,
+            tv_label        = tv_label,
+            tv_minus1_label = tv_minus1_label,
+            sacrum_label    = _TSS_SACRUM,
+            l3_label        = l3_label,
+            sp_corpus_volume = sp_corpus_vol,
+            voxel_spacing_mm = spacing,
         )
+    except Exception as exc:
+        result.computation_notes.append(f"compute_angles raised: {exc}")
+        logger.error("compute_vertebral_angles inner call failed: %s", exc)
+        return result
 
-    res.angles_available = (
-        res.delta_angle_deg is not None or
-        res.c_angle_deg     is not None
+    # Populate VertebralAnglesResult from LSTVAngles
+    result.a_angle_deg     = angles.A
+    result.b_angle_deg     = angles.B
+    result.c_angle_deg     = angles.C
+    result.d_angle_deg     = angles.D
+    result.d1_angle_deg    = angles.D1
+    result.delta_angle_deg = angles.delta
+    result.angle_flags     = angles.flags
+    result.angles_available = any(
+        v is not None for v in (angles.A, angles.D, angles.delta)
     )
 
-    # LR keys
-    lr_keys: List[str] = []
-    if res.delta_positive:
-        lr_keys.append('angle_delta_type2')
-    elif res.delta_any_lstv:
-        lr_keys.append('angle_delta_any_lstv')
-    if res.c_positive:
-        lr_keys.append('angle_c_lstv')
-    if res.a_angle_elevated:
-        lr_keys.append('angle_a_elevated')
-    if res.d_angle_decreased:
-        lr_keys.append('angle_d_decreased')
-    res.angle_lr_keys_fired = lr_keys
+    # Classification flags
+    if angles.delta is not None:
+        result.delta_positive = angles.delta <= 8.5   # ≤8.5°
+        result.delta_any_lstv = angles.delta <= 15.0
+    if angles.C is not None:
+        result.c_positive = angles.C <= 35.5                # ≤35.5°
+    if angles.A is not None:
+        result.a_angle_elevated = angles.A > 41.0            # >41°
 
-    # Summary
-    parts = []
-    if res.delta_angle_deg is not None:
-        parts.append(f"delta={res.delta_angle_deg:.1f}°"
-                     f"{'⚠TYPE2' if res.delta_positive else ('⚠LSTV' if res.delta_any_lstv else '')}")
-    if res.c_angle_deg is not None:
-        parts.append(f"C={res.c_angle_deg:.1f}°{'⚠' if res.c_positive else ''}")
-    if res.a_angle_deg is not None:
-        parts.append(f"A={res.a_angle_deg:.1f}°{'↑' if res.a_angle_elevated else ''}")
-    if res.d_angle_deg is not None:
-        parts.append(f"D={res.d_angle_deg:.1f}°{'↓' if res.d_angle_decreased else ''}")
-    if res.d1_angle_deg is not None:
-        parts.append(f"D1={res.d1_angle_deg:.1f}°")
-    if res.b_angle_deg is not None:
-        parts.append(f"B={res.b_angle_deg:.1f}°")
-    if res.disc_pattern_lstv:
-        parts.append('disc-pattern⚠')
-    parts.append(f"[orient:ax{cc_axis}{'↑' if si_positive else '↓'}]")
-    if res.sanity_warnings:
-        parts.append(f'[{len(res.sanity_warnings)} sanity warns]')
-    if notes:
-        parts.append(f'[{len(notes)} notes]')
-    res.summary = '  '.join(parts) if parts else 'angles unavailable'
+    logger.debug(
+        "VertebralAngles: A=%.1f B=%s C=%s D=%.1f D1=%.1f delta=%.1f "
+        "(delta_pos=%s c_pos=%s a_elev=%s)",
+        angles.A or 0,
+        f"{angles.B:.1f}" if angles.B else "–",
+        f"{angles.C:.1f}" if angles.C else "–",
+        angles.D or 0, angles.D1 or 0, angles.delta or 0,
+        result.delta_positive, result.c_positive, result.a_angle_elevated,
+    )
+    return result
 
-    return res
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BAYESIAN UPDATE
-# ══════════════════════════════════════════════════════════════════════════════
 
 def apply_angle_lr_updates(
-        lo_sac:       float,
-        lo_lumb:      float,
-        angle_result: VertebralAnglesResult,
-        existing_criteria: list,
+    lo_sac:    float,
+    lo_lumb:   float,
+    angle_result: VertebralAnglesResult,
+    existing_criteria: list,
 ) -> Tuple[float, float, list]:
-    """Apply angle-based likelihood ratio updates to Bayesian log-odds."""
-    try:
-        from lstv_engine import RadiologicCriterion
-        _has_rc = True
-    except ImportError:
-        _has_rc = False
+    """
+    Apply Bayesian log-odds updates from angle findings and return
+    (updated_lo_sac, updated_lo_lumb, new_RadiologicCriterion_list).
 
-    def _mk_criterion(**kw):
-        if _has_rc:
-            return RadiologicCriterion(**kw)
-        return kw
+    LR values from Seilanian Toosi 2025 (Table 3 / text):
+      delta ≤8.5°  → sens 92.3%, spec 87.9%  →  LR+ ≈ 7.7
+      C ≤35.5°     → LSTV signal              →  LR+ ≈ 4.5
+      A >41°       → sacralization shift       →  LR+ ≈ 2.0
+    """
+    new_criteria: list = []
+    keys_fired:   list = []
 
-    new_crit = []
-
-    for key in angle_result.angle_lr_keys_fired:
-        if key not in _ANGLE_LR:
-            continue
-        lr_ps, lr_ns, lr_pl, lr_nl = _ANGLE_LR[key]
-        ds = float(np.log(max(1e-9, lr_ps)))
-        dl = float(np.log(max(1e-9, lr_pl)))
-        lo_sac  += ds
-        lo_lumb += dl
-
-        if key == 'angle_delta_type2':
-            finding = (
-                f"delta-angle = {angle_result.delta_angle_deg:.1f}° ≤ {DELTA_TYPE2_THRESHOLD}° "
-                f"— primary predictor of Castellvi Type 2 LSTV "
-                f"(sens 92.3%, spec 87.9%, NPV 99.5%; Seilanian Toosi 2025)"
-            )
-        elif key == 'angle_delta_any_lstv':
-            finding = (
-                f"delta-angle = {angle_result.delta_angle_deg:.1f}° ≤ {DELTA_ANY_LSTV_THRESHOLD}° "
-                f"— predicts any LSTV (sens 66.7%, spec 52.2%; Seilanian Toosi 2025)"
-            )
-        elif key == 'angle_c_lstv':
-            finding = (
-                f"C-angle = {angle_result.c_angle_deg:.1f}° ≤ {C_LSTV_THRESHOLD}° "
-                f"— predicts any LSTV (sens 72.2%, spec 57.6%; Seilanian Toosi 2025)"
-            )
-        elif key == 'angle_a_elevated':
-            finding = (
-                f"A-angle = {angle_result.a_angle_deg:.1f}° > {A_INCREASED_THRESHOLD}° "
-                f"— elevated sacral tilt (OR 1.141/deg; Seilanian Toosi 2025)"
-            )
-        elif key == 'angle_d_decreased':
-            finding = (
-                f"D-angle = {angle_result.d_angle_deg:.1f}° < {D_DECREASED_THRESHOLD}° "
-                f"— decreased lumbosacral angle (OR 0.719; Seilanian Toosi 2025)"
-            )
-        else:
-            finding = f"Vertebral angle criterion: {key}"
-
-        new_crit.append(_mk_criterion(
-            name        = key,
-            value       = f"{angle_result.delta_angle_deg or angle_result.c_angle_deg or 0:.1f}°",
-            direction   = 'sacralization',
-            strength    = 'primary' if key == 'angle_delta_type2' else 'secondary',
-            lr_sac      = round(ds, 3),
-            lr_lumb     = round(dl, 3),
-            citation    = 'Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280',
-            finding     = finding,
+    if angle_result.delta_positive:
+        delta_update = float(np.log(7.7))
+        lo_sac      += delta_update
+        keys_fired.append('delta_le_8.5')
+        new_criteria.append(RadiologicCriterion(
+            name='delta_angle',
+            value=f'{angle_result.delta_angle_deg:.1f}°',
+            direction='sacralization',
+            strength='primary',
+            lr_sac=round(delta_update, 3),
+            lr_lumb=0.0,
+            citation='Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280',
+            finding=(
+                f'delta-angle {angle_result.delta_angle_deg:.1f}° ≤ 8.5° — '
+                f'Type 2 LSTV (sens 92.3%, spec 87.9%, NPV 99.5%)'),
+        ))
+    elif angle_result.delta_any_lstv:
+        delta_update = float(np.log(2.5))
+        lo_sac      += delta_update
+        keys_fired.append('delta_le_15')
+        new_criteria.append(RadiologicCriterion(
+            name='delta_angle_borderline',
+            value=f'{angle_result.delta_angle_deg:.1f}°',
+            direction='sacralization',
+            strength='supporting',
+            lr_sac=round(delta_update, 3),
+            lr_lumb=0.0,
+            citation='Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280',
+            finding=f'delta-angle {angle_result.delta_angle_deg:.1f}° ≤ 15° — borderline LSTV signal',
         ))
 
-    return lo_sac, lo_lumb, new_crit
+    if angle_result.c_positive:
+        c_update = float(np.log(4.5))
+        lo_sac  += c_update
+        keys_fired.append('c_le_35.5')
+        new_criteria.append(RadiologicCriterion(
+            name='c_angle',
+            value=f'{angle_result.c_angle_deg:.1f}°',
+            direction='sacralization',
+            strength='secondary',
+            lr_sac=round(c_update, 3),
+            lr_lumb=0.0,
+            citation='Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280',
+            finding=f'C-angle {angle_result.c_angle_deg:.1f}° ≤ 35.5° — LSTV posterior alignment signal',
+        ))
+
+    if angle_result.a_angle_elevated:
+        a_update = float(np.log(2.0))
+        lo_sac  += a_update
+        keys_fired.append('a_gt_41')
+        new_criteria.append(RadiologicCriterion(
+            name='a_angle_elevated',
+            value=f'{angle_result.a_angle_deg:.1f}°',
+            direction='sacralization',
+            strength='supporting',
+            lr_sac=round(a_update, 3),
+            lr_lumb=0.0,
+            citation='Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280',
+            finding=f'A-angle {angle_result.a_angle_deg:.1f}° > 41° — elevated sacral tilt',
+        ))
+
+    angle_result.angle_lr_keys_fired = keys_fired
+    return lo_sac, lo_lumb, new_criteria
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STANDALONE TEST HARNESS
-# ══════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# 04_detect_lstv.py v5.2 interface: tp_in_correct_zone
+# ============================================================
 
-if __name__ == '__main__':
-    import sys
-    print("lstv_angles.py v2 — orientation-robust sanity-checked test")
-    print()
+def tp_in_correct_zone(
+    tp_mask:     np.ndarray,
+    tss_vol:     np.ndarray,
+    cc_axis:     int  = 2,
+    si_positive: bool = True,
+) -> Tuple[bool, str]:
+    """
+    Check whether a TP mask's craniocaudal centroid lies within the valid
+    L5 transverse-process zone:
 
-    def _make_spine_volume(shape, cc_axis, si_positive, sac_tilt_deg=40.0):
-        vert = np.zeros(shape, np.int32)
-        sp   = np.zeros(shape, np.int32)
+        lower bound: cranial (superior) face of L5-S1 disc (TSS label 100)
+                     fallback: cranial face of sacrum        (TSS label 50)
+        upper bound: caudal  (inferior) face of L4-L5 disc  (TSS label 95)
+                     fallback: cranial  face of TSS L5        (label 45)
 
-        def _fill(label, cc_lo, cc_hi, perp_lo, perp_hi, perp2_lo, perp2_hi):
-            idx = [slice(None)] * 3
-            idx[cc_axis] = slice(
-                cc_lo if si_positive else shape[cc_axis] - cc_hi - 1,
-                (cc_hi if si_positive else shape[cc_axis] - cc_lo) + 1
-            )
-            axes = [0, 1, 2]
-            non_cc = [a for a in axes if a != cc_axis]
-            idx[non_cc[0]] = slice(perp_lo, perp_hi)
-            idx[non_cc[1]] = slice(perp2_lo, perp2_hi)
-            vert[tuple(idx)] = label
-            sp[tuple(idx)]   = SP_CORPUS
+    In standard canonical (RAS) with si_positive=True: larger CC index = cranial.
+    So:
+        lower_bound = max CC of L5-S1 disc  (its cranial face)
+        upper_bound = min CC of L4-L5 disc  (its caudal  face)
 
-        _fill(22, 55, 67, 15, 45, 10, 50)
-        _fill(23, 40, 54, 15, 45, 10, 50)
-        _fill(24, 24, 39, 15, 45, 10, 50)
+    Returns
+    -------
+    (ok: bool, message: str)
+    """
+    if not tp_mask.any():
+        return True, "TP mask empty — skipping zone check"
 
-        axes = [0, 1, 2]
-        non_cc = [a for a in axes if a != cc_axis]
-        ap_axis = non_cc[1]
-        tilt_slope = np.tan(np.radians(sac_tilt_deg))
+    centroid_cc = float(np.mean(np.where(tp_mask)[cc_axis]))
 
-        for cc_i in range(0, 24):
-            cc_real = cc_i if si_positive else shape[cc_axis] - cc_i - 1
-            ap_offset = int(cc_i * tilt_slope)
-            idx = [slice(None)] * 3
-            idx[cc_axis]  = cc_real
-            idx[non_cc[0]] = slice(15, 45)
-            idx[ap_axis]   = slice(10 + ap_offset, 50 + ap_offset)
-            vert[tuple(idx)] = 26
-            sp[tuple(idx)]   = SP_CORPUS
-
-        return vert, sp
-
-    shape = (80, 80, 80)
-    scenarios = [
-        ("RAS canonical (cc=axis2, si_pos=True)",  2, True),
-        ("Non-standard (cc=axis0, si_pos=True)",   0, True),
-        ("Non-standard (cc=axis1, si_pos=True)",   1, True),
-        ("Inverted SI   (cc=axis2, si_pos=False)", 2, False),
-    ]
-
-    all_pass = True
-    for name, cc_ax, si_pos in scenarios:
-        print(f"  Scenario: {name}")
-        vert, sp = _make_spine_volume(shape, cc_ax, si_pos, sac_tilt_deg=40.0)
-        result = compute_vertebral_angles(
-            sp_iso=sp, vert_iso=vert, tss_iso=None,
-            tv_veridah_label=VD_L5,
-            disc_above_dhi=65.0, disc_below_dhi=85.0,
-        )
-        print(f"    Detected: cc_axis={result.detected_cc_axis} "
-              f"si_positive={result.detected_si_positive}")
-        print(f"    A={result.a_angle_deg}°  D={result.d_angle_deg}°  "
-              f"D1={result.d1_angle_deg}°  delta={result.delta_angle_deg}°  "
-              f"C={result.c_angle_deg}°")
-        if result.sanity_warnings:
-            print(f"    Sanity: {result.sanity_warnings}")
-        print(f"    Summary: {result.summary}")
-
-        orient_ok = (result.detected_cc_axis == cc_ax and
-                     result.detected_si_positive == si_pos)
-        a_ok = (result.a_angle_deg is not None and
-                25.0 < result.a_angle_deg < 60.0)
-        delta_ok = result.delta_angle_deg is not None
-
-        status = "✓" if (orient_ok and a_ok and delta_ok) else "✗ FAIL"
-        if not (orient_ok and a_ok and delta_ok):
-            all_pass = False
-        print(f"    {status}")
-        print()
-
-    # Test PCA TP height — CC component selection
-    print("  TP height PCA test (CC-axis component, not longest):")
-    # Build a TP that is wide mediolaterally (x) and short craniocaudally (z)
-    # Long axis ~30mm in x, height ~10mm in z — longest PCA axis would be x,
-    # but the correct measurement is the z-extent (CC height).
-    tp_test = np.zeros((50, 50, 50), bool)
-    tp_test[5:35, 20:30, 20:30] = True  # 30mm wide (x), 10mm tall (z)
-
-    # Without disc info — should pick axis aligned with z (cc_axis=2)
-    h_cc, axis_cc = measure_tp_height_pca(tp_test, vox_mm=1.0, tss_iso=None,
-                                           cc_axis=2, si_positive=True)
-    h_naive = float((tp_test.nonzero()[2].max() - tp_test.nonzero()[2].min() + 1))
-    print(f"    Z-span (naive): {h_naive:.1f}mm  PCA CC height (no disc): {h_cc:.1f}mm  "
-          f"axis={axis_cc.round(3)}")
-    cc_ok = abs(h_cc - h_naive) < 3.0 and abs(axis_cc[2]) > 0.8
-    print(f"    {'✓ CC axis selected correctly' if cc_ok else '✗ FAIL — wrong axis selected'}")
-
-    # With synthetic disc TSS — discs at z=15 (L5S1=100) and z=25 (L4L5=95)
-    tss_test = np.zeros((50, 50, 50), np.int32)
-    tss_test[15:25, 15:35, 13:17] = 100   # L5-S1 disc at z~15 (caudal)
-    tss_test[15:25, 15:35, 23:27] = 95    # L4-L5 disc at z~25 (cranial)
-    h_disc, axis_disc = measure_tp_height_pca(tp_test, vox_mm=1.0, tss_iso=tss_test,
-                                               cc_axis=2, si_positive=True)
-    print(f"    PCA CC height (with disc axis): {h_disc:.1f}mm  axis={axis_disc.round(3)}")
-    disc_ok = abs(h_disc - h_naive) < 3.0
-    print(f"    {'✓ Disc-guided axis correct' if disc_ok else '✗ FAIL — disc-guided axis wrong'}")
-
-    if all_pass:
-        print("\n✓ All orientation scenarios passed")
-        sys.exit(0)
+    # ── upper bound: caudal (inferior) face of L4-L5 disc ──────────────────
+    disc_l4l5 = (tss_vol == 95)
+    tss_l5    = (tss_vol == 45)
+    if disc_l4l5.any():
+        cc_vals = np.where(disc_l4l5)[cc_axis]
+        upper   = float(cc_vals.min() if si_positive else cc_vals.max())
+        upper_src = "L4-L5 disc (TSS 95) caudal face"
+    elif tss_l5.any():
+        cc_vals = np.where(tss_l5)[cc_axis]
+        upper   = float(cc_vals.max() if si_positive else cc_vals.min())
+        upper_src = "TSS L5 (label 45) cranial face [fallback]"
     else:
-        print("\n✗ One or more scenarios FAILED")
-        sys.exit(1)
+        upper     = None
+        upper_src = "unavailable"
+
+    # ── lower bound: cranial (superior) face of L5-S1 disc ─────────────────
+    disc_l5s1 = (tss_vol == 100)
+    tss_sac   = (tss_vol == 50)
+    if disc_l5s1.any():
+        cc_vals = np.where(disc_l5s1)[cc_axis]
+        lower   = float(cc_vals.max() if si_positive else cc_vals.min())
+        lower_src = "L5-S1 disc (TSS 100) cranial face"
+    elif tss_sac.any():
+        cc_vals = np.where(tss_sac)[cc_axis]
+        lower   = float(cc_vals.max() if si_positive else cc_vals.min())
+        lower_src = "sacrum (TSS 50) cranial face [fallback]"
+    else:
+        lower     = None
+        lower_src = "unavailable"
+
+    # ── check ───────────────────────────────────────────────────────────────
+    if lower is None and upper is None:
+        return True, "bounds unavailable — cannot validate zone"
+
+    if si_positive:
+        below_disc = (lower is not None and centroid_cc < lower)
+        above_l4l5 = (upper is not None and centroid_cc > upper)
+    else:
+        below_disc = (lower is not None and centroid_cc > lower)
+        above_l4l5 = (upper is not None and centroid_cc < upper)
+
+    if below_disc:
+        return False, (
+            f"TP centroid CC={centroid_cc:.1f} BELOW lower bound={lower:.1f} "
+            f"({lower_src}) — TP displaced into sacrum"
+        )
+    if above_l4l5:
+        return False, (
+            f"TP centroid CC={centroid_cc:.1f} ABOVE upper bound={upper:.1f} "
+            f"({upper_src}) — TP belongs to L4, not L5"
+        )
+
+    return True, (
+        f"TP centroid CC={centroid_cc:.1f} in zone "
+        f"[{lower if lower is not None else '?':.1f}, "
+        f"{upper if upper is not None else '?':.1f}] "
+        f"(lower={lower_src}, upper={upper_src})"
+    )

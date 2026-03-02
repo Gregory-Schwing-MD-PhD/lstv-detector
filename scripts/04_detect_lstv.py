@@ -1,10 +1,27 @@
 #!/usr/bin/env python3
 """
-04_detect_lstv.py — Hybrid Two-Phase LSTV Castellvi Classifier (v5.2)
+04_detect_lstv.py — Hybrid Two-Phase LSTV Castellvi Classifier (v5.3)
 ======================================================================
 Classifies Lumbosacral Transitional Vertebrae (LSTV) using the Castellvi
 system, then calls lstv_engine.py for radiologically-grounded phenotype
 classification (lumbarization / sacralization / transitional_indeterminate).
+
+WHAT'S NEW IN v5.3
+------------------
+- BUG FIX: All vertebral angle key names corrected.  v5.2 read wrong keys
+  from the vertebral_angles dict (e.g. 'delta_angle', 'delta_le8p5', 'c_le35p5',
+  'disc_pattern_lstv', 'a_increased', 'd_decreased') — these do NOT exist in
+  VertebralAngles.  Correct names: delta_angle_deg, delta_positive, c_positive,
+  disc_pattern_l4dehy_l5preserved, a_angle_elevated, d_angle_decreased,
+  c_angle_deg, a_angle_deg, b_angle_deg, d_angle_deg, d1_angle_deg.
+  This caused ALL angle-based LSTV detection and logging to silently produce
+  N/A values and miss detections.
+
+- BUG FIX: TP concordance now passed to lstv_engine correctly.
+  validate_tp_concordance() now returns (TPConcordanceResult, corrected_z).
+  load_lstv_masks() is called with tp_concordance_precomputed= so the engine
+  uses the correctly-computed (TSS-voxel-space) result instead of re-running
+  its broken cross-NIfTI-space comparison.
 
 WHAT'S NEW IN v5.2
 ------------------
@@ -19,21 +36,21 @@ WHAT'S NEW IN v5.2
 
 CASTELLVI CLASSIFICATION (Castellvi et al. 1984, Spine 9:31-35)
 -----------------------------------------------------------------
-Type I   : Dysplastic TP ≥ 19 mm craniocaudal height, no sacral contact
+Type I   : Dysplastic TP >= 19 mm craniocaudal height, no sacral contact
            Ia = unilateral; Ib = bilateral
 Type II  : Pseudo-articulation (diarthrodial joint) between TP and sacrum
            IIa = unilateral; IIb = bilateral
 Type III : Complete osseous fusion of TP with sacrum
            IIIa = unilateral; IIIb = bilateral
-Type IV  : Mixed — one side Type II, other side Type III
+Type IV  : Mixed -- one side Type II, other side Type III
 
-LABEL REFERENCE — SOURCE DISAMBIGUATION
+LABEL REFERENCE -- SOURCE DISAMBIGUATION
 ----------------------------------------
 SPINEPS seg-spine_msk.nii.gz  (subregion / semantic labels):
-  43 = Costal_Process_Left   ← TP SOURCE
-  44 = Costal_Process_Right  ← TP SOURCE
+  43 = Costal_Process_Left   <- TP SOURCE
+  44 = Costal_Process_Right  <- TP SOURCE
   26 = Sacrum
-  ⚠ TSS labels 43/44 = L3/L4 vertebral bodies — NEVER used as TP source
+  TSS labels 43/44 = L3/L4 vertebral bodies -- NEVER used as TP source
 
 SPINEPS seg-vert_msk.nii.gz  (VERIDAH per-vertebra instance labels):
   20=L1  21=L2  22=L3  23=L4  24=L5  25=L6  26=Sacrum
@@ -60,6 +77,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from lstv_engine import (
     load_lstv_masks, analyze_lstv, compute_lstv_pathology_score,
+    TPConcordanceResult,
     TP_HEIGHT_MM, CONTACT_DIST_MM,
     TSS_SACRUM, TSS_LUMBAR, SP_TP_L, SP_TP_R, SP_SACRUM,
     VD_L1, VD_L2, VD_L3, VD_L4, VD_L5, VD_L6, VD_SAC,
@@ -67,7 +85,7 @@ from lstv_engine import (
 )
 from lstv_angles import tp_in_correct_zone   # v5.2: disc-boundary TP validation
 
-# ── Vertebral angle thresholds (Seilanian Toosi et al. 2025) ──────────────────
+# -- Vertebral angle thresholds (Seilanian Toosi et al. 2025) -----------------
 DELTA_ANGLE_TYPE2_THRESHOLD = 8.5
 C_ANGLE_LSTV_THRESHOLD      = 35.5
 A_ANGLE_NORMAL_MEDIAN       = 41.0
@@ -77,26 +95,26 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s  %(levelname)-7s  %(message)s')
 logger = logging.getLogger(__name__)
 
-# ── Phase 2 signal thresholds ─────────────────────────────────────────────────
+# -- Phase 2 signal thresholds ------------------------------------------------
 BBOX_HALF          = 16
 P2_DARK_CLEFT_FRAC = 0.55
 P2_MIN_STD_RATIO   = 0.12
 
-# ── Cross-validation thresholds ───────────────────────────────────────────────
+# -- Cross-validation thresholds ----------------------------------------------
 XVAL_MIN_DICE      = 0.30
 XVAL_MAX_CENTROID  = 20.0
 
-# ── TP sacrum-overlap threshold ───────────────────────────────────────────────
+# -- TP sacrum-overlap threshold ----------------------------------------------
 TP_SACRUM_OVERLAP_FRAC = 0.10
 
-# ── TSS disc labels ───────────────────────────────────────────────────────────
-TSS_DISC_L4L5 = 95    # L4-L5 disc — TP centroid must be BELOW (caudal to) this
-TSS_DISC_L5S1 = 100   # L5-S1 disc — TP centroid must be ABOVE (cranial to) this
+# -- TSS disc labels ----------------------------------------------------------
+TSS_DISC_L4L5 = 95    # L4-L5 disc -- TP centroid must be BELOW (caudal to) this
+TSS_DISC_L5S1 = 100   # L5-S1 disc -- TP centroid must be ABOVE (cranial to) this
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # NIfTI HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def load_canonical(path: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
     nii  = nib.load(str(path))
@@ -115,9 +133,9 @@ def voxel_size_mm(nii: nib.Nifti1Image) -> np.ndarray:
     return np.abs(np.array(nii.header.get_zooms()[:3], dtype=float))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # CROSS-VALIDATION
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def dice_coefficient(a: np.ndarray, b: np.ndarray) -> float:
     a, b  = a.astype(bool), b.astype(bool)
@@ -144,11 +162,11 @@ def run_cross_validation(sag_spineps: np.ndarray,
         d = dice_coefficient(sp_sac, tss_sac)
         xval['sacrum_dice'] = round(d, 4)
         if d < XVAL_MIN_DICE:
-            msg = f"Sacrum Dice={d:.3f} < {XVAL_MIN_DICE} — SPINEPS/TSS sacrum mismatch"
+            msg = f"Sacrum Dice={d:.3f} < {XVAL_MIN_DICE} -- SPINEPS/TSS sacrum mismatch"
             logger.warning(f"  [{study_id}] {msg}")
             xval['warnings'].append(msg)
         else:
-            logger.info(f"  [{study_id}] Sacrum Dice={d:.3f} ✓")
+            logger.info(f"  [{study_id}] Sacrum Dice={d:.3f} OK")
 
     vd_l5  = (sag_vert == VD_L5)
     tss_l5 = (sag_tss  == 45)
@@ -163,14 +181,14 @@ def run_cross_validation(sag_spineps: np.ndarray,
                 logger.warning(f"  [{study_id}] {msg}")
                 xval['warnings'].append(msg)
             else:
-                logger.info(f"  [{study_id}] L5 centroid dist={dist:.1f}mm ✓")
+                logger.info(f"  [{study_id}] L5 centroid dist={dist:.1f}mm OK")
 
     return xval
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # MASK OPERATIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def get_tv_z_range(vert_data: np.ndarray, tv_label: int) -> Optional[Tuple[int, int]]:
     mask = (vert_data == tv_label)
@@ -250,9 +268,9 @@ def min_dist_3d(mask_a: np.ndarray, mask_b: np.ndarray,
     return dist_mm, vox_a, vox_b
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TP CONCORDANCE CHECK  (v5.2: uses lstv_angles.tp_in_correct_zone)
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# TP CONCORDANCE CHECK  (v5.3: returns TPConcordanceResult for engine passthrough)
+# =============================================================================
 
 def validate_tp_concordance(sag_sp:    np.ndarray,
                              sag_vert:  np.ndarray,
@@ -260,56 +278,81 @@ def validate_tp_concordance(sag_sp:    np.ndarray,
                              vox_mm:    np.ndarray,
                              tv_z:      Tuple[int, int],
                              sac_mask:  np.ndarray,
-                             study_id:  str) -> Tuple[bool, Tuple[int, int]]:
+                             study_id:  str) -> Tuple[TPConcordanceResult, Tuple[int, int]]:
     """
     Validate TP mask positions using disc-boundary zone checking.
 
+    v5.3: Returns (TPConcordanceResult, corrected_tv_z) so lstv_engine can use
+    the correct concordance (computed here in TSS voxel space) instead of
+    re-running its broken cross-NIfTI-space comparison.
+
     v5.2: Uses tp_in_correct_zone() from lstv_angles.py, which checks:
       - TP centroid is BELOW (caudal to) the inferior edge of L4-L5 disc (TSS 95)
-        → prevents the L4 TP being used instead of L5 TP
       - TP centroid is ABOVE (cranial to) the superior edge of L5-S1 disc / sacrum
-        → prevents displaced TPs counted as being inside the sacrum
 
-    Additionally checks overlap fraction with TSS sacrum as a secondary signal.
-
-    Returns (corrected: bool, corrected_tv_z: Tuple[int,int])
+    Returns (TPConcordanceResult, corrected_tv_z: Tuple[int,int])
     """
+    tc = TPConcordanceResult()
+    tc.checked = True
+
     if sag_tss is None:
-        return False, tv_z
+        tc.checked = False
+        tc.notes.append("TSS not available -- TP concordance skipped")
+        return tc, tv_z
 
     tss_sacrum_mask = (sag_tss == TSS_SACRUM)
     if not tss_sacrum_mask.any():
-        return False, tv_z
+        tc.checked = False
+        tc.notes.append("TSS sacrum absent -- TP concordance skipped")
+        return tc, tv_z
 
-    # Detect cranio-caudal orientation from masks
-    # In canonical RAS after nib.as_closest_canonical: axis 2 = Z = cranio-caudal
-    # si_positive = True (larger Z index = more cranial / superior)
-    # This matches the nib.as_closest_canonical guarantee.
     cc_axis     = 2
     si_positive = True
 
-    # Log disc label availability
-    disc_95_present  = (sag_tss == TSS_DISC_L4L5).any()
-    disc_100_present = (sag_tss == TSS_DISC_L5S1).any()
+    # Establish bounds for the result object
+    disc_l4l5 = (sag_tss == TSS_DISC_L4L5)
+    disc_l5s1 = (sag_tss == TSS_DISC_L5S1)
+    if disc_l4l5.any():
+        tc.upper_bound_cc  = float(np.where(disc_l4l5)[cc_axis].min())
+        tc.upper_bound_src = "L4-L5 disc (TSS 95) caudal face"
+    if disc_l5s1.any():
+        tc.lower_bound_cc  = float(np.where(disc_l5s1)[cc_axis].max())
+        tc.lower_bound_src = "L5-S1 disc (TSS 100) cranial face"
+    elif tss_sacrum_mask.any():
+        tc.lower_bound_cc  = float(np.where(tss_sacrum_mask)[cc_axis].max())
+        tc.lower_bound_src = "TSS sacrum (label 50) cranial face [fallback]"
+
+    disc_95_present  = disc_l4l5.any()
+    disc_100_present = disc_l5s1.any()
     logger.debug(
         f"  [{study_id}] TP concordance disc labels: "
-        f"L4-L5(95)={'✓' if disc_95_present else '✗'}  "
-        f"L5-S1(100)={'✓' if disc_100_present else '✗'}"
+        f"L4-L5(95)={'Y' if disc_95_present else 'N'}  "
+        f"L5-S1(100)={'Y' if disc_100_present else 'N'}"
     )
 
     def _check_side(tp_lbl: int, side: str) -> bool:
+        """Returns True if TP is displaced (zone violation)."""
         isolated = isolate_tp_at_tv(sag_sp, tp_lbl, *tv_z)
         tp = inferiormost_tp_cc(isolated, tss_sacrum_mask)
         if not tp.any():
+            if side == 'left':  tc.left_in_bounds  = None
+            else:               tc.right_in_bounds = None
+            tc.notes.append(f"  {side}: TP absent")
             return False
 
         n_tp         = int(tp.sum())
         overlap_frac = int((tp & tss_sacrum_mask).sum()) / n_tp
-        centroid_z   = float(np.mean(np.where(tp)[2]))
+        centroid_z   = float(np.mean(np.where(tp)[cc_axis]))
 
-        # Primary check: disc-boundary zone validation
+        if side == 'left':  tc.left_centroid_cc  = centroid_z
+        else:               tc.right_centroid_cc = centroid_z
+
         zone_ok, zone_msg = tp_in_correct_zone(
             tp, sag_tss, cc_axis=cc_axis, si_positive=si_positive)
+
+        in_bounds = zone_ok
+        if side == 'left':  tc.left_in_bounds  = in_bounds
+        else:               tc.right_in_bounds = in_bounds
 
         logger.info(
             f"  [{study_id}] {side:5s} TP  sacrum_overlap={overlap_frac:.1%}  "
@@ -318,18 +361,22 @@ def validate_tp_concordance(sag_sp:    np.ndarray,
         )
 
         if not zone_ok:
-            logger.warning(
-                f"  [{study_id}] {side} TP ZONE VIOLATION — {zone_msg}")
+            logger.warning(f"  [{study_id}] {side} TP ZONE VIOLATION -- {zone_msg}")
+            tc.notes.append(f"  {side}: centroid={centroid_z:.1f} FAIL {zone_msg}")
             return True
 
-        # Secondary check: high overlap with sacrum is suspicious even if zone passes
+        tc.notes.append(
+            f"  {side}: centroid={centroid_z:.1f} OK  "
+            f"[{tc.lower_bound_cc},{tc.upper_bound_cc}]")
+
         if overlap_frac >= TP_SACRUM_OVERLAP_FRAC:
-            # Verify the centroid is not inside the sacrum proper
             sac_z_max = float(np.where(tss_sacrum_mask)[cc_axis].max())
-            if centroid_z < sac_z_max - 3:  # centroid well inside sacrum body
+            if centroid_z < sac_z_max - 3:
                 logger.warning(
                     f"  [{study_id}] {side} TP HIGH SACRUM OVERLAP ({overlap_frac:.0%}) "
-                    f"AND centroid ({centroid_z:.0f}) inside sacrum body ({sac_z_max:.0f}) — flagging")
+                    f"AND centroid ({centroid_z:.0f}) inside sacrum body ({sac_z_max:.0f}) -- flagging")
+                if side == 'left':  tc.left_in_bounds  = False
+                else:               tc.right_in_bounds = False
                 return True
 
         return False
@@ -337,10 +384,17 @@ def validate_tp_concordance(sag_sp:    np.ndarray,
     displaced_L = _check_side(SP_TP_L, 'left')
     displaced_R = _check_side(SP_TP_R, 'right')
 
-    if not displaced_L and not displaced_R:
-        return False, tv_z
+    n_fail = sum(1 for v in (tc.left_in_bounds, tc.right_in_bounds) if v is False)
+    if n_fail:
+        logger.warning(f"  [{study_id}] TP concordance: {n_fail} side(s) out of bounds")
+    elif tc.lower_bound_cc is not None and tc.upper_bound_cc is not None:
+        logger.info(
+            f"  [{study_id}] TP concordance OK  "
+            f"[{tc.lower_bound_cc:.0f},{tc.upper_bound_cc:.0f}]")
 
-    # Try to find correct TV Z range from TSS L5 or VERIDAH L5
+    if not displaced_L and not displaced_R:
+        return tc, tv_z
+
     ref_z: Optional[Tuple[int, int]] = None
     tss_l5 = (sag_tss == 45) if sag_tss is not None else None
     if tss_l5 is not None and tss_l5.any():
@@ -354,19 +408,19 @@ def validate_tp_concordance(sag_sp:    np.ndarray,
             ref_z = (int(zc.min()), int(zc.max()))
             logger.info(f"  [{study_id}] Using VERIDAH L5 Z reference for correction: {ref_z}")
     if ref_z is None:
-        logger.warning(f"  [{study_id}] Cannot correct TP zone — no L5 reference available")
-        return False, tv_z
+        logger.warning(f"  [{study_id}] Cannot correct TP zone -- no L5 reference available")
+        return tc, tv_z
 
     sides = ('left ' if displaced_L else '') + ('right' if displaced_R else '')
     logger.info(
         f"  [{study_id}] TP correction: {sides.strip()} out-of-zone "
-        f"→ re-isolating both from corrected z={ref_z}")
-    return True, ref_z
+        f"-> re-isolating both from corrected z={ref_z}")
+    return tc, ref_z
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — AXIAL T2w SIGNAL CLASSIFICATION
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# PHASE 2 -- AXIAL T2w SIGNAL CLASSIFICATION
+# =============================================================================
 
 def _extract_bbox(axial_t2w: np.ndarray, midpoint: np.ndarray,
                   half: int = BBOX_HALF) -> Optional[np.ndarray]:
@@ -399,14 +453,14 @@ def _classify_signal(patch: np.ndarray, axial_t2w: np.ndarray) -> Tuple[str, dic
 
     if p_mean < dark_thr:
         feats['reason'] = (f"mean={p_mean:.1f} < dark_thr={dark_thr:.1f} "
-                           f"— dark/intermediate signal → fibrocartilage cleft → Type II")
+                           f"-- dark/intermediate signal -> fibrocartilage cleft -> Type II")
         return 'Type II', feats
     elif cv < P2_MIN_STD_RATIO:
         feats['reason'] = (f"CV={cv:.3f} < {P2_MIN_STD_RATIO} "
-                           f"— uniform bright signal → osseous marrow bridge → Type III")
+                           f"-- uniform bright signal -> osseous marrow bridge -> Type III")
         return 'Type III', feats
     else:
-        feats['reason'] = "Bright but heterogeneous — ambiguous; Type II (conservative)"
+        feats['reason'] = "Bright but heterogeneous -- ambiguous; Type II (conservative)"
         return 'Type II', feats
 
 
@@ -447,9 +501,9 @@ def phase2_axial(side: str, tp_label: int,
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — SAGITTAL GEOMETRIC CLASSIFIER
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# PHASE 1 -- SAGITTAL GEOMETRIC CLASSIFIER
+# =============================================================================
 
 def phase1_sagittal(side: str, tp_label: int,
                     sag_sp: np.ndarray, sag_tss: Optional[np.ndarray],
@@ -483,7 +537,6 @@ def phase1_sagittal(side: str, tp_label: int,
     out['tp_centroid_z_mm'] = round(
         float(np.mean(np.where(tp_mask)[2])) * sag_vox_mm[2], 2)
 
-    # v5.2: Log disc-zone validation result
     if sag_tss is not None:
         zone_ok, zone_msg = tp_in_correct_zone(tp_mask, sag_tss,
                                                 cc_axis=2, si_positive=True)
@@ -512,9 +565,9 @@ def phase1_sagittal(side: str, tp_label: int,
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # L6 VERIFICATION
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 TSS_DISC_LABELS = set(range(91, 101))
 
@@ -525,7 +578,7 @@ def _verify_l6(sag_vert:  np.ndarray,
                tv_z:      Tuple[int, int],
                study_id:  str) -> Tuple[bool, str]:
     if sag_tss is None:
-        return False, "no TSS available — cannot verify L6"
+        return False, "no TSS available -- cannot verify L6"
 
     l6_z_min, l6_z_max = tv_z
     l6_centroid_z = (l6_z_min + l6_z_max) / 2.0
@@ -534,22 +587,22 @@ def _verify_l6(sag_vert:  np.ndarray,
     tss_sac  = (sag_tss == TSS_SACRUM)
 
     if not tss_sac.any():
-        return False, "TSS sacrum (label 50) absent — cannot verify L6 position"
+        return False, "TSS sacrum (label 50) absent -- cannot verify L6 position"
 
     sac_z_sup = float(np.where(tss_sac)[2].max())
 
     if l6_centroid_z <= sac_z_sup:
         return False, (
-            f"L6 centroid z={l6_centroid_z:.0f} ≤ TSS sacrum superior z={sac_z_sup:.0f} "
-            f"— VERIDAH L6 is inside the sacrum (mislabeled sacrum)"
+            f"L6 centroid z={l6_centroid_z:.0f} <= TSS sacrum superior z={sac_z_sup:.0f} "
+            f"-- VERIDAH L6 is inside the sacrum (mislabeled sacrum)"
         )
 
     if tss_l5.any():
         l5_z_min = float(np.where(tss_l5)[2].min())
         if l6_centroid_z >= l5_z_min:
             return False, (
-                f"L6 centroid z={l6_centroid_z:.0f} ≥ TSS L5 inferior z={l5_z_min:.0f} "
-                f"— VERIDAH L6 overlaps TSS L5"
+                f"L6 centroid z={l6_centroid_z:.0f} >= TSS L5 inferior z={l5_z_min:.0f} "
+                f"-- VERIDAH L6 overlaps TSS L5"
             )
 
     disc_above_z: Optional[float] = None
@@ -569,12 +622,12 @@ def _verify_l6(sag_vert:  np.ndarray,
 
     if disc_above_z is None:
         return False, (
-            f"no TSS disc found above VERIDAH L6 (z=[{l6_z_min},{l6_z_max}]) — "
+            f"no TSS disc found above VERIDAH L6 (z=[{l6_z_min},{l6_z_max}]) -- "
             f"no L5-L6 disc space present")
     if disc_below_z is None:
         return False, (
             f"no TSS disc found between VERIDAH L6 inferior (z={l6_z_min}) and "
-            f"TSS sacrum superior (z={sac_z_sup:.0f}) — no L6-S1 disc space present")
+            f"TSS sacrum superior (z={sac_z_sup:.0f}) -- no L6-S1 disc space present")
 
     return True, (
         f"positional OK (centroid z={l6_centroid_z:.0f}, sac_sup={sac_z_sup:.0f}), "
@@ -582,9 +635,9 @@ def _verify_l6(sag_vert:  np.ndarray,
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # PER-STUDY CLASSIFIER
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def classify_study(study_id:       str,
                    spineps_dir:    Path,
@@ -645,7 +698,6 @@ def classify_study(study_id:       str,
     sag_tss  = sag_tss.astype(int)
     vox_mm   = voxel_size_mm(sp_nii)
 
-    # TSS lumbar label inventory
     tss_unique         = sorted(int(v) for v in np.unique(sag_tss) if v > 0)
     tss_lumbar_present = {lbl: name for lbl, name in TSS_LUMBAR.items()
                           if lbl in tss_unique}
@@ -661,15 +713,14 @@ def classify_study(study_id:       str,
     disc_100_present = TSS_DISC_L5S1 in tss_unique
     logger.info(
         f"  [{study_id}] TSS disc labels: "
-        f"L4-L5(95)={'✓' if disc_95_present else '✗'}  "
-        f"L5-S1(100)={'✓' if disc_100_present else '✗'}"
+        f"L4-L5(95)={'Y' if disc_95_present else 'N'}  "
+        f"L5-S1(100)={'Y' if disc_100_present else 'N'}"
     )
 
     xval = run_cross_validation(sag_sp, sag_vert, sag_tss, vox_mm, study_id)
     out['cross_validation'] = xval
     for w in xval.get('warnings', []): out['errors'].append(f'XVAL: {w}')
 
-    # Axial data (Phase 2)
     ax_tss, ax_tss_nii = _load(tss_ax, 'TSS axial')
     ax_sp,  _          = _load(sp_ax,  'registered SPINEPS axial')
     ax_t2w, ax_vox_mm  = None, None
@@ -682,12 +733,11 @@ def classify_study(study_id:       str,
 
     p2_available = (ax_tss is not None and ax_sp is not None and ax_t2w is not None)
     if not p2_available:
-        logger.warning(f"  Phase 2 unavailable — contact cases → Type II (conservative)")
+        logger.warning(f"  Phase 2 unavailable -- contact cases -> Type II (conservative)")
 
     if ax_tss is not None: ax_tss = ax_tss.astype(int)
     if ax_sp  is not None: ax_sp  = ax_sp.astype(int)
 
-    # TV identification
     vert_unique = sorted(int(v) for v in np.unique(sag_vert) if v > 0)
     named       = [VERIDAH_NAMES[l] for l in vert_unique if l in VERIDAH_NAMES]
     logger.info(f"  [{study_id}] VERIDAH labels: {named}")
@@ -704,7 +754,6 @@ def classify_study(study_id:       str,
     if tv_z is None:
         out['errors'].append(f'TV label {tv_name} empty in VERIDAH mask'); return out
 
-    # L6 verification
     l6_verified = False
     if tv_label == VD_L6:
         l6_ok, l6_reason = _verify_l6(sag_vert, sag_tss, vox_mm, tv_z, study_id)
@@ -712,7 +761,7 @@ def classify_study(study_id:       str,
         if not l6_ok:
             logger.warning(
                 f"  [{study_id}] VERIDAH L6 FAILED verification: {l6_reason} "
-                f"— demoting TV to L5"
+                f"-- demoting TV to L5"
             )
             if VD_L5 in vert_unique:
                 tv_label = VD_L5
@@ -722,16 +771,18 @@ def classify_study(study_id:       str,
                 out['errors'].append('L6 verification failed and no VERIDAH L5 fallback')
                 return out
         else:
-            logger.info(f"  [{study_id}] VERIDAH L6 verified ✓ — {l6_reason}")
+            logger.info(f"  [{study_id}] VERIDAH L6 verified OK -- {l6_reason}")
 
-    # TP concordance validation (v5.2: uses disc-zone checking from lstv_angles)
+    # TP concordance validation (v5.3: returns TPConcordanceResult for engine passthrough)
     tss_sac_mask = (sag_tss == TSS_SACRUM) if sag_tss is not None else None
     sac_mask_p1  = (tss_sac_mask
                     if tss_sac_mask is not None and tss_sac_mask.any()
                     else (sag_sp == SP_SACRUM))
 
-    tp_corrected, tv_z_final = validate_tp_concordance(
+    tp_concordance_result, tv_z_final = validate_tp_concordance(
         sag_sp, sag_vert, sag_tss, vox_mm, tv_z, sac_mask_p1, study_id)
+
+    tp_corrected = (tv_z_final != tv_z)
 
     out['details'] = {
         'tv_label':                   tv_label,
@@ -745,17 +796,16 @@ def classify_study(study_id:       str,
         'phase2_available':           p2_available,
         'tp_source':                  'seg-spine_msk labels 43 (L) / 44 (R)',
         'sacrum_source':              'TSS label 50 (preferred) / SPINEPS 26 (fallback)',
-        'label_note':                 'TSS 43/44 = L3/L4 vertebrae — TP always from seg-spine_msk',
+        'label_note':                 'TSS 43/44 = L3/L4 vertebrae -- TP always from seg-spine_msk',
         'tss_lumbar_labels':          tss_lumbar_present,
         'tss_disc_l4l5_present':      disc_95_present,
         'tss_disc_l5s1_present':      disc_100_present,
     }
     logger.info(
         f"  [{study_id}] TV={tv_name}  z=[{tv_z[0]},{tv_z[1]}]"
-        + (f"  → corrected z=[{tv_z_final[0]},{tv_z_final[1]}]" if tp_corrected else "")
+        + (f"  -> corrected z=[{tv_z_final[0]},{tv_z_final[1]}]" if tp_corrected else "")
     )
 
-    # Phase 1 + 2 per side
     for side, tp_lbl in (('left', SP_TP_L), ('right', SP_TP_R)):
         try:
             p1 = phase1_sagittal(side, tp_lbl, sag_sp, sag_tss, vox_mm, tv_z_final)
@@ -779,7 +829,7 @@ def classify_study(study_id:       str,
             elif p1['contact'] and not p2_available:
                 p1['classification'] = 'Type II'
                 p1['phase2']         = {'phase2_attempted': False,
-                                        'p2_note': 'Axial data unavailable — Type II (conservative)'}
+                                        'p2_note': 'Axial data unavailable -- Type II (conservative)'}
                 out['confidence']    = 'low'
 
             out[side] = p1
@@ -789,7 +839,6 @@ def classify_study(study_id:       str,
             logger.error(f"  {side} failed: {exc}")
             logger.debug(traceback.format_exc())
 
-    # Final Castellvi type
     l_cls = out['left'].get('classification',  'Normal')
     r_cls = out['right'].get('classification', 'Normal')
     valid = {l_cls, r_cls} - {'Normal', 'CONTACT_PENDING_P2'}
@@ -804,15 +853,16 @@ def classify_study(study_id:       str,
             out['castellvi_type'] = dominant + 'a'
 
         out['lstv_detected'] = True
-        out['lstv_reason'].append(f"Castellvi {out['castellvi_type']} — TP morphology")
-        logger.info(f"  ✓ [{study_id}] Castellvi: {out['castellvi_type']}")
+        out['lstv_reason'].append(f"Castellvi {out['castellvi_type']} -- TP morphology")
+        logger.info(f"  [{study_id}] Castellvi: {out['castellvi_type']}")
     else:
-        logger.info(f"  ✗ [{study_id}] No Castellvi finding")
+        logger.info(f"  [{study_id}] No Castellvi finding")
 
-    # Extended LSTV morphometrics + angle analysis
     if run_morpho:
         try:
-            masks  = load_lstv_masks(study_id, spineps_dir, totalspine_dir)
+            # v5.3: pass correct TSS-space concordance result into engine
+            masks  = load_lstv_masks(study_id, spineps_dir, totalspine_dir,
+                                     tp_concordance_precomputed=tp_concordance_result)
             morpho = analyze_lstv(masks, castellvi_result=out)
             out['lstv_morphometrics'] = morpho.to_dict()
 
@@ -822,54 +872,51 @@ def classify_study(study_id:       str,
             if consensus is not None and consensus != EXPECTED_LUMBAR:
                 out['lstv_detected'] = True
                 direction = 'LUMBARIZATION' if consensus > EXPECTED_LUMBAR else 'SACRALIZATION'
-                reason = (f"Lumbar count = {consensus} (expected {EXPECTED_LUMBAR}) — "
+                reason = (f"Lumbar count = {consensus} (expected {EXPECTED_LUMBAR}) -- "
                           f"{direction} by vertebral counting "
                           f"(TSS={morpho.lumbar_count_tss}, "
                           f"VERIDAH={morpho.lumbar_count_veridah})")
                 out['lstv_reason'].append(reason)
-                logger.info(f"  ✓ [{study_id}] LSTV: {reason}")
+                logger.info(f"  [{study_id}] LSTV: {reason}")
 
             if phenotype in ('sacralization', 'lumbarization'):
                 out['lstv_detected'] = True
                 primary = morpho.primary_criteria_met or []
                 reason  = (f"Phenotype: {phenotype.upper()} "
-                           f"({morpho.phenotype_confidence} confidence) — "
+                           f"({morpho.phenotype_confidence} confidence) -- "
                            f"criteria: {'; '.join(primary)}")
                 if not any('Phenotype' in r for r in out['lstv_reason']):
                     out['lstv_reason'].append(reason)
-                logger.info(f"  ✓ [{study_id}] LSTV: {reason}")
+                logger.info(f"  [{study_id}] LSTV: {reason}")
 
             # Angle-based LSTV detection (Seilanian Toosi 2025)
+            # v5.3 FIX: use correct VertebralAngles field names
             morpho_dict = out['lstv_morphometrics'] or {}
             va_dict = morpho_dict.get('vertebral_angles') or {}
-            va_delta      = va_dict.get('delta_angle')
-            va_delta_flag = va_dict.get('delta_le8p5', False)
-            va_c_flag     = va_dict.get('c_le35p5', False)
-            va_disc_pat   = va_dict.get('disc_pattern_lstv', False)
-            va_a_increased= va_dict.get('a_increased', False)
-            va_d_decreased= va_dict.get('d_decreased', False)
-            va_c_angle    = va_dict.get('c_angle')
-            va_a_angle    = va_dict.get('a_angle')
-            va_b_angle    = va_dict.get('b_angle')
-            va_d_angle    = va_dict.get('d_angle')
-            va_d1_angle   = va_dict.get('d1_angle')
-            va_summary    = va_dict.get('summary', '')
+            va_delta      = va_dict.get('delta_angle_deg')
+            va_delta_flag = va_dict.get('delta_positive', False)
+            va_c_flag     = va_dict.get('c_positive', False)
+            va_disc_pat   = va_dict.get('disc_pattern_l4dehy_l5preserved', False)
+            va_a_increased= va_dict.get('a_angle_elevated', False)
+            va_d_decreased= va_dict.get('d_angle_decreased', False)
+            va_c_angle    = va_dict.get('c_angle_deg')
+            va_a_angle    = va_dict.get('a_angle_deg')
+            va_b_angle    = va_dict.get('b_angle_deg')
+            va_d_angle    = va_dict.get('d_angle_deg')
+            va_d1_angle   = va_dict.get('d1_angle_deg')
 
-            # Log ALL angles for every case
-            _afmt = lambda v: f'{v:.1f}°' if v is not None else 'N/A'
+            _afmt = lambda v: f'{v:.1f}' if v is not None else 'N/A'
             logger.info(
                 f"  [{study_id}] ANGLES (Seilanian Toosi 2025):"
-                f"  A={_afmt(va_a_angle)}{'↑' if va_a_increased else ''}"
+                f"  A={_afmt(va_a_angle)}{'up' if va_a_increased else ''}"
                 f"  B={_afmt(va_b_angle)}"
-                f"  C={_afmt(va_c_angle)}{'⚠' if va_c_flag else ''}"
-                f"  D={_afmt(va_d_angle)}{'↓' if va_d_decreased else ''}"
+                f"  C={_afmt(va_c_angle)}{'!' if va_c_flag else ''}"
+                f"  D={_afmt(va_d_angle)}{'dn' if va_d_decreased else ''}"
                 f"  D1={_afmt(va_d1_angle)}"
                 f"  delta={_afmt(va_delta)}"
-                f"{'⚠TYPE2' if va_delta_flag else '⚠LSTV' if va_dict.get('delta_any_lstv') else ''}"
-                f"  disc_pattern={'⚠' if va_disc_pat else 'N'}"
+                f"{'!TYPE2' if va_delta_flag else '!LSTV' if va_dict.get('delta_any_lstv') else ''}"
+                f"  disc_pattern={'!' if va_disc_pat else 'N'}"
             )
-            if va_summary:
-                logger.info(f"  [{study_id}] Angles summary: {va_summary}")
 
             sanity_warns = va_dict.get('sanity_warnings', [])
             for sw in sanity_warns:
@@ -877,25 +924,25 @@ def classify_study(study_id:       str,
 
             if va_delta_flag:
                 out['lstv_detected'] = True
-                reason = (f"Angle: delta={va_delta:.1f}° ≤ {DELTA_ANGLE_TYPE2_THRESHOLD}° — "
+                reason = (f"Angle: delta={va_delta:.1f} <= {DELTA_ANGLE_TYPE2_THRESHOLD} -- "
                           f"predicts Castellvi Type 2 LSTV (sens 92.3%, spec 87.9%, "
                           f"NPV 99.5%; Seilanian Toosi 2025)")
                 if not any('delta' in r.lower() and 'Angle' in r for r in out['lstv_reason']):
                     out['lstv_reason'].append(reason)
-                logger.info(f"  ✓ [{study_id}] LSTV (angle/delta): {reason}")
+                logger.info(f"  [{study_id}] LSTV (angle/delta): {reason}")
 
             elif va_c_flag and (va_disc_pat or va_a_increased or va_d_decreased):
                 out['lstv_detected'] = True
                 corroboration = (
                     'disc pattern' if va_disc_pat
-                    else 'A↑' if va_a_increased else 'D↓'
+                    else 'A elevated' if va_a_increased else 'D decreased'
                 )
-                reason = (f"Angle: C={va_c_angle:.1f}° ≤ {C_ANGLE_LSTV_THRESHOLD}° "
-                          f"+ {corroboration} — supports LSTV "
+                reason = (f"Angle: C={va_c_angle:.1f} <= {C_ANGLE_LSTV_THRESHOLD} "
+                          f"+ {corroboration} -- supports LSTV "
                           f"(sens 72.2%, spec 57.6%; Seilanian Toosi 2025)")
                 if not any('C=' in r and 'Angle' in r for r in out['lstv_reason']):
                     out['lstv_reason'].append(reason)
-                logger.info(f"  ✓ [{study_id}] LSTV (angle/C+): {reason}")
+                logger.info(f"  [{study_id}] LSTV (angle/C+): {reason}")
 
             elif va_disc_pat and not out['lstv_detected']:
                 out['lstv_detected'] = True
@@ -903,7 +950,7 @@ def classify_study(study_id:       str,
                           "(OR 19.9 in multivariate; Seilanian Toosi 2025)")
                 if not any('Disc pattern' in r for r in out['lstv_reason']):
                     out['lstv_reason'].append(reason)
-                logger.info(f"  ✓ [{study_id}] LSTV (disc pattern): {reason}")
+                logger.info(f"  [{study_id}] LSTV (disc pattern): {reason}")
 
             logger.info(
                 f"  [{study_id}] Morphometrics: "
@@ -914,6 +961,7 @@ def classify_study(study_id:       str,
 
         except Exception as exc:
             logger.error(f"  [{study_id}] lstv_engine error: {exc}")
+            logger.debug(traceback.format_exc())
             out['errors'].append(f'lstv_engine: {exc}')
 
     # Final summary log
@@ -927,8 +975,9 @@ def classify_study(study_id:       str,
     wl_risk     = sr_dict.get('wrong_level_risk', '?')
     bert_prob   = sr_dict.get('bertolotti_probability', 0)
     rdr         = morpho_dict.get('relative_disc_ratio')
-    delta_val   = va_dict.get('delta_angle')
-    c_val       = va_dict.get('c_angle')
+    # v5.3: correct key names
+    delta_val   = va_dict.get('delta_angle_deg')
+    c_val       = va_dict.get('c_angle_deg')
 
     if out['lstv_detected']:
         ph_str = ''
@@ -937,11 +986,11 @@ def classify_study(study_id:       str,
                       f"({morpho_dict.get('phenotype_confidence','')})")
         angle_str = ''
         if delta_val is not None:
-            angle_str = (f"  delta={delta_val:.1f}°{'⚠' if va_dict.get('delta_le8p5') else ''}"
-                         f"  C={c_val:.1f}°{'⚠' if va_dict.get('c_le35p5') else ''}"
-                         if c_val is not None else f"  delta={delta_val:.1f}°")
+            angle_str = (f"  delta={delta_val:.1f}{'!' if va_dict.get('delta_positive') else ''}"
+                         f"  C={c_val:.1f}{'!' if va_dict.get('c_positive') else ''}"
+                         if c_val is not None else f"  delta={delta_val:.1f}")
         logger.info(
-            f"  ✓✓ [{study_id}] LSTV DETECTED  "
+            f"  [{study_id}] LSTV DETECTED  "
             f"Castellvi={out.get('castellvi_type','None')}  "
             f"{ph_str}  "
             f"P(sac)={p_sac:.0%}  P(lumb)={p_lumb:.0%}  P(norm)={p_norm:.0%}  "
@@ -953,9 +1002,9 @@ def classify_study(study_id:       str,
     else:
         angle_str = ''
         if delta_val is not None and c_val is not None:
-            angle_str = f"  delta={delta_val:.1f}°  C={c_val:.1f}°"
+            angle_str = f"  delta={delta_val:.1f}  C={c_val:.1f}"
         logger.info(
-            f"  ✗✗ [{study_id}] No LSTV  "
+            f"  [{study_id}] No LSTV  "
             f"P(sac)={p_sac:.0%}  P(lumb)={p_lumb:.0%}  P(norm)={p_norm:.0%}"
             + angle_str
         )
@@ -966,9 +1015,9 @@ def classify_study(study_id:       str,
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # STUDY SELECTION
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def select_studies_csv(csv_path: Path, top_n: int, rank_by: str,
                         valid_ids: Optional[set]) -> List[str]:
@@ -984,13 +1033,13 @@ def select_studies_csv(csv_path: Path, top_n: int, rank_by: str,
     return result
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='Hybrid Two-Phase LSTV Castellvi Classifier + Morphometrics (v5.2)',
+        description='Hybrid Two-Phase LSTV Castellvi Classifier + Morphometrics (v5.3)',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--spineps_dir',      required=True)
     parser.add_argument('--totalspine_dir',   required=True)
@@ -1059,12 +1108,14 @@ def main() -> int:
             ph = morpho.get('lstv_phenotype', 'normal')
             phenotype_counts[ph] = phenotype_counts.get(ph, 0) + 1
 
+            # v5.3: correct key names for batch stats
             va = morpho.get('vertebral_angles') or {}
-            if va.get('delta_le8p5'):       delta_le8p5_count += 1
-            if va.get('c_le35p5'):          c_le35p5_count += 1
-            if va.get('disc_pattern_lstv'): disc_pattern_count += 1
+            if va.get('delta_positive'):                     delta_le8p5_count += 1
+            if va.get('c_positive'):                         c_le35p5_count += 1
+            if va.get('disc_pattern_l4dehy_l5preserved'):    disc_pattern_count += 1
             has_ct   = bool(ct and ct not in ('None', None))
-            va_flags = va.get('delta_le8p5') or va.get('c_le35p5') or va.get('disc_pattern_lstv')
+            va_flags = (va.get('delta_positive') or va.get('c_positive')
+                        or va.get('disc_pattern_l4dehy_l5preserved'))
             if va_flags and not has_ct:
                 angle_only_lstv += 1
 
@@ -1122,32 +1173,32 @@ def main() -> int:
     logger.info(f"Errors:                   {errors}")
     logger.info(f"TP concordance fixes:     {tp_correction_count}")
 
-    logger.info(f"\n── Castellvi Type Breakdown ──────────────────────────────")
+    logger.info(f"\n-- Castellvi Type Breakdown --")
     for t, cnt in castellvi_counts.items():
         if cnt: logger.info(f"  {t:12s}: {cnt}")
     total_ct = sum(castellvi_counts.values())
     logger.info(f"  {'TOTAL':12s}: {total_ct}  ({100*total_ct/n:.1f}%)")
 
-    logger.info(f"\n── Vertebral Angle Statistics (Seilanian Toosi 2025) ─────")
-    logger.info(f"  delta ≤ {DELTA_ANGLE_TYPE2_THRESHOLD}° (Type 2 predictor): {delta_le8p5_count} ({100*delta_le8p5_count/n:.1f}%)")
-    logger.info(f"  C ≤ {C_ANGLE_LSTV_THRESHOLD}° (any LSTV):         {c_le35p5_count} ({100*c_le35p5_count/n:.1f}%)")
+    logger.info(f"\n-- Vertebral Angle Statistics (Seilanian Toosi 2025) --")
+    logger.info(f"  delta <= {DELTA_ANGLE_TYPE2_THRESHOLD} (Type 2 predictor): {delta_le8p5_count} ({100*delta_le8p5_count/n:.1f}%)")
+    logger.info(f"  C <= {C_ANGLE_LSTV_THRESHOLD} (any LSTV):         {c_le35p5_count} ({100*c_le35p5_count/n:.1f}%)")
     logger.info(f"  L4-L5 dehyd + L5-S1 preserved:      {disc_pattern_count} ({100*disc_pattern_count/n:.1f}%)")
     logger.info(f"  Angle-only LSTV (no Castellvi):      {angle_only_lstv}")
 
-    logger.info(f"\n── Probability Model Statistics ──────────────────────────")
+    logger.info(f"\n-- Probability Model Statistics --")
     if p_sac_vals:
         logger.info(f"  P(sacralization): mean={float(np.mean(p_sac_vals)):.2%}  >80%: {high_cert_sac}")
         logger.info(f"  P(lumbarization): mean={float(np.mean(p_lumb_vals)):.2%}  >80%: {high_cert_lumb}")
         logger.info(f"  Relative disc ratio < 0.65: {rel_disc_low}")
 
-    logger.info(f"\n── Surgical Risk Distribution ────────────────────────────")
+    logger.info(f"\n-- Surgical Risk Distribution --")
     for risk_lvl in ('critical', 'high', 'moderate', 'low-moderate', 'low'):
         cnt = wl_risk_counts.get(risk_lvl, 0)
         if cnt: logger.info(f"  {risk_lvl:14s}: {cnt} ({100*cnt/n:.1f}%)")
     logger.info(f"  Nerve root ambiguity: {nerve_ambig}")
-    logger.info(f"  Bertolotti P≥50%:     {bertolotti_ge50}")
+    logger.info(f"  Bertolotti P>=50%:     {bertolotti_ge50}")
 
-    logger.info(f"\n── Top-10 Pathology Scores ───────────────────────────────")
+    logger.info(f"\n-- Top-10 Pathology Scores --")
     for sid, sc in scores[:10]:
         r_match = next((r for r in results if r['study_id'] == sid), {})
         morpho  = r_match.get('lstv_morphometrics') or {}
@@ -1163,10 +1214,11 @@ def main() -> int:
         bp      = sr.get('bertolotti_probability', 0)
         rdr     = morpho.get('relative_disc_ratio')
         rdr_str = f'  disc_ratio={rdr:.2f}' if rdr is not None else ''
-        delta_v = va.get('delta_angle')
-        delta_str = f'  delta={delta_v:.1f}°{"⚠" if va.get("delta_le8p5") else ""}' if delta_v is not None else ''
-        c_v     = va.get('c_angle')
-        c_str   = f'  C={c_v:.1f}°{"⚠" if va.get("c_le35p5") else ""}' if c_v is not None else ''
+        # v5.3: correct key names
+        delta_v = va.get('delta_angle_deg')
+        delta_str = f'  delta={delta_v:.1f}{"!" if va.get("delta_positive") else ""}' if delta_v is not None else ''
+        c_v     = va.get('c_angle_deg')
+        c_str   = f'  C={c_v:.1f}{"!" if va.get("c_positive") else ""}' if c_v is not None else ''
         logger.info(
             f"  {sid}: score={sc:.1f}  {ph}  castellvi={ct}  "
             f"P(sac)={ps:.0%}  P(lumb)={pl:.0%}  "
@@ -1210,7 +1262,7 @@ def main() -> int:
     with open(output_dir / 'lstv_summary.json', 'w') as fh:
         json.dump(summary, fh, indent=2, default=str)
 
-    logger.info(f"Results → {out_json}")
+    logger.info(f"Results -> {out_json}")
     return 0
 
 

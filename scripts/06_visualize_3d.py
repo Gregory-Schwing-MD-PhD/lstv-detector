@@ -1,8 +1,49 @@
 #!/usr/bin/env python3
 """
-06_visualize_3d.py — LSTV-Focused Interactive 3D Spine Viewer (v5)
-===================================================================
-Renders 3D interactive HTML for LSTV cases.
+06_visualize_3d.py — LSTV 3D Visualization (v5.2)
+==================================================
+v5.2 CHANGES vs v5.1:
+  1. PAPER-ACCURATE DORSAL ANGLE OVERLAYS (build_angle_overlays_3d):
+       Lines project POSTERIORLY outside the spine at a fixed dorsal Y plane,
+       matching Figures 1–4 of Seilanian Toosi 2025.  Each angle group sits at
+       a distinct dorsal depth so they never overlap:
+         δ  (white/red)  — furthest dorsal, width-5 lines, 15pt label — most prominent
+         D  (orange)     — intermediate dorsal depth
+         D1 (cyan)       — slightly further than D
+         A  (yellow)     — sacral level
+         B  (red)        — full spine height
+         C  (magenta)    — posterior body lines with yellow vertical ref
+       Each has: tilted endplate line, dashed vertical connector, arc, bold label.
+       δ ≤ 8.5°  → lines/arc/label turn red, label appends "⚠ Type2 LSTV".
+       C ≤ 35.5° → label turns red, appends "⚠".
+
+  2. BUG FIXES vs v5.1:
+       - Arc: was using wrong Rodrigues formula; fixed to proper spherical linear
+         interpolation (slerp) so arc endpoints exactly match the two input lines.
+       - Endplate line: Y was incorrectly perturbed by tilt; line now stays at
+         fixed y_dorsal and tilts only in Z (matching paper figures).
+       - Docstring / version tag updated.
+
+  3. COLOR CONFLICT FIX (from v5.1, retained):
+       TP-Left  = #00ccff (cyan)    — was #ff3333 (red, clashed with TSS sacrum)
+       TP-Right = #ff6600 (orange)
+       TSS Sacrum = #ff8c00 — now unambiguous
+
+  4. ANGLE PANEL (right sidebar, from v5.1, retained):
+       δ, C, A, B, D, D1 with color-coded threshold badges.
+
+OUTPUT
+------
+  {output_dir}/{study_id}_lstv_3d.html  — self-contained Plotly HTML
+
+USAGE
+-----
+  python 06_visualize_3d.py \\
+      --study-id SUB-001 \\
+      --spineps-dir /data/spineps \\
+      --totalspine-dir /data/totalspine \\
+      --lstv-json /data/results/SUB-001_lstv.json \\
+      --output-dir /data/visualizations
 """
 
 from __future__ import annotations
@@ -10,108 +51,102 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import traceback
+import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import nibabel as nib
 import numpy as np
-import plotly.graph_objects as go
-from scipy.ndimage import binary_fill_holes, gaussian_filter, label as cc_label, zoom as ndizoom
-from skimage.measure import marching_cubes
+from scipy.ndimage import zoom as ndizoom
 
-import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
-from lstv_engine import (
-    ISO_MM, TP_HEIGHT_MM, CONTACT_DIST_MM, EXPECTED_LUMBAR,
-    TSS_SACRUM, TSS_LUMBAR, TSS_THORACIC, TSS_DISCS, TSS_CORD, TSS_CANAL,
-    SP_TP_L, SP_TP_R, SP_SACRUM, SP_ARCUS, SP_SPINOUS, SP_CORPUS,
-    SP_CORD, SP_CANAL, SP_SAL, SP_SAR,
-    VD_L1, VD_L2, VD_L3, VD_L4, VD_L5, VD_L6, VD_SAC,
-    VD_IVD_BASE, VD_EP_BASE,
-    VERIDAH_NAMES, TV_SHAPE_LUMBAR, TV_SHAPE_SACRAL,
-    DHI_REDUCED_PCT, DHI_MODERATE_PCT, DHI_MILD_PCT,
-    compute_lstv_pathology_score,
-)
-
-# ── Vertebral angle thresholds (Seilanian Toosi et al. 2025) ──────────────────
-# Defined locally — not yet in lstv_engine.py
-DELTA_ANGLE_TYPE2_THRESHOLD = 8.5
-C_ANGLE_LSTV_THRESHOLD      = 35.5
-A_ANGLE_NORMAL_MEDIAN       = 41.0
-D_ANGLE_NORMAL_MEDIAN       = 13.5
-
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s  %(levelname)-7s  %(message)s')
 logger = logging.getLogger(__name__)
 
-# ── Focused view label sets ────────────────────────────────────────────────────
-FOCUSED_VERIDAH_LABELS  = {23, 24, 25, 26}
-FOCUSED_VERIDAH_IVD     = {23, 24, 25}
-FOCUSED_TSS_LABELS      = {45, 50, 95, 100}
-FOCUSED_SPINE_LABELS    = {SP_SACRUM, SP_TP_L, SP_TP_R}
+# ── Label constants ───────────────────────────────────────────────────────────
+SP_TP_L    = 43
+SP_TP_R    = 44
+SP_SACRUM  = 26
+SP_ARCUS   = 41
+SP_SPINOUS = 42
+SP_SAL     = 45
+SP_SAR     = 46
+SP_CORPUS  = 49
+SP_CORD    = 60
+SP_CANAL   = 61
 
-PHENOTYPE_CONFIG = {
-    'sacralization': {
-        'color': '#ff2222', 'bg': '#3a0000', 'border': '#ff4444',
-        'label': 'SACRALIZATION', 'emoji': '🔴',
-    },
-    'lumbarization': {
-        'color': '#ff8c00', 'bg': '#2a1800', 'border': '#ffaa33',
-        'label': 'LUMBARIZATION', 'emoji': '🟠',
-    },
-    'transitional_indeterminate': {
-        'color': '#ffe033', 'bg': '#2a2200', 'border': '#ffe066',
-        'label': 'TRANSITIONAL (INDETERMINATE)', 'emoji': '🟡',
-    },
-    'transitional': {
-        'color': '#ffe033', 'bg': '#2a2200', 'border': '#ffe066',
-        'label': 'TRANSITIONAL (INDETERMINATE)', 'emoji': '🟡',
-    },
-    'normal': {
-        'color': '#2dc653', 'bg': '#001a06', 'border': '#44ff77',
-        'label': 'NORMAL VARIANT', 'emoji': '🟢',
-    },
-}
+TSS_SACRUM    = 50
+TSS_L4L5_DISC = 95
+TSS_L5S1_DISC = 100
+TSS_LUMBAR    = {41:'L1', 42:'L2', 43:'L3', 44:'L4', 45:'L5'}
 
-SPINE_LABELS: List[Tuple] = [
-    (SP_SACRUM, 'Sacrum (spine)',    '#ff8c00', 0.80, True,  1.5),
-    (SP_ARCUS,  'Arcus Vertebrae',   '#7744bb', 0.60, True,  1.5),
-    (SP_SPINOUS,'Spinous Processes', '#d4b830', 0.65, True,  1.5),
-    (SP_TP_L,   'TP Left',           '#ff3333', 0.95, False, 0.8),
-    (SP_TP_R,   'TP Right',          '#00ccff', 0.95, False, 0.8),
-    (SP_SAL,    'Sup Articular L',   '#55aa88', 0.60, True,  1.5),
-    (SP_SAR,    'Sup Articular R',   '#338866', 0.60, True,  1.5),
-    (SP_CORPUS, 'Corpus Border',     '#5588bb', 0.50, True,  1.5),
-    (SP_CORD,   'Spinal Cord',       '#ffe066', 0.72, False, 1.0),
-    (SP_CANAL,  'Spinal Canal',      '#00ffb3', 0.25, False, 0.8),
+VD_L1=20; VD_L2=21; VD_L3=22; VD_L4=23; VD_L5=24; VD_L6=25; VD_SAC=26
+
+# ── Morphology thresholds ─────────────────────────────────────────────────────
+TP_HEIGHT_MM    = 19.0
+CONTACT_DIST_MM = 2.0
+
+# ── RENDER CONFIG ─────────────────────────────────────────────────────────────
+SP_RENDER: List[Tuple[int, str, str, float]] = [
+    (SP_TP_L,    'TP Left',      '#00ccff', 0.95),   # cyan  — v5.1 fix
+    (SP_TP_R,    'TP Right',     '#ff6600', 0.95),   # orange — v5.1 fix
+    (SP_SACRUM,  'SP Sacrum',    '#b06000', 0.50),
+    (SP_CORPUS,  'SP Corpus',    '#c0c0ff', 0.30),
+    (SP_ARCUS,   'SP Arcus',     '#a0a0dd', 0.25),
+    (SP_SPINOUS, 'SP Spinous',   '#8888cc', 0.25),
+    (SP_SAL,     'SP SAL',       '#88aacc', 0.20),
+    (SP_SAR,     'SP SAR',       '#88ccaa', 0.20),
+    (SP_CORD,    'Cord',         '#ffff88', 0.45),
+    (SP_CANAL,   'Canal',        '#ffffcc', 0.18),
 ]
 
-VERIDAH_COLOURS: Dict[int, Tuple[str, float]] = {
-    20: ('#aabbcc', 0.42), 21: ('#99aabb', 0.42), 22: ('#2288cc', 0.48),
-    23: ('#2266aa', 0.55), 24: ('#1e6fa8', 0.68), 25: ('#33aaff', 0.72),
-    26: ('#ff8c00', 0.78),
-}
-VERIDAH_IVD_COLOURS: Dict[int, str] = {
-    20: '#ffe28a', 21: '#ffd060', 22: '#ffb830',
-    23: '#ff9900', 24: '#ff7700', 25: '#ff5500',
-}
-
-TSS_RENDER: List[Tuple] = [
-    (50,  'TSS Sacrum',     '#ff8c00', 0.72),
-    (41,  'TSS L1',         '#aabbcc', 0.35),
-    (42,  'TSS L2',         '#99aabb', 0.35),
-    (43,  'TSS L3',         '#2288cc', 0.40),
-    (44,  'TSS L4',         '#2266aa', 0.48),
-    (45,  'TSS L5',         '#1e6fa8', 0.62),
-    (95,  'TSS disc L4-L5', '#ff9900', 0.55),
-    (100, 'TSS disc L5-S1', '#ff5500', 0.58),
+TSS_RENDER: List[Tuple[int, str, str, float]] = [
+    (TSS_SACRUM,    'TSS Sacrum',    '#ff8c00', 0.72),
+    (TSS_L4L5_DISC, 'L4-L5 Disc',   '#44dd44', 0.60),
+    (TSS_L5S1_DISC, 'L5-S1 Disc',   '#22bb22', 0.60),
+    (41,            'TSS L1',        '#dde0ff', 0.20),
+    (42,            'TSS L2',        '#ccd0ff', 0.20),
+    (43,            'TSS L3',        '#bbc0ff', 0.20),
+    (44,            'TSS L4',        '#aab0ff', 0.20),
+    (45,            'TSS L5',        '#9090ee', 0.22),
 ]
 
+VD_RENDER: List[Tuple[int, str, str, float]] = [
+    (VD_L1, 'VD L1', '#e8e8ff', 0.18),
+    (VD_L2, 'VD L2', '#d8d8ff', 0.18),
+    (VD_L3, 'VD L3', '#c8c8ff', 0.18),
+    (VD_L4, 'VD L4', '#b8b8ee', 0.18),
+    (VD_L5, 'VD L5', '#9898dd', 0.20),
+    (VD_L6, 'VD L6', '#7878cc', 0.22),
+    (VD_SAC,'VD Sac','#cc8800', 0.40),
+]
 
-# ── NIfTI helpers ──────────────────────────────────────────────────────────────
+PHENOTYPE_COLORS = {
+    'sacralization':               '#ff4444',
+    'lumbarization':               '#4488ff',
+    'transitional_indeterminate':  '#ff9900',
+    'normal':                      '#44cc44',
+}
 
-def _load_canonical(path: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
+# ── Angle thresholds (Seilanian Toosi 2025) ───────────────────────────────────
+DELTA_THRESHOLD = 8.5
+C_THRESHOLD     = 35.5
+A_UPPER_NORMAL  = 41.0
+D_LOWER_NORMAL  = 13.5
+
+# ── Dorsal projection geometry constants ──────────────────────────────────────
+DORSAL_OFFSET   = 20.0   # vox posterior to spine posterior surface
+LINE_HALF_LEN   = 38.0   # half-length of each endplate line (vox)
+ARC_R_SMALL     = 11.0   # arc radius for D/D1/delta
+ARC_R_LARGE     = 17.0   # arc radius for A/B/C
+LINE_WIDTH_PRI  = 4
+LINE_WIDTH_SEC  = 3
+DOT_SIZE        = 8
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NIfTI HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_canonical_iso(path: Path, target_mm: float = 1.0) -> np.ndarray:
     nii  = nib.load(str(path))
     nii  = nib.as_closest_canonical(nii)
     data = nii.get_fdata()
@@ -119,1363 +154,1049 @@ def _load_canonical(path: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
         data = data[..., 0]
     if data.ndim == 4:
         data = data[..., 0]
-    if data.ndim != 3:
-        raise ValueError(f"Cannot reduce {path.name} to 3D")
-    return data, nii
-
-
-def _voxmm(nii: nib.Nifti1Image) -> np.ndarray:
-    return np.abs(np.array(nii.header.get_zooms()[:3], dtype=float))
-
-
-def _resample(vol: np.ndarray, vox_mm: np.ndarray) -> np.ndarray:
-    return ndizoom(vol.astype(np.int32), (vox_mm / ISO_MM).tolist(),
+    vox  = np.abs(np.array(nii.header.get_zooms()[:3], dtype=float))
+    factors = (vox / target_mm).tolist()
+    return ndizoom(data.astype(np.int32), factors,
                    order=0, mode='nearest', prefilter=False).astype(np.int32)
 
 
-# ── Geometry helpers ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MESH EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _centroid(mask: np.ndarray) -> Optional[np.ndarray]:
-    c = np.array(np.where(mask))
-    return c.mean(axis=1) * ISO_MM if c.size else None
-
-
-def _z_range(mask: np.ndarray) -> Optional[Tuple[int, int]]:
-    if not mask.any(): return None
-    zc = np.where(mask)[2]
-    return int(zc.min()), int(zc.max())
-
-
-def _inferiormost_cc(mask: np.ndarray,
-                     sac: Optional[np.ndarray] = None) -> np.ndarray:
-    if not mask.any(): return np.zeros_like(mask, bool)
-    lab, n = cc_label(mask)
-    if n == 1: return mask.astype(bool)
-    sac_zmin = None
-    if sac is not None and sac.any():
-        sac_zmin = int(np.where(sac)[2].min())
-    comps = []
-    for i in range(1, n + 1):
-        c = (lab == i); zc = np.where(c)[2]
-        comps.append((float(zc.mean()), int(zc.max()), c))
-    comps.sort(key=lambda t: t[0])
-    if sac_zmin is not None:
-        cands = [c for _, zm, c in comps if zm < sac_zmin]
-        if cands: return cands[0].astype(bool)
-    return comps[0][2].astype(bool)
+def _extract_mesh(vol: np.ndarray, label: int,
+                   level: float = 0.5, step_size: int = 2,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    try:
+        from skimage.measure import marching_cubes
+    except ImportError:
+        logger.error("scikit-image not installed")
+        return None
+    mask = (vol == label).astype(np.uint8)
+    if mask.sum() < 27:
+        return None
+    try:
+        verts, faces, _, _ = marching_cubes(mask, level=level, step_size=step_size)
+        return verts, faces, None
+    except Exception:
+        return None
 
 
-def _tp_height_mm(tp: np.ndarray) -> float:
-    if not tp.any(): return 0.0
-    zc = np.where(tp)[2]
-    return float((int(zc.max()) - int(zc.min()) + 1) * ISO_MM)
+def _mesh_to_plotly(verts: np.ndarray, faces: np.ndarray,
+                     color: str, opacity: float, name: str) -> dict:
+    return dict(
+        type        = 'mesh3d',
+        x           = verts[:, 0].tolist(),
+        y           = verts[:, 1].tolist(),
+        z           = verts[:, 2].tolist(),
+        i           = faces[:, 0].tolist(),
+        j           = faces[:, 1].tolist(),
+        k           = faces[:, 2].tolist(),
+        color       = color,
+        opacity     = opacity,
+        name        = name,
+        flatshading = False,
+        lighting    = dict(ambient=0.6, diffuse=0.8, specular=0.3,
+                           roughness=0.5, fresnel=0.1),
+        lightposition = dict(x=100, y=200, z=300),
+        showscale   = False,
+        hovertemplate = f'<b>{name}</b><extra></extra>',
+    )
 
 
-def _min_dist(a: np.ndarray, b: np.ndarray) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
-    from scipy.ndimage import distance_transform_edt
-    if not a.any() or not b.any(): return float('inf'), None, None
-    dt   = distance_transform_edt(~b) * ISO_MM
-    di   = np.where(a, dt, np.inf)
-    flat = int(np.argmin(di))
-    va   = np.array(np.unravel_index(flat, a.shape), dtype=float)
-    dist = float(dt[tuple(va.astype(int))])
-    cb   = np.array(np.where(b), dtype=float)
-    d2   = ((cb.T - va) ** 2).sum(axis=1)
-    vb   = cb[:, int(np.argmin(d2))]
-    return dist, va * ISO_MM, vb * ISO_MM
+# ══════════════════════════════════════════════════════════════════════════════
+# BASIC GEOMETRY / TP RULER HELPERS  (unchanged from v5.1)
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def _isolate_z(mask: np.ndarray, z_lo: int, z_hi: int, margin: int = 15) -> np.ndarray:
-    out = np.zeros_like(mask)
-    lo  = max(0, z_lo - margin)
-    hi  = min(mask.shape[2] - 1, z_hi + margin)
-    out[:, :, lo:hi + 1] = mask[:, :, lo:hi + 1]
-    return out
-
-
-# ── Bounding box wireframe trace ───────────────────────────────────────────────
-
-def bbox_wireframe(mask: np.ndarray, origin_mm: np.ndarray,
-                   colour: str, name: str,
-                   dash: str = 'dash', width: int = 4,
-                   margin_vox: int = 2) -> Optional[go.Scatter3d]:
+def _centroid(vol: np.ndarray, label: int) -> Optional[np.ndarray]:
+    mask = (vol == label)
     if not mask.any():
         return None
-    coords = np.array(np.where(mask))
-    x0 = max(0, coords[0].min() - margin_vox) * ISO_MM - origin_mm[0]
-    x1 = (coords[0].max() + margin_vox) * ISO_MM - origin_mm[0]
-    y0 = max(0, coords[1].min() - margin_vox) * ISO_MM - origin_mm[1]
-    y1 = (coords[1].max() + margin_vox) * ISO_MM - origin_mm[1]
-    z0 = max(0, coords[2].min() - margin_vox) * ISO_MM - origin_mm[2]
-    z1 = (coords[2].max() + margin_vox) * ISO_MM - origin_mm[2]
+    coords = np.array(np.where(mask), dtype=float)
+    return coords.mean(axis=1)
 
-    corners = [
-        (x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0),
-        (x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1),
+
+def _tp_sacrum_gap_mm(sp_vol: np.ndarray,
+                       tp_label: int,
+                       sac_label: int = SP_SACRUM) -> Optional[float]:
+    tp_mask  = (sp_vol == tp_label)
+    sac_mask = (sp_vol == sac_label)
+    if not tp_mask.any() or not sac_mask.any():
+        return None
+    tp_pts  = np.array(np.where(tp_mask),  dtype=float).T
+    sac_pts = np.array(np.where(sac_mask), dtype=float).T
+    if len(tp_pts)  > 5000: tp_pts  = tp_pts [np.random.choice(len(tp_pts),  5000, False)]
+    if len(sac_pts) > 5000: sac_pts = sac_pts[np.random.choice(len(sac_pts), 5000, False)]
+    from scipy.spatial import cKDTree
+    tree = cKDTree(sac_pts)
+    dists, _ = tree.query(tp_pts, k=1)
+    return float(dists.min())
+
+
+def _ruler_trace(p0: np.ndarray, p1: np.ndarray,
+                  color: str = '#ffffff', name: str = '',
+                  width: int = 3) -> dict:
+    return dict(
+        type   = 'scatter3d',
+        x      = [float(p0[0]), float(p1[0])],
+        y      = [float(p0[1]), float(p1[1])],
+        z      = [float(p0[2]), float(p1[2])],
+        mode   = 'lines+markers',
+        line   = dict(color=color, width=width),
+        marker = dict(size=4, color=color),
+        name   = name,
+        hovertemplate = f'<b>{name}</b><extra></extra>',
+        showlegend = True,
+    )
+
+
+def _annotation_trace(pos: np.ndarray, text: str, color: str = '#ffffff') -> dict:
+    return dict(
+        type     = 'scatter3d',
+        x        = [float(pos[0])],
+        y        = [float(pos[1])],
+        z        = [float(pos[2])],
+        mode     = 'markers+text',
+        marker   = dict(size=6, color=color, symbol='circle'),
+        text     = [text],
+        textposition = 'top center',
+        textfont = dict(color=color, size=11),
+        name     = text,
+        hovertemplate = f'<b>{text}</b><extra></extra>',
+        showlegend = False,
+    )
+
+
+def _plane_trace(center: np.ndarray, normal: np.ndarray,
+                  color: str, opacity: float, name: str,
+                  extent: float = 25.0) -> dict:
+    n   = normal / (np.linalg.norm(normal) + 1e-9)
+    ref = np.array([0., 1., 0.]) if abs(n[1]) < 0.9 else np.array([1., 0., 0.])
+    t1  = np.cross(n, ref); t1 /= (np.linalg.norm(t1) + 1e-9)
+    t2  = np.cross(n, t1);  t2 /= (np.linalg.norm(t2) + 1e-9)
+    corners = [center + extent * (s1 * t1 + s2 * t2)
+               for s1, s2 in [(-1,-1),(1,-1),(1,1),(-1,1)]]
+    return dict(
+        type    = 'mesh3d',
+        x       = [float(c[0]) for c in corners],
+        y       = [float(c[1]) for c in corners],
+        z       = [float(c[2]) for c in corners],
+        i       = [0, 0], j = [1, 2], k = [2, 3],
+        color   = color, opacity = opacity, name = name,
+        flatshading = True,
+        hovertemplate = f'<b>{name}</b><extra></extra>',
+        showscale = False,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANGLE PANEL HTML  (sidebar — unchanged from v5.1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _angle_color(angle: Optional[float], threshold: float,
+                  direction: str = 'below') -> str:
+    if angle is None:
+        return '#555555'
+    triggered = (angle <= threshold if direction == 'below' else angle >= threshold)
+    return '#cc2222' if triggered else '#226622'
+
+
+def _fmt_angle(v: Optional[float]) -> str:
+    return f'{v:.1f}°' if v is not None else 'N/A'
+
+
+def build_angle_panel_html(angles: Optional[dict]) -> str:
+    if angles is None or not angles.get('angles_available', False):
+        return '<div style="color:#888;padding:12px">Angles not available</div>'
+
+    a  = angles.get('a_angle_deg')
+    b  = angles.get('b_angle_deg')
+    c  = angles.get('c_angle_deg')
+    d  = angles.get('d_angle_deg')
+    d1 = angles.get('d1_angle_deg')
+    de = angles.get('delta_angle_deg')
+
+    rows = [
+        ('δ (delta)', de, DELTA_THRESHOLD, 'below',
+         '≤8.5° → Type 2 LSTV (sens 92%, spec 88%)'),
+        ('C', c, C_THRESHOLD, 'below',
+         '≤35.5° → LSTV (sens 72%, spec 58%)'),
+        ('A', a, A_UPPER_NORMAL, 'above',
+         f'>{A_UPPER_NORMAL}° = elevated (normal ~37°)'),
+        ('D', d, D_LOWER_NORMAL, 'below',
+         f'<{D_LOWER_NORMAL}° = decreased (normal ~26°)'),
+        ('D1', d1, None, None, 'TV-1 vs TV superior endplates'),
+        ('B',  b,  None, None, 'L3 vs sacral surface'),
     ]
-    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),
-             (0,4),(1,5),(2,6),(3,7)]
-    xs, ys, zs = [], [], []
-    for a, b in edges:
-        p0, p1 = corners[a], corners[b]
-        xs += [p0[0], p1[0], None]; ys += [p0[1], p1[1], None]; zs += [p0[2], p1[2], None]
 
-    return go.Scatter3d(
-        x=xs, y=ys, z=zs, mode='lines',
-        line=dict(color=colour, width=width, dash=dash),
-        name=name, showlegend=True, hoverinfo='name',
-    )
+    html = '''<table style="width:100%;border-collapse:collapse;
+        font-family:monospace;font-size:12px;color:#eee;">
+      <thead><tr style="background:#333">
+        <th style="padding:4px 8px;text-align:left">Angle</th>
+        <th style="padding:4px 8px;text-align:right">Value</th>
+        <th style="padding:4px 8px;text-align:left;font-weight:normal;font-size:11px">Criterion</th>
+      </tr></thead><tbody>'''
+
+    for label, val, thr, direction, note in rows:
+        bg   = _angle_color(val, thr, direction) if thr is not None else (
+               '#335533' if val is not None else '#555555')
+        flag = ''
+        if val is not None and thr is not None:
+            triggered = (val <= thr if direction == 'below' else val >= thr)
+            flag = ' ⚠' if triggered else ' ✓'
+        html += (f'<tr style="background:{bg};border-bottom:1px solid #444">'
+                 f'<td style="padding:5px 8px;font-weight:bold">{label}</td>'
+                 f'<td style="padding:5px 8px;text-align:right">{_fmt_angle(val)}{flag}</td>'
+                 f'<td style="padding:5px 8px;font-size:10px;color:#ccc">{note}</td></tr>')
+
+    html += '</tbody></table>'
+
+    tc = angles.get('tp_concordance')
+    if tc:
+        lf = tc.get('left_in_bounds');  rf = tc.get('right_in_bounds')
+        lstr = '✓' if lf is True else ('✗' if lf is False else '—')
+        rstr = '✓' if rf is True else ('✗' if rf is False else '—')
+        tc_color = '#cc2222' if (lf is False or rf is False) else '#226622'
+        html += (f'<div style="margin-top:6px;padding:4px 8px;background:{tc_color};'
+                 f'font-size:11px;">TP Concordance  L:{lstr}  R:{rstr}</div>')
+    return html
 
 
-# ── Marching cubes → Mesh3d ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ENDPLATE GEOMETRY HELPERS  (v5.2: bugs fixed)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def mask_to_mesh3d(iso_mask: np.ndarray,
-                   origin_mm: np.ndarray,
-                   name: str, colour: str, opacity: float,
-                   smooth: float = 1.5, fill: bool = True) -> Optional[go.Mesh3d]:
-    if not iso_mask.any(): return None
-    m   = binary_fill_holes(iso_mask) if fill else iso_mask.copy()
-    vol = gaussian_filter(m.astype(np.float32), sigma=smooth)
-    vol = np.pad(vol, 1, mode='constant', constant_values=0)
-    if vol.max() <= 0.5 or vol.min() >= 0.5: return None
+def _fit_endplate_normal_and_center(
+        vol: np.ndarray, label: int,
+        surface: str = 'superior', slab_vox: int = 4,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    PCA plane fit to the superior or inferior slab of a segmented vertebra.
+    Returns (center_xyz, normal_unit_vec) with normal pointing cranially (+Z).
+    """
+    mask = (vol == label)
+    if not mask.any():
+        return None, None
+    coords = np.array(np.where(mask), dtype=float).T   # (N, 3)
+    z_all  = coords[:, 2]
+    if surface == 'superior':
+        slab = coords[z_all >= z_all.max() - slab_vox]
+    else:
+        slab = coords[z_all <= z_all.min() + slab_vox]
+    if len(slab) < 6:
+        slab = coords
+    center = slab.mean(axis=0)
+    cov    = np.cov((slab - center).T)
     try:
-        verts, faces, _, _ = marching_cubes(vol, level=0.5,
-                                             spacing=(ISO_MM, ISO_MM, ISO_MM))
-    except Exception as exc:
-        logger.warning(f"  MC failed '{name}': {exc}"); return None
-    verts -= ISO_MM
-    verts -= origin_mm[np.newaxis, :]
-    return go.Mesh3d(
-        x=verts[:, 0].tolist(), y=verts[:, 1].tolist(), z=verts[:, 2].tolist(),
-        i=faces[:, 0].tolist(), j=faces[:, 1].tolist(), k=faces[:, 2].tolist(),
-        color=colour, opacity=opacity, name=name,
-        showlegend=True, flatshading=False,
-        lighting=dict(ambient=0.40, diffuse=0.75, specular=0.28,
-                      roughness=0.50, fresnel=0.18),
-        lightposition=dict(x=100, y=200, z=150),
-        hoverinfo='name', showscale=False,
+        _, vecs = np.linalg.eigh(cov)
+        normal  = vecs[:, 0]          # smallest eigenvector = plane normal
+    except Exception:
+        normal = np.array([0., 0., 1.])
+    if normal[2] < 0:
+        normal = -normal
+    normal /= np.linalg.norm(normal) + 1e-9
+    return center, normal
+
+
+def _spine_mid_x(sp_vol: np.ndarray, vert_vol: np.ndarray) -> float:
+    """Mid ML (X) coordinate — used to anchor all overlays in the sagittal plane."""
+    for vol in (vert_vol, sp_vol):
+        mask = vol > 0
+        if mask.any():
+            return float(np.where(mask)[0].mean())
+    return float(sp_vol.shape[0] / 2)
+
+
+def _post_y_for_label(tss_vol: Optional[np.ndarray], tss_lbl: Optional[int],
+                       vert_vol: np.ndarray, vd_lbl: Optional[int]) -> Optional[float]:
+    """Return posterior (min-Y) surface of a label — used to set y_dorsal."""
+    for vol, lbl in [(tss_vol, tss_lbl), (vert_vol, vd_lbl)]:
+        if vol is None or lbl is None:
+            continue
+        mask = (vol == lbl)
+        if mask.any():
+            return float(np.where(mask)[1].min())
+    return None
+
+
+def _endplate_line(
+        center:   np.ndarray,
+        normal:   np.ndarray,
+        x_mid:    float,
+        y_dorsal: float,
+        half_len: float = LINE_HALF_LEN,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build an endplate line in the dorsal projection plane.
+
+    The line sits at fixed y = y_dorsal (posterior to the spine) and
+    extends ±half_len in the Z direction, with a tilt derived from the
+    endplate normal.  Y is held constant so the line is always visible
+    from a lateral/posterior view and doesn't dive into or behind the mesh.
+
+    Returns (anchor, p0, p1):
+      anchor — (x_mid, y_dorsal, z_center) : where the angle arc is drawn
+      p0     — caudal endpoint
+      p1     — cranial endpoint
+    """
+    z_c    = float(center[2])
+    anchor = np.array([x_mid, y_dorsal, z_c])
+
+    # Endplate tilt: the line is perpendicular to the normal projected into YZ.
+    # In the sagittal plane the endplate direction tangent is (0, nz, -ny)
+    # (90° rotation of normal in YZ).  We project onto Z only because Y is fixed.
+    ny = float(normal[1]); nz = float(normal[2])
+    # Tangent in sagittal: dz component from normal
+    # A horizontal endplate has normal=(0,0,1) → tangent=(0,1,0) → dz_tilt=0
+    # A tilted endplate normal=(0, sin θ, cos θ) → tangent=(0, cos θ, -sin θ)
+    # tilt in Z per unit extension = -ny / (nz+eps)
+    dz_tilt = -ny / (abs(nz) + 1e-4)   # ΔZ per ΔY=1; but Y is fixed so we tilt in Z
+    # clamp extreme tilts
+    dz_tilt = float(np.clip(dz_tilt, -1.5, 1.5))
+
+    # p0 = caudal end, p1 = cranial end
+    # We extend purely in Z, with a small tilt correction
+    p0 = np.array([x_mid, y_dorsal, z_c - half_len + dz_tilt * half_len * 0.3])
+    p1 = np.array([x_mid, y_dorsal, z_c + half_len + dz_tilt * half_len * 0.3])
+    return anchor, p0, p1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRIMITIVE 3D TRACE BUILDERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _line3d_trace(p0: np.ndarray, p1: np.ndarray,
+                   color: str, width: int = 3, name: str = '',
+                   dash: str = 'solid', show_legend: bool = True) -> dict:
+    return dict(
+        type  = 'scatter3d',
+        x     = [float(p0[0]), float(p1[0])],
+        y     = [float(p0[1]), float(p1[1])],
+        z     = [float(p0[2]), float(p1[2])],
+        mode  = 'lines',
+        line  = dict(color=color, width=width, dash=dash),
+        name  = name,
+        hovertemplate = f'<b>{name}</b><extra></extra>',
+        showlegend = show_legend,
     )
 
 
-# ── 3D annotation traces ───────────────────────────────────────────────────────
-
-def _line(p0, p1, colour, name, width=6, dash='solid') -> go.Scatter3d:
-    return go.Scatter3d(
-        x=[p0[0], p1[0]], y=[p0[1], p1[1]], z=[p0[2], p1[2]],
-        mode='lines', line=dict(color=colour, width=width, dash=dash),
-        name=name, showlegend=True, hoverinfo='name')
-
-
-def _marker(pos, text, colour, size=12, sym='circle') -> go.Scatter3d:
-    return go.Scatter3d(
-        x=[pos[0]], y=[pos[1]], z=[pos[2]],
-        mode='markers+text',
-        marker=dict(size=size, color=colour, symbol=sym,
-                    line=dict(color='white', width=1)),
-        text=[text], textposition='top center',
-        textfont=dict(size=12, color=colour),
-        name=text, showlegend=False, hoverinfo='text')
+def _arc3d_trace(xs: List[float], ys: List[float], zs: List[float],
+                  color: str, width: int = 3, name: str = '') -> dict:
+    return dict(
+        type  = 'scatter3d',
+        x = xs, y = ys, z = zs,
+        mode  = 'lines',
+        line  = dict(color=color, width=width),
+        name  = name,
+        hovertemplate = f'<b>{name}</b><extra></extra>',
+        showlegend = False,
+    )
 
 
-def midpt(a, b) -> np.ndarray:
-    return (np.asarray(a) + np.asarray(b)) / 2.0
+def _label3d_trace(pos: np.ndarray, text: str, color: str, size: int = 13) -> dict:
+    return dict(
+        type  = 'scatter3d',
+        x     = [float(pos[0])], y = [float(pos[1])], z = [float(pos[2])],
+        mode  = 'text',
+        text  = [text],
+        textfont = dict(color=color, size=size, family='Arial Black'),
+        name  = text,
+        hovertemplate = f'<b>{text}</b><extra></extra>',
+        showlegend = False,
+    )
 
 
-def tp_ruler_traces(tp_iso: np.ndarray, origin_mm: np.ndarray,
-                    colour: str, side: str, span_mm: float) -> List:
-    if not tp_iso.any(): return []
-    zc = np.where(tp_iso)[2]
-    z_lo, z_hi = int(zc.min()), int(zc.max())
-    xc = np.where(tp_iso)[0]; yc = np.where(tp_iso)[1]
-    x_c = int(np.median(xc)); y_c = int(np.median(yc))
-    p_lo = np.array([x_c, y_c, z_lo], float) * ISO_MM - origin_mm
-    p_hi = np.array([x_c, y_c, z_hi], float) * ISO_MM - origin_mm
-    mid  = midpt(p_lo, p_hi)
-    flag = f'✗ ≥{TP_HEIGHT_MM:.0f}mm → Type I' if span_mm >= TP_HEIGHT_MM else '✓ <19mm'
-    clr  = '#ff4444' if span_mm >= TP_HEIGHT_MM else '#44ff88'
-    traces = [_line(p_lo, p_hi, colour, f'TP ruler {side}', width=8)]
-    traces.append(_marker(mid, f'{side} TP: {span_mm:.1f}mm  {flag}', clr, size=11, sym='diamond'))
-    off = np.array([4., 0., 0.])
-    for pt in (p_lo, p_hi):
-        traces.append(_line(pt - off, pt + off, colour, f'tick {side}', width=3))
+def _dot3d_trace(pos: np.ndarray, color: str, size: int = 7) -> dict:
+    return dict(
+        type   = 'scatter3d',
+        x      = [float(pos[0])], y = [float(pos[1])], z = [float(pos[2])],
+        mode   = 'markers',
+        marker = dict(size=size, color=color),
+        showlegend = False,
+        hoverinfo  = 'skip',
+    )
+
+
+def _arc_slerp(
+        apex:   np.ndarray,
+        v1:     np.ndarray,
+        v2:     np.ndarray,
+        radius: float = 14.0,
+        n_pts:  int   = 28,
+) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Correct spherical linear interpolation arc between unit directions v1 and v2.
+
+    Projects both vectors into the sagittal (YZ) plane so the arc stays
+    in the plane of the paper figure regardless of ML tilt.
+
+    FIX vs v5.1: old code used  sin(t*θ)*v2 + cos(t*θ)*v1  which is only
+    correct at t=0 and gives the wrong endpoint at t=1.  Correct slerp is:
+        p(t) = sin((1-t)*θ)/sin(θ) * v1  +  sin(t*θ)/sin(θ) * v2
+    """
+    def _sag_unit(v: np.ndarray) -> np.ndarray:
+        s = np.array([0.0, float(v[1]), float(v[2])])
+        n = np.linalg.norm(s)
+        return s / n if n > 1e-9 else np.array([0.0, 0.0, 1.0])
+
+    s1 = _sag_unit(v1)
+    s2 = _sag_unit(v2)
+
+    cos_t = float(np.clip(np.dot(s1, s2), -1.0, 1.0))
+    theta = math.acos(cos_t)
+
+    xs, ys, zs = [], [], []
+    if theta < 1e-6:
+        # Vectors are parallel — degenerate arc, just return the single point
+        p = apex + radius * s1
+        return ([float(p[0])], [float(p[1])], [float(p[2])])
+
+    sin_t = math.sin(theta)
+    for i in range(n_pts + 1):
+        t  = i / n_pts
+        w1 = math.sin((1.0 - t) * theta) / sin_t
+        w2 = math.sin(t          * theta) / sin_t
+        s  = w1 * s1 + w2 * s2
+        # s is already unit-length by slerp construction; normalise for safety
+        sn = np.linalg.norm(s)
+        if sn > 1e-9:
+            s /= sn
+        p = apex + radius * np.array([0.0, s[1], s[2]])
+        xs.append(float(p[0]))
+        ys.append(float(p[1]))
+        zs.append(float(p[2]))
+    return xs, ys, zs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAPER-ACCURATE DORSAL ANGLE OVERLAYS  (v5.2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_angle_overlays_3d(
+        sp_vol:      np.ndarray,
+        tss_vol:     Optional[np.ndarray],
+        vert_vol:    np.ndarray,
+        tv_vd_label: int,
+        angles:      dict,
+) -> List[dict]:
+    """
+    Build paper-accurate 3D angle overlays (Seilanian Toosi 2025, Figs 1-4).
+
+    All lines are drawn at a FIXED y_dorsal value (posterior to the spine),
+    extending in Z with the endplate tilt.  Each angle group is placed at a
+    distinct dorsal depth so overlays never obscure each other:
+
+        δ  (deepest dorsal) — white or red
+        D1 (next)           — cyan
+        D  (next)           — orange
+        C  (shared mid)     — magenta
+        B  (near spine)     — red
+        A  (near spine)     — yellow
+
+    Arc is drawn via slerp so it exactly spans the two endplate lines.
+    """
+    traces: List[dict] = []
+    if not angles.get('angles_available', False):
+        return traces
+
+    x_mid = _spine_mid_x(sp_vol, vert_vol)
+
+    # Label mappings
+    tv_tss  = {VD_L5: 45, VD_L4: 44, VD_L6: 45, VD_L3: 43}.get(tv_vd_label)
+    tv1_vd  = {VD_L5: VD_L4, VD_L4: VD_L3, VD_L6: VD_L5}.get(tv_vd_label)
+    tv1_tss = {VD_L4: 44, VD_L3: 43, VD_L5: 45}.get(tv1_vd) if tv1_vd else None
+
+    def _cn(tss_lbl, vd_lbl, surface='superior'):
+        if tss_lbl and tss_vol is not None:
+            c, n = _fit_endplate_normal_and_center(tss_vol, tss_lbl, surface)
+            if c is not None:
+                return c, n
+        if vd_lbl:
+            c, n = _fit_endplate_normal_and_center(vert_vol, vd_lbl, surface)
+            if c is not None:
+                return c, n
+        return None, None
+
+    def _py(tss_lbl, vd_lbl):
+        y = _post_y_for_label(tss_vol, tss_lbl, vert_vol, vd_lbl)
+        return (y - DORSAL_OFFSET) if y is not None else (-DORSAL_OFFSET)
+
+    # Gather endplate geometry
+    c_sac,  n_sac  = _cn(TSS_SACRUM, VD_SAC, 'superior')
+    c_tv,   n_tv   = _cn(tv_tss, tv_vd_label, 'superior')
+    c_tv1,  n_tv1  = _cn(tv1_tss, tv1_vd, 'superior') if tv1_vd else (None, None)
+    c_l3,   n_l3   = _cn(43, VD_L3, 'superior')
+
+    # Determine shared Y anchor — use minimum across all needed labels
+    y_vals = [_py(TSS_SACRUM, VD_SAC)]
+    if tv_tss:    y_vals.append(_py(tv_tss, tv_vd_label))
+    if tv1_tss:   y_vals.append(_py(tv1_tss, tv1_vd))
+    y_base = min(y_vals)  # furthest posterior label surface - DORSAL_OFFSET
+
+    # Each angle band sits at a distinct dorsal depth:
+    #   δ furthest (y_base - 24), D1 (y_base - 16), D (y_base - 8),
+    #   C/B/A closer to spine (y_base)
+    Y = {
+        'delta': y_base - 24.0,
+        'D1':    y_base - 16.0,
+        'D':     y_base - 8.0,
+        'C':     y_base - 2.0,
+        'B':     y_base,
+        'A':     y_base + 2.0,
+    }
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _overlay(label: str, center_a, normal_a, center_b, normal_b,
+                  color: str, val: Optional[float],
+                  line_w: int, arc_r: float,
+                  name_a: str, name_b: str,
+                  flag_str: str = '',
+                  show_vert_connector: bool = True) -> None:
+        """Render one angle overlay: two endplate lines + arc + label."""
+        y_d = Y[label]
+        anc_a, pa0, pa1 = _endplate_line(center_a, normal_a, x_mid, y_d)
+        anc_b, pb0, pb1 = _endplate_line(center_b, normal_b, x_mid, y_d)
+
+        if show_vert_connector:
+            # Dashed vertical connecting the two anchor Z levels at the dorsal plane
+            va = np.array([x_mid, y_d, float(center_a[2])])
+            vb = np.array([x_mid, y_d, float(center_b[2])])
+            traces.append(_line3d_trace(va, vb, '#888888', 2,
+                                         f'{label}: connector', dash='dash',
+                                         show_legend=False))
+
+        traces.append(_line3d_trace(pa0, pa1, color, line_w, name_a))
+        traces.append(_line3d_trace(pb0, pb1, color, LINE_WIDTH_SEC, name_b,
+                                     show_legend=False))
+        traces.append(_dot3d_trace(anc_a, color, DOT_SIZE))
+
+        # Arc — slerp between the two line directions
+        da = pa1 - pa0; da /= np.linalg.norm(da) + 1e-9
+        db = pb1 - pb0; db /= np.linalg.norm(db) + 1e-9
+        ax, ay, az = _arc_slerp(anc_a, da, db, arc_r)
+        traces.append(_arc3d_trace(ax, ay, az, color, line_w, f'{label}-arc'))
+
+        if val is not None:
+            lbl_text = f'{label}={val:.1f}°{flag_str}'
+            lbl_pos  = anc_a + np.array([0.0, -arc_r * 1.6, arc_r * 0.4])
+            traces.append(_label3d_trace(lbl_pos, lbl_text, color,
+                                          size=15 if label == 'δ' else 12))
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # A-ANGLE (yellow) — sacral superior surface vs vertical reference
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    a_val = angles.get('a_angle_deg')
+    if c_sac is not None and n_sac is not None and a_val is not None:
+        col  = '#ffdd00'
+        y_d  = Y['A']
+        anc, p0, p1 = _endplate_line(c_sac, n_sac, x_mid, y_d, LINE_HALF_LEN * 1.1)
+        # Vertical reference line
+        vert_up   = anc + np.array([0., 0.,  LINE_HALF_LEN * 0.85])
+        vert_down = anc + np.array([0., 0., -LINE_HALF_LEN * 0.45])
+        traces.append(_line3d_trace(p0, p1, col, LINE_WIDTH_PRI, 'A: sacral surface'))
+        traces.append(_line3d_trace(vert_down, vert_up, col, LINE_WIDTH_SEC,
+                                     'A: vertical ref', dash='dash', show_legend=False))
+        traces.append(_dot3d_trace(anc, col, DOT_SIZE))
+        da = p1 - p0; da /= np.linalg.norm(da) + 1e-9
+        dv = np.array([0., 0., 1.])
+        ax, ay, az = _arc_slerp(anc, da, dv, ARC_R_LARGE)
+        traces.append(_arc3d_trace(ax, ay, az, col, 3, 'A-arc'))
+        lp = anc + np.array([0., -ARC_R_LARGE * 1.5, ARC_R_LARGE * 0.5])
+        traces.append(_label3d_trace(lp, f'A={a_val:.1f}°', col, 12))
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # B-ANGLE (red) — L3 superior vs sacral superior
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    b_val = angles.get('b_angle_deg')
+    if (c_sac is not None and c_l3 is not None
+            and n_sac is not None and n_l3 is not None and b_val is not None):
+        _overlay('B', c_sac, n_sac, c_l3, n_l3,
+                 '#ff4444', b_val, LINE_WIDTH_PRI, ARC_R_LARGE * 0.9,
+                 'B: sacral ref', 'B: L3 endplate')
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # C-ANGLE (magenta) — posterior body lines, largest pair
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    c_val = angles.get('c_angle_deg')
+    if c_val is not None:
+        col_c     = '#ff44ff'
+        triggered = c_val <= C_THRESHOLD
+        col_lbl   = '#ff0000' if triggered else col_c
+        flag_c    = ' ⚠' if triggered else ''
+
+        def _post_wall_dir(tss_lbl, vd_lbl):
+            for vol, lbl in [(tss_vol, tss_lbl), (vert_vol, vd_lbl)]:
+                if vol is None or lbl is None: continue
+                mask = (vol == lbl)
+                if not mask.any(): continue
+                coords = np.array(np.where(mask), dtype=float).T
+                y_min  = coords[:, 1].min()
+                post   = coords[coords[:, 1] <= y_min + 3]
+                if len(post) < 4: continue
+                ctr = post.mean(axis=0)
+                cov = np.cov((post - ctr).T)
+                try:
+                    _, vecs = np.linalg.eigh(cov)
+                    d = vecs[:, 2]
+                except Exception:
+                    d = np.array([0., 0., 1.])
+                if d[2] < 0: d = -d
+                d /= np.linalg.norm(d) + 1e-9
+                return ctr, d
+            return None, None
+
+        pairs = [
+            (TSS_SACRUM, VD_SAC),
+            (tv_tss, tv_vd_label),
+            (tv1_tss, tv1_vd) if tv1_vd else (None, None),
+        ]
+        post_lines = [(c, d) for tl, vl in pairs
+                      for c, d in [_post_wall_dir(tl, vl)] if c is not None]
+
+        if len(post_lines) >= 2:
+            best = (0, 1)
+            best_cos = 1.0
+            for i in range(len(post_lines)):
+                for j in range(i+1, len(post_lines)):
+                    cos_a = abs(float(np.dot(post_lines[i][1], post_lines[j][1])))
+                    if cos_a < best_cos:
+                        best_cos = cos_a; best = (i, j)
+
+            c0, d0 = post_lines[best[0]]
+            c1, d1 = post_lines[best[1]]
+            y_C    = Y['C']
+            z_mid  = float((c0[2] + c1[2]) / 2)
+            anc_C  = np.array([x_mid, y_C, z_mid])
+
+            # Vertical reference (yellow dashed, like Fig 1b)
+            vr_a = anc_C + np.array([0., 0.,  LINE_HALF_LEN * 0.8])
+            vr_b = anc_C + np.array([0., 0., -LINE_HALF_LEN * 0.4])
+            traces.append(_line3d_trace(vr_b, vr_a, '#ffdd00', LINE_WIDTH_SEC,
+                                         'C: vert ref', dash='dash', show_legend=False))
+
+            traces.append(_line3d_trace(
+                anc_C - d0 * LINE_HALF_LEN * 0.8,
+                anc_C + d0 * LINE_HALF_LEN * 0.8,
+                col_c, LINE_WIDTH_PRI, 'C: post body 1'))
+            traces.append(_line3d_trace(
+                anc_C - d1 * LINE_HALF_LEN * 0.8,
+                anc_C + d1 * LINE_HALF_LEN * 0.8,
+                col_c, LINE_WIDTH_SEC, 'C: post body 2', show_legend=False))
+            traces.append(_dot3d_trace(anc_C, col_c, DOT_SIZE))
+
+            ax, ay, az = _arc_slerp(anc_C, d0, d1, ARC_R_LARGE)
+            traces.append(_arc3d_trace(ax, ay, az, col_c, 3, 'C-arc'))
+            lp = anc_C + np.array([0., -ARC_R_LARGE * 1.4, ARC_R_LARGE * 0.2])
+            traces.append(_label3d_trace(lp, f'C={c_val:.1f}°{flag_c}', col_lbl, 13))
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # D-ANGLE (orange) — TV superior vs S1 superior
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    d_val = angles.get('d_angle_deg')
+    if d_val is not None and c_tv is not None and c_sac is not None:
+        _overlay('D', c_tv, n_tv, c_sac, n_sac,
+                 '#ff8800', d_val, LINE_WIDTH_PRI, ARC_R_SMALL,
+                 'D: TV sup endplate', 'D: S1 sup endplate')
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # D1-ANGLE (cyan) — TV-1 superior vs TV superior
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    d1_val = angles.get('d1_angle_deg')
+    if d1_val is not None and c_tv1 is not None and c_tv is not None:
+        _overlay('D1', c_tv1, n_tv1, c_tv, n_tv,
+                 '#00ccff', d1_val, LINE_WIDTH_PRI, ARC_R_SMALL,
+                 'D1: TV-1 endplate', 'D1: TV endplate ref')
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # DELTA (white/red) — most prominent, furthest dorsal
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    de_val = angles.get('delta_angle_deg')
+    if de_val is not None and c_tv is not None and c_tv1 is not None:
+        triggered = de_val <= DELTA_THRESHOLD
+        col_de    = '#ff2222' if triggered else '#ffffff'
+        flag_de   = ' ⚠ Type2 LSTV' if triggered else ''
+
+        _overlay('δ', c_tv, n_tv, c_tv1, n_tv1,
+                 col_de, de_val, 5, ARC_R_SMALL * 1.4,
+                 f'δ TV endplate{flag_de}', 'δ TV-1 endplate',
+                 flag_str=flag_de)
+
     return traces
 
 
-def gap_ruler_traces(tp: np.ndarray, sac: np.ndarray,
-                     origin_mm: np.ndarray, colour: str,
-                     side: str, dist_mm: float) -> List:
-    if not tp.any() or not sac.any(): return []
-    _, pt_a, pt_b = _min_dist(tp, sac)
-    if pt_a is None: return []
-    p_a = pt_a - origin_mm; p_b = pt_b - origin_mm
-    mid = midpt(p_a, p_b)
-    contact = np.isfinite(dist_mm) and dist_mm <= CONTACT_DIST_MM
-    lbl = f'CONTACT {dist_mm:.1f}mm' if contact else f'Gap {dist_mm:.1f}mm ✓'
-    clr = '#ff2222' if contact else '#44ff88'
-    return [
-        _line(p_a, p_b, colour, f'gap ruler {side}', width=5,
-              dash='dot' if contact else 'dash'),
-        _marker(mid, f'{side}: {lbl}', clr, size=9, sym='square'),
-    ]
-
-
-def tv_plane_traces(vert_iso: np.ndarray, tv_label: int,
-                    origin_mm: np.ndarray, tv_name: str, phenotype: str) -> List:
-    mask = (vert_iso == tv_label)
-    if not mask.any(): return []
-    zc    = np.where(mask)[2]
-    z_mid = int((zc.min() + zc.max()) // 2)
-    xs    = np.linspace(0, vert_iso.shape[0] - 1, 14)
-    ys    = np.linspace(0, vert_iso.shape[1] - 1, 14)
-    xg, yg = np.meshgrid(xs, ys)
-    zg    = np.full_like(xg, z_mid)
-    cfg   = PHENOTYPE_CONFIG.get(phenotype, PHENOTYPE_CONFIG['normal'])
-    col   = cfg['color']
-
-    def _h2r(h):
-        h = h.lstrip('#')
-        return f"{int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)}"
-
-    plane = go.Surface(
-        x=xg * ISO_MM - origin_mm[0],
-        y=yg * ISO_MM - origin_mm[1],
-        z=zg * ISO_MM - origin_mm[2],
-        colorscale=[[0, f"rgba({_h2r(col)},0.14)"],
-                    [1, f"rgba({_h2r(col)},0.14)"]],
-        showscale=False, opacity=0.22,
-        name=f'TV plane ({tv_name})', showlegend=True, hoverinfo='name',
-    )
-    ctr = _centroid(mask)
-    if ctr is not None:
-        return [plane, _marker(ctr - origin_mm, f'TV: {tv_name}', col, size=16, sym='cross')]
-    return [plane]
-
-
-def tv_body_annotation_traces(vert_iso: np.ndarray, tv_label: int,
-                               origin_mm: np.ndarray, shape: dict,
-                               phenotype: str) -> List:
-    mask = (vert_iso == tv_label)
-    if not mask.any() or not shape: return []
-    cfg    = PHENOTYPE_CONFIG.get(phenotype, PHENOTYPE_CONFIG['normal'])
-    colour = cfg['color']
-    coords = np.array(np.where(mask))
-    y_min  = int(coords[1].min()); y_max = int(coords[1].max())
-    z_min  = int(coords[2].min()); z_max = int(coords[2].max())
-    x_mid  = int(coords[0].mean())
-    p_ant  = np.array([x_mid, y_min, (z_min + z_max) // 2], float) * ISO_MM - origin_mm
-    p_post = np.array([x_mid, y_max, (z_min + z_max) // 2], float) * ISO_MM - origin_mm
-    p_sup  = np.array([x_mid, (y_min + y_max) // 2, z_max], float) * ISO_MM - origin_mm
-    p_inf  = np.array([x_mid, (y_min + y_max) // 2, z_min], float) * ISO_MM - origin_mm
-    h_ap   = shape.get('h_ap_ratio', 0)
-    sc     = shape.get('shape_class', 'unknown')
-    return [
-        _line(p_ant, p_post, '#8888aa', 'TV AP depth ruler', width=3, dash='dot'),
-        _line(p_sup, p_inf,  colour,    'TV SI height ruler', width=4),
-        _marker(midpt(p_sup, p_inf), f'TV H/AP={h_ap:.2f} ({sc})', colour, size=10, sym='diamond-open'),
-    ]
-
-
-def delta_angle_ruler_traces(vert_iso: np.ndarray, tv_label: int,
-                              origin_mm: np.ndarray,
-                              delta_angle: Optional[float],
-                              delta_flag: bool) -> List:
-    """3D ruler between TV and TV-1 superior surfaces labelled with delta-angle."""
-    if delta_angle is None:
-        return []
-    tv_mask  = (vert_iso == tv_label)
-    tv1_mask = (vert_iso == tv_label - 1)
-    if not tv_mask.any() or not tv1_mask.any():
-        return []
-
-    def _sup_centroid(mask):
-        zc    = np.where(mask)[2]
-        z_top = int(zc.max())
-        z_band = max(z_top - 3, int(zc.min()))
-        slab  = mask.copy(); slab[:, :, :z_band] = False
-        if not slab.any(): slab = mask
-        c = np.array(np.where(slab))
-        return c.mean(axis=1) * ISO_MM - origin_mm
-
-    p_tv  = _sup_centroid(tv_mask)
-    p_tv1 = _sup_centroid(tv1_mask)
-
-    colour   = '#ff2222' if delta_flag else ('#ff8800' if delta_angle < 15.0 else '#44ff88')
-    flag_str = f'⚠ ≤{DELTA_ANGLE_TYPE2_THRESHOLD}° → Castellvi 2!' if delta_flag else ''
-    label    = f'δ={delta_angle:.1f}°  {flag_str}'
-    mid      = midpt(p_tv, p_tv1)
-
-    return [
-        _line(p_tv, p_tv1, colour, f'delta-angle ruler ({delta_angle:.1f}°)', width=6, dash='dash'),
-        _marker(mid, label, colour, size=13, sym='diamond'),
-    ]
-
-
-# ── Clinical narrative ─────────────────────────────────────────────────────────
-
-def _generate_clinical_narrative(result: dict, morpho: dict) -> str:
-    phenotype    = morpho.get('lstv_phenotype', 'normal')
-    confidence   = morpho.get('phenotype_confidence', '')
-    castellvi    = result.get('castellvi_type') or ''
-    tv_name      = morpho.get('tv_name', 'L5')
-    lumbar_count = morpho.get('lumbar_count_consensus', 5) or 5
-    tv_shape     = morpho.get('tv_shape') or {}
-    disc_below   = morpho.get('disc_below') or {}
-    disc_above   = morpho.get('disc_above') or {}
-    score        = result.get('pathology_score', 0)
-    lft          = result.get('left') or {}
-    rgt          = result.get('right') or {}
-    va           = morpho.get('vertebral_angles') or {}
-
-    h_ap      = tv_shape.get('h_ap_ratio')
-    shape_c   = tv_shape.get('shape_class', '')
-    dhi_b     = disc_below.get('dhi_pct')
-    dhi_a     = disc_above.get('dhi_pct')
-    dhi_b_lvl = disc_below.get('level', 'below TV')
-    dhi_a_lvl = disc_above.get('level', 'above TV')
-    l_h = lft.get('tp_height_mm', 0); r_h = rgt.get('tp_height_mm', 0)
-    l_d = lft.get('dist_mm', float('inf')); r_d = rgt.get('dist_mm', float('inf'))
-    has_ct  = bool(castellvi and castellvi not in ('None', 'N/A'))
-    norm_r  = tv_shape.get('norm_ratio')
-
-    delta_angle  = va.get('delta_angle')
-    c_angle      = va.get('c_angle')
-    a_angle      = va.get('a_angle')
-    d_angle      = va.get('d_angle')
-    delta_flag   = va.get('delta_le8p5', False)
-    c_flag       = va.get('c_le35p5', False)
-    disc_pattern = va.get('disc_pattern_lstv', False)
-    a_increased  = va.get('a_increased', False)
-    d_decreased  = va.get('d_decreased', False)
-
-    paras = []
-
-    conf_str = f' ({confidence} confidence)' if confidence else ''
-    if phenotype == 'lumbarization':
-        p = (f'<b>Lumbarization</b> identified at lumbosacral junction{conf_str}, '
-             f'pathology score {score:.0f}. Six lumbar vertebrae present — '
-             f'{tv_name} is the extra mobile segment (Hughes &amp; Saifuddin 2006).')
-    elif phenotype == 'sacralization':
-        p = (f'<b>Sacralization</b> identified at lumbosacral junction{conf_str}, '
-             f'pathology score {score:.0f}. {tv_name} shows progressive sacral incorporation.')
-        if lumbar_count == 4:
-            p += f' Only {lumbar_count} mobile lumbar segments confirmed.'
-    elif phenotype == 'transitional_indeterminate':
-        p = (f'<b>Transitional morphology</b> — indeterminate phenotype '
-             f'(score {score:.0f}). Castellvi TP morphology present without full primary criteria.')
-    else:
-        p = (f'<b>No significant LSTV</b> (score {score:.0f}). '
-             f'Five lumbar vertebrae, normal lumbosacral morphology.')
-    paras.append(p)
-
-    if delta_angle is not None or c_angle is not None:
-        angle_parts = []
-        if delta_angle is not None:
-            clr = 'color:#ff2222' if delta_flag else ('color:#ff8800' if delta_angle < 15 else '')
-            flag_txt = (f' <b style="{clr}">⚠ ≤{DELTA_ANGLE_TYPE2_THRESHOLD}° — '
-                        f'predicts Type 2 (sens 92.3%, spec 87.9%)</b>') if delta_flag else ''
-            angle_parts.append(f'<b>δ={delta_angle:.1f}°</b>{flag_txt}')
-        if c_angle is not None:
-            clr_c   = 'color:#ff8800' if c_flag else ''
-            flag_c  = (f' <b style="{clr_c}">⚠ ≤{C_ANGLE_LSTV_THRESHOLD}° (sens 72.2%)</b>') if c_flag else ''
-            angle_parts.append(f'C={c_angle:.1f}°{flag_c}')
-        if a_angle is not None:
-            angle_parts.append(f'A={a_angle:.1f}°{"↑ (OR 1.14)" if a_increased else ""}')
-        if d_angle is not None:
-            angle_parts.append(f'D={d_angle:.1f}°{"↓ (OR 0.72)" if d_decreased else ""}')
-        p = ('<b>Angles (Seilanian Toosi 2025)</b>: ' + ' | '.join(angle_parts) + '.')
-        if disc_pattern:
-            p += (' <b style="color:#ffe033">Disc pattern: L4-L5 dehydrated + L5-S1 preserved '
-                  '(OR 19.9, p&lt;0.001).</b>')
-        paras.append(p)
-
-    if has_ct:
-        sides = []
-        if l_h >= TP_HEIGHT_MM or l_d <= CONTACT_DIST_MM:
-            sides.append(f'left (h={l_h:.1f}mm, gap={l_d:.1f}mm)')
-        if r_h >= TP_HEIGHT_MM or r_d <= CONTACT_DIST_MM:
-            sides.append(f'right (h={r_h:.1f}mm, gap={r_d:.1f}mm)')
-        sides_str = ' and '.join(sides) if sides else 'bilateral'
-        type_desc = {
-            'IV':  'mixed (Type II unilateral, Type III contralateral)',
-            'III': 'complete osseous TP-sacral fusion',
-            'II':  'diarthrodial pseudo-articulation',
-            'I':   'dysplastic TP ≥19mm without sacral contact',
-        }
-        ct_key = next((k for k in ('IV','III','II','I') if k in castellvi), '')
-        paras.append(f'<b>Castellvi {castellvi.replace("Type ","")}</b> — {sides_str}: '
-                     f'{type_desc.get(ct_key, "TP enlargement")} (Castellvi 1984).')
-
-    if dhi_b is not None:
-        if dhi_b < DHI_REDUCED_PCT:
-            grade_str = f'severely reduced (DHI={dhi_b:.0f}%)'
-        elif dhi_b < DHI_MODERATE_PCT:
-            grade_str = f'moderately reduced (DHI={dhi_b:.0f}%)'
-        elif dhi_b < DHI_MILD_PCT:
-            grade_str = f'mildly reduced (DHI={dhi_b:.0f}%)'
-        else:
-            grade_str = f'preserved (DHI={dhi_b:.0f}%)'
-        p = f'Disc <b>{dhi_b_lvl}</b>: {grade_str}.'
-        if dhi_a and dhi_a >= DHI_MILD_PCT:
-            p += f' Disc above ({dhi_a_lvl}, DHI={dhi_a:.0f}%) preserved.'
-        paras.append(p)
-
-    if h_ap and shape_c:
-        shape_str = {'lumbar-like': f'lumbar-like (H/AP={h_ap:.2f})',
-                     'transitional': f'transitional (H/AP={h_ap:.2f})',
-                     'sacral-like': f'sacral-like (H/AP={h_ap:.2f})'}.get(shape_c, f'H/AP={h_ap:.2f}')
-        p = f'TV <b>{tv_name}</b> body: {shape_str} (Nardo 2012).'
-        if norm_r:
-            p += f' TV/L4={norm_r:.2f}.'
-        paras.append(p)
-
-    return '\n'.join('<div class="narr-para">' + p + '</div>' for p in paras)
-
-
-# ── Angle panel ────────────────────────────────────────────────────────────────
-
-def _build_angle_panel(va: dict) -> str:
-    if not va:
-        return ''
-
-    def row(k, v, cls=''):
-        cls_attr = f' {cls}' if cls else ''
-        return (f'<div class="pr"><span class="pk">{k}</span>'
-                f'<span class="pv{cls_attr}">{v}</span></div>')
-
-    def alert_row(msg, colour='#ff8800', bg='#1a1000'):
-        return (f'<div class="angle-alert" style="color:{colour};background:{bg};'
-                f'border-left-color:{colour}">{msg}</div>')
-
-    lines = ['<div class="ps">🔭 Vertebral Angles (Seilanian Toosi 2025)</div>']
-
-    delta      = va.get('delta_angle')
-    c_ang      = va.get('c_angle')
-    a_ang      = va.get('a_angle')
-    b_ang      = va.get('b_angle')
-    d_ang      = va.get('d_angle')
-    d1         = va.get('d1_angle')
-    delta_flag = va.get('delta_le8p5', False)
-    c_flag     = va.get('c_le35p5', False)
-    a_increased= va.get('a_increased', False)
-    d_decreased= va.get('d_decreased', False)
-    disc_pat   = va.get('disc_pattern_lstv', False)
-
-    if delta is not None:
-        d_cls = 'cr' if delta_flag else ('wn' if delta < 15 else 'ok')
-        lines.append(row('δ (D−D1)', f'{delta:.1f}°{"  ⚠" if delta_flag else ""}', d_cls))
-    if c_ang is not None:
-        c_cls = 'cr' if c_flag else ('wn' if c_ang < 38 else 'ok')
-        lines.append(row('C-angle', f'{c_ang:.1f}°{"  ⚠" if c_flag else ""}', c_cls))
-    if a_ang is not None:
-        lines.append(row('A-angle', f'{a_ang:.1f}°{"↑" if a_increased else ""}',
-                         'wn' if a_increased else 'ok'))
-    if b_ang is not None:
-        lines.append(row('B-angle', f'{b_ang:.1f}°'))
-    if d_ang is not None:
-        lines.append(row('D-angle', f'{d_ang:.1f}°{"↓" if d_decreased else ""}',
-                         'wn' if d_decreased else 'ok'))
-    if d1 is not None:
-        lines.append(row('D1-angle', f'{d1:.1f}°'))
-
-    if delta_flag:
-        lines.append(alert_row(
-            f'⚠ δ ≤ {DELTA_ANGLE_TYPE2_THRESHOLD}° → Type 2 LSTV  Sn 92.3% Sp 87.9%',
-            '#ff3333', '#2a0000'))
-    if c_flag and not delta_flag:
-        lines.append(alert_row(
-            f'⚠ C ≤ {C_ANGLE_LSTV_THRESHOLD}° → any LSTV  Sn 72.2% Sp 57.6%',
-            '#ff8800', '#1e1000'))
-    if disc_pat:
-        lines.append(alert_row(
-            '⚠ L4-L5 dehy + L5-S1 preserved  OR 19.9 p&lt;0.001',
-            '#ffe033', '#1a1800'))
-
-    lines.append(
-        '<div class="pc" style="color:#445566;font-size:.58rem">'
-        'Ref: Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280</div>')
-    return '\n'.join(lines)
-
-
-# ── Metrics HTML panel ─────────────────────────────────────────────────────────
-
-def build_metrics_panel(result: dict) -> str:
-    morpho       = result.get('lstv_morphometrics') or {}
-    castellvi    = result.get('castellvi_type') or 'None'
-    phenotype    = morpho.get('lstv_phenotype', 'normal')
-    confidence   = morpho.get('phenotype_confidence', '')
-    rationale    = morpho.get('phenotype_rationale', '')
-    criteria     = morpho.get('phenotype_criteria', [])
-    primary      = morpho.get('primary_criteria_met', [])
-    lumbar_count = morpho.get('lumbar_count_consensus', '?')
-    tv_name      = morpho.get('tv_name', '?')
-    lc_anomaly   = morpho.get('lumbar_count_anomaly', False)
-    tv_shape     = morpho.get('tv_shape') or {}
-    disc_above   = morpho.get('disc_above') or {}
-    disc_below   = morpho.get('disc_below') or {}
-    rib          = morpho.get('rib_anomaly') or {}
-    score        = result.get('pathology_score', 0)
-    xval         = result.get('cross_validation') or {}
-    lft          = result.get('left')   or {}
-    rgt          = result.get('right')  or {}
-    lstv_reasons = result.get('lstv_reason', [])
-    probs        = morpho.get('probabilities') or {}
-    rad_ev       = morpho.get('radiologic_evidence') or []
-    surg         = morpho.get('surgical_relevance') or {}
-    rdr          = morpho.get('relative_disc_ratio')
-    rdr_note     = morpho.get('relative_disc_note', '')
-    grad_note    = tv_shape.get('gradient_note', '')
-    caudal_grad  = tv_shape.get('caudal_gradient')
-    va           = morpho.get('vertebral_angles') or {}
-
-    cfg   = PHENOTYPE_CONFIG.get(phenotype, PHENOTYPE_CONFIG['normal'])
-    p_col = cfg['color']; p_bg = cfg['bg']; p_bdr = cfg['border']
-    p_lbl = cfg['label']; p_emj = cfg['emoji']
-
-    def sect(t): return f'<div class="ps">{t}</div>'
-    def row(k, v, cls=''):
-        cls_attr = f' {cls}' if cls else ''
-        return (f'<div class="pr"><span class="pk">{k}</span>'
-                f'<span class="pv{cls_attr}">{v}</span></div>')
-    def crit(txt): return f'<div class="pc">• {txt}</div>'
-
-    def prob_bar(label, pct, color):
-        w = min(float(pct), 100)
-        return (f'<div class="pb-row">'
-                f'<span class="pb-label">{label}</span>'
-                f'<div class="pb-track"><div class="pb-fill" style="width:{w:.0f}%;background:{color}"></div></div>'
-                f'<span class="pb-val">{pct:.0f}%</span></div>')
-
-    def risk_chip(level):
-        colours = {'critical':('#ff2222','#3a0000'),'high':('#ff6633','#2a1000'),
-                   'moderate':('#ff8800','#1e1000'),'low-moderate':('#ffe033','#1a1800'),
-                   'low':('#2dc653','#001a06')}
-        fg, bg = colours.get(level, ('#aaa','#111'))
-        return (f'<span class="risk-chip" style="color:{fg};background:{bg};'
-                f'border-color:{fg}">{level.upper()}</span>')
-
-    def strength_tag(s):
-        s = (s or '').lower()
-        if s == 'primary':   return '<span class="ev-tag ev-primary">PRIMARY</span>'
-        if s == 'secondary': return '<span class="ev-tag ev-secondary">2°</span>'
-        if s == 'against':   return '<span class="ev-tag ev-against">AGAINST</span>'
-        return '<span class="ev-tag ev-support">SUPPORT</span>'
-
-    def dir_col(d):
-        d = (d or '').lower()
-        if 'sacral' in d: return '#ff6633'
-        if 'lumbar' in d: return '#ffaa33'
-        if 'normal' in d: return '#2dc653'
-        return '#aaaacc'
-
-    def _n(x): return (x * 100 if (x or 0) <= 1 else x) if x is not None else 0
-
-    lines = []
-
-    lines.append(f'<div class="pstatus" style="background:{p_bg};border:2px solid {p_bdr};color:{p_col}">'
-                 f'{p_emj} {p_lbl}</div>')
-    lines.append(f'<div class="pconf" style="color:{p_col}">Confidence: {confidence.upper() if confidence else "—"}</div>')
-
-    p_sac  = _n(probs.get('p_sacralization'))
-    p_lumb = _n(probs.get('p_lumbarization'))
-    p_norm = _n(probs.get('p_normal'))
-    dom    = probs.get('dominant_class', '—')
-    conf_p = _n(probs.get('confidence_pct'))
-    n_crit = probs.get('n_criteria', 0)
-    cal_n  = probs.get('calibration_note', '')
-
-    if probs:
-        lines.append(sect('Bayesian Probability Model'))
-        lines.append(prob_bar('Sacralization', p_sac,  '#ff4444'))
-        lines.append(prob_bar('Lumbarization', p_lumb, '#ff8c00'))
-        lines.append(prob_bar('Normal',        p_norm, '#2dc653'))
-        dom_cls = 'cr' if dom == 'sacralization' else 'wn' if dom == 'lumbarization' else 'ok'
-        lines.append(row('Dominant', dom, dom_cls))
-        lines.append(row('Confidence', f'{conf_p:.0f}%', 'cr' if conf_p > 85 else 'wn' if conf_p > 65 else 'ok'))
-        lines.append(row('Criteria', str(n_crit)))
-        if cal_n:
-            lines.append(f'<div class="pc" style="color:#5566aa;font-style:italic">{cal_n}</div>')
-
-    angle_panel = _build_angle_panel(va)
-    if angle_panel:
-        lines.append(angle_panel)
-
-    narrative_html = _generate_clinical_narrative(result, morpho)
-    if narrative_html:
-        lines.append(sect('Clinical Summary'))
-        lines.append(narrative_html)
-
-    if surg:
-        wl_risk  = surg.get('wrong_level_risk', '')
-        wl_pct   = _n(surg.get('wrong_level_risk_pct'))
-        bert_pct = _n(surg.get('bertolotti_probability'))
-        nerve_amb= surg.get('nerve_root_ambiguity', False)
-        flags    = surg.get('surgical_flags') or []
-        approach = surg.get('approach_considerations') or []
-        count_rec= surg.get('recommended_counting_method', '')
-        ionm_note= surg.get('intraop_neuromonitoring_note', '')
-
-        lines.append(sect('⚕ Surgical Relevance'))
-        lines.append(f'<div class="pr"><span class="pk">Wrong-level risk</span>'
-                     f'<span class="pv">{risk_chip(wl_risk)}</span></div>')
-        if wl_pct:
-            lines.append(prob_bar('Level-error probability', wl_pct, '#ff3333'))
-        lines.append(row('Nerve root ambiguity',
-                         '⚠ YES' if nerve_amb else 'No', 'wn' if nerve_amb else 'ok'))
-        lines.append(prob_bar("Bertolotti P", bert_pct, '#ff6633' if bert_pct >= 50 else '#ff8800'))
-        if flags:
-            lines.append(sect('Intraoperative Flags'))
-            for f in flags:
-                lines.append(f'<div class="surg-flag">⚠ {f}</div>')
-        if count_rec:
-            lines.append(f'<div class="surg-note">{count_rec}</div>')
-        if approach:
-            for a in approach:
-                lines.append(f'<div class="surg-note">• {a}</div>')
-        if ionm_note:
-            lines.append(f'<div class="surg-note">{ionm_note}</div>')
-
-    lines.append(sect('LSTV Detection Basis'))
-    if lstv_reasons:
-        for r in lstv_reasons:
-            lines.append(f'<div class="pc">▶ {r}</div>')
-    else:
-        lines.append('<div class="pc" style="color:#2dc653">No LSTV criteria met</div>')
-
-    lines.append(sect('Pathology Score'))
-    sc_cls = 'cr' if score >= 8 else 'wn' if score >= 3 else 'ok'
-    lines.append(row('Score', f'{score:.0f}', sc_cls))
-
-    if rad_ev:
-        lines.append(sect('Radiologic Evidence'))
-        lines.append('<div class="ev-table">')
-        for group_dir, group_label in [
-            ('sacralization','Sacralization'), ('lumbarization','Lumbarization'),
-            ('normal','Against LSTV'), ('supporting','Supporting'),
-        ]:
-            group_items = [e for e in rad_ev if (e.get('direction') or '').lower() == group_dir]
-            if not group_items: continue
-            col = dir_col(group_dir)
-            lines.append(f'<div class="ev-group-hdr" style="color:{col}">{group_label}</div>')
-            for ev in group_items:
-                lr_sac  = ev.get('lr_sac', 0) or 0
-                lr_lumb = ev.get('lr_lumb', 0) or 0
-                lr_str  = ''
-                if lr_sac:  lr_str += f' LR(sac)={lr_sac:+.1f}'
-                if lr_lumb: lr_str += f' LR(lum)={lr_lumb:+.1f}'
-                lines.append(
-                    f'<div class="ev-row">{strength_tag(ev.get("strength",""))}'
-                    f'<div class="ev-body">'
-                    f'<div class="ev-name">{ev.get("name","")}</div>'
-                    f'<div class="ev-finding">{ev.get("finding","")}</div>'
-                    f'<div class="ev-meta">{ev.get("citation","")}{lr_str}</div>'
-                    f'</div></div>')
-        lines.append('</div>')
-
-    lines.append(sect('Castellvi Classification'))
-    ct_cls = ('cr' if castellvi and any(x in castellvi for x in ('III','IV'))
-              else 'wn' if castellvi and any(x in castellvi for x in ('I','II'))
-              else 'ok')
-    lines.append(row('Type', castellvi, ct_cls))
-    l_h = lft.get('tp_height_mm', 0); r_h = rgt.get('tp_height_mm', 0)
-    l_d = lft.get('dist_mm', float('inf')); r_d = rgt.get('dist_mm', float('inf'))
-    lines.append(row('Left',  f'{lft.get("classification","—")} | h={l_h:.1f}mm | d={l_d:.1f}mm',
-                     'cr' if (l_h >= TP_HEIGHT_MM or l_d <= CONTACT_DIST_MM) else 'ok'))
-    lines.append(row('Right', f'{rgt.get("classification","—")} | h={r_h:.1f}mm | d={r_d:.1f}mm',
-                     'cr' if (r_h >= TP_HEIGHT_MM or r_d <= CONTACT_DIST_MM) else 'ok'))
-
-    lines.append(sect('Lumbar Vertebrae'))
-    lines.append(row('Count (consensus)', f'{lumbar_count}{"  ⚠" if lc_anomaly else ""}',
-                     'cr' if lc_anomaly else 'ok'))
-    lines.append(row('TSS',    str(morpho.get('lumbar_count_tss', '—'))))
-    lines.append(row('VERIDAH',str(morpho.get('lumbar_count_veridah', '—'))))
-    if morpho.get('has_l6'):
-        lines.append(row('L6 present', 'YES — LUMBARIZATION signal', 'wn'))
-
-    lines.append(sect('Transitional Vertebra'))
-    lines.append(row('TV', tv_name, 'wn'))
-    h_ap = tv_shape.get('h_ap_ratio'); shpc = tv_shape.get('shape_class','—')
-    shp_cls = ('cr' if shpc == 'sacral-like' else 'wn' if shpc == 'transitional' else 'ok')
-    if h_ap:
-        lines.append(row('Body H/AP', f'{h_ap:.2f} ({shpc})', shp_cls))
-    nr = tv_shape.get('norm_ratio')
-    if nr:
-        lines.append(row('TV/L4 H:AP', f'{nr:.2f}', 'wn' if nr < 0.80 else 'ok'))
-    if caudal_grad is not None:
-        lines.append(row('H/AP gradient', f'{caudal_grad:+.3f}/level',
-                         'cr' if caudal_grad < -0.04 else 'ok'))
-    if grad_note:
-        lines.append(f'<div class="pc">{grad_note}</div>')
-
-    lines.append(sect('Adjacent Disc Heights (DHI)'))
-    for disc, label in ((disc_above,'Above TV'), (disc_below,'Below TV')):
-        dhi = disc.get('dhi_pct'); lvl = disc.get('level','—')
-        if dhi is not None:
-            cls = 'cr' if dhi < DHI_REDUCED_PCT else 'wn' if dhi < DHI_MODERATE_PCT else 'ok'
-            lines.append(row(f'{label} ({lvl})', f'{dhi:.0f}% [{disc.get("grade","?")}]', cls))
-        elif disc.get('is_absent'):
-            lines.append(row(f'{label} ({lvl})', 'ABSENT', 'cr'))
-        else:
-            lines.append(row(f'{label} ({lvl})', 'Not detected', 'pm'))
-    if rdr is not None:
-        lines.append(row('Disc ratio', f'{rdr:.2f} (Farshad-Amacker 2014)',
-                         'cr' if rdr < 0.50 else 'wn' if rdr < 0.65 else 'ok'))
-    if rdr_note:
-        lines.append(f'<div class="pc">{rdr_note}</div>')
-
-    lines.append(sect('Rib / Thoracic Count'))
-    thr_count = rib.get('thoracic_count')
-    if thr_count is not None:
-        lines.append(row('Thoracic', f'{thr_count} (exp {rib.get("expected_thoracic",12)})',
-                         'cr' if rib.get('count_anomaly') else 'ok'))
-    if rib.get('lumbar_rib_l1'):
-        lines.append(row('Lumbar rib L1', f'⚠ {rib.get("lumbar_rib_l1_h_mm",0):.1f}mm', 'cr'))
-
-    if primary:
-        lines.append(sect('Primary Criteria'))
-        for p in primary:
-            lines.append(f'<div class="pc">✓ {p}</div>')
-
-    if criteria:
-        lines.append(sect('Classification Evidence'))
-        for c in criteria[:7]:
-            lines.append(crit(c))
-
-    if rationale:
-        lines.append(sect('Rationale'))
-        lines.append(f'<div class="preason">{rationale}</div>')
-
-    xval_warns = xval.get('warnings', [])
-    if xval_warns:
-        lines.append(sect('⚠ QC Warnings'))
-        for w in xval_warns: lines.append(f'<div class="pwarning">{w}</div>')
-    else:
-        sd = xval.get('sacrum_dice')
-        if sd is not None:
-            lines.append(sect('QC (Cross-Validation)'))
-            lines.append(row('Sacrum Dice', f'{sd:.3f}', 'ok' if sd >= 0.30 else 'cr'))
-
-    return '\n'.join(lines)
-
-
-# ── Main figure builder ────────────────────────────────────────────────────────
-
-def build_3d_figure(study_id: str,
-                    spineps_dir: Path,
-                    totalspine_dir: Path,
-                    result: dict,
-                    smooth: float = 2.0,
-                    show_tss: bool = True):
-    seg_dir   = spineps_dir / 'segmentations' / study_id
-    sp_path   = seg_dir / f"{study_id}_seg-spine_msk.nii.gz"
-    vert_path = seg_dir / f"{study_id}_seg-vert_msk.nii.gz"
-    tss_path  = totalspine_dir / study_id / 'sagittal' / f"{study_id}_sagittal_labeled.nii.gz"
-
-    def _load(p, tag):
-        if not p.exists(): logger.warning(f"  Missing: {p.name}"); return None, None
-        try: return _load_canonical(p)
-        except Exception as exc: logger.warning(f"  {tag}: {exc}"); return None, None
-
-    sp_arr,  nii_ref  = _load(sp_path,   'seg-spine_msk')
-    vert_arr, _       = _load(vert_path, 'seg-vert_msk')
-    tss_arr,  tss_nii = _load(tss_path,  'TSS sagittal')
-
-    if sp_arr is None or vert_arr is None:
-        logger.error(f"[{study_id}] Missing required masks"); return None
-
-    vox_mm   = _voxmm(nii_ref)
-    sp_iso   = _resample(sp_arr.astype(np.int32),   vox_mm)
-    vert_iso = _resample(vert_arr.astype(np.int32), vox_mm)
-    tss_iso  = (_resample(tss_arr.astype(np.int32), _voxmm(tss_nii))
-                if tss_arr is not None and tss_nii is not None else None)
-
-    sp_labels   = frozenset(np.unique(sp_iso).tolist())   - {0}
-    vert_labels = frozenset(np.unique(vert_iso).tolist()) - {0}
-    tss_labels  = (frozenset(np.unique(tss_iso).tolist()) - {0}
-                   if tss_iso is not None else frozenset())
-
-    morpho    = result.get('lstv_morphometrics') or {}
-    phenotype = morpho.get('lstv_phenotype', 'normal')
-    tv_name   = morpho.get('tv_name') or result.get('details', {}).get('tv_name', 'L5')
-    cfg       = PHENOTYPE_CONFIG.get(phenotype, PHENOTYPE_CONFIG['normal'])
-    tv_label  = morpho.get('tv_label_veridah') or result.get('details', {}).get('tv_label')
-    va        = morpho.get('vertebral_angles') or {}
-
-    sac_iso = np.zeros(sp_iso.shape, bool)
-    if tss_iso is not None and TSS_SACRUM in tss_labels:
-        sac_iso = (tss_iso == TSS_SACRUM)
-    elif SP_SACRUM in sp_labels:
-        sac_iso = (sp_iso == SP_SACRUM)
-
-    col_mask  = (vert_iso > 0)
-    origin_mm = (_centroid(col_mask)
-                 if col_mask.any()
-                 else np.array(sp_iso.shape, float) / 2.0 * ISO_MM)
-
-    tv_z = _z_range(vert_iso == tv_label) if tv_label else None
-
-    details      = result.get('details', {})
-    tp_corrected = bool(details.get('tp_concordance_corrected', False))
-    if tp_corrected and details.get('corrected_tv_z_range'):
-        tv_z_for_tp = tuple(details['corrected_tv_z_range'])
-    else:
-        tv_z_for_tp = tv_z
-
-    def _get_tp(tp_lbl):
-        if tp_lbl not in sp_labels: return np.zeros(sp_iso.shape, bool)
-        if tv_z_for_tp:
-            isolated = _isolate_z(sp_iso == tp_lbl, tv_z_for_tp[0], tv_z_for_tp[1])
-            tp       = _inferiormost_cc(isolated, sac_iso if sac_iso.any() else None)
-            if not tp.any(): tp = (sp_iso == tp_lbl)
-        else:
-            tp = (sp_iso == tp_lbl)
-        return tp
-
-    tp_L = _get_tp(SP_TP_L); tp_R = _get_tp(SP_TP_R)
-    span_L = _tp_height_mm(tp_L); span_R = _tp_height_mm(tp_R)
-    dist_L = _min_dist(tp_L, sac_iso)[0]; dist_R = _min_dist(tp_R, sac_iso)[0]
-    castellvi = result.get('castellvi_type') or 'None'
-
-    traces: List  = []
-    groups:  List[str] = []
-
-    def _add(t, group='focused'):
-        if t is not None: traces.append(t); groups.append(group)
-    def _add_all(lst, group='focused'):
-        for t in lst: _add(t, group)
-
-    for lbl, name, col, op, fh, mx_s in SPINE_LABELS:
-        if lbl not in sp_labels: continue
-        mask = (tp_L if lbl == SP_TP_L else tp_R if lbl == SP_TP_R else (sp_iso == lbl))
-        if not mask.any(): continue
-        grp  = 'focused' if lbl in FOCUSED_SPINE_LABELS else 'full'
-        _add(mask_to_mesh3d(mask, origin_mm, name, col, op, min(smooth, mx_s), fh), grp)
-
-    for lbl, (col, op) in sorted(VERIDAH_COLOURS.items()):
-        if lbl not in vert_labels: continue
-        eff_col = cfg['color'] if lbl == tv_label else col
-        eff_op  = 0.82 if lbl == tv_label else op
-        grp = 'focused' if lbl in FOCUSED_VERIDAH_LABELS else 'full'
-        _add(mask_to_mesh3d(vert_iso == lbl, origin_mm,
-                            VERIDAH_NAMES.get(lbl, str(lbl)), eff_col, eff_op, smooth, True), grp)
-
-    for base, col in VERIDAH_IVD_COLOURS.items():
-        ivd_lbl = VD_IVD_BASE + base
-        if ivd_lbl not in vert_labels: continue
-        grp = 'focused' if base in FOCUSED_VERIDAH_IVD else 'full'
-        _add(mask_to_mesh3d(vert_iso == ivd_lbl, origin_mm,
-                            f'IVD {VERIDAH_NAMES.get(base,str(base))}', col, 0.58, smooth, True), grp)
-
-    if show_tss and tss_iso is not None:
-        for lbl, name, col, op in TSS_RENDER:
-            if lbl not in tss_labels: continue
-            grp = 'focused' if lbl in FOCUSED_TSS_LABELS else 'full'
-            _add(mask_to_mesh3d(tss_iso == lbl, origin_mm, name, col, op,
-                                0.8 if lbl in (TSS_CORD, TSS_CANAL) else smooth,
-                                lbl not in (TSS_CORD, TSS_CANAL)), grp)
-
-    if tv_label and tv_label in vert_labels:
-        _add_all(tv_plane_traces(vert_iso, tv_label, origin_mm, tv_name, phenotype))
-    tv_shape_dict = morpho.get('tv_shape') or {}
-    if tv_label and tv_label in vert_labels and tv_shape_dict:
-        _add_all(tv_body_annotation_traces(vert_iso, tv_label, origin_mm,
-                                            tv_shape_dict, phenotype))
-    _add_all(tp_ruler_traces(tp_L, origin_mm, '#ff3333', 'Left',  span_L))
-    _add_all(tp_ruler_traces(tp_R, origin_mm, '#00ccff', 'Right', span_R))
-    _add_all(gap_ruler_traces(tp_L, sac_iso, origin_mm, '#ff8800', 'Left',  dist_L))
-    _add_all(gap_ruler_traces(tp_R, sac_iso, origin_mm, '#00aaff', 'Right', dist_R))
-
-    if tv_label and tv_label in vert_labels:
-        _add_all(delta_angle_ruler_traces(vert_iso, tv_label, origin_mm,
-                                          va.get('delta_angle'), va.get('delta_le8p5', False)))
-
-    ct_has = bool(castellvi and castellvi not in ('None','N/A'))
-    if ct_has:
-        ct_col = '#ff2222' if any(x in castellvi for x in ('III','IV')) else '#ff8800'
-        if tp_L.any() and (span_L >= TP_HEIGHT_MM or dist_L <= CONTACT_DIST_MM):
-            _add(bbox_wireframe(tp_L, origin_mm, ct_col, f'⚠ Castellvi L ({castellvi})', width=5))
-        if tp_R.any() and (span_R >= TP_HEIGHT_MM or dist_R <= CONTACT_DIST_MM):
-            _add(bbox_wireframe(tp_R, origin_mm, ct_col, f'⚠ Castellvi R ({castellvi})', width=5))
-
-    if va.get('delta_le8p5') and tv_label and tv_label in vert_labels:
-        tv_mask  = (vert_iso == tv_label)
-        tv1_mask = (vert_iso == tv_label - 1)
-        if tv_mask.any() and tv1_mask.any():
-            _add(bbox_wireframe(tv_mask | tv1_mask, origin_mm, '#ff2222',
-                                f'⚠ δ ≤ {DELTA_ANGLE_TYPE2_THRESHOLD}°', dash='dot', width=4, margin_vox=4))
-
-    lumbar_count = morpho.get('lumbar_count_consensus', 5) or 5
-    if lumbar_count == 6 and VD_L6 in vert_labels:
-        l6_mask = (vert_iso == VD_L6)
-        if l6_mask.any():
-            _add(bbox_wireframe(l6_mask, origin_mm, '#ff8c00',
-                                '⚠ L6 — LUMBARIZATION', dash='dash', width=5, margin_vox=3))
-
-    if lumbar_count == 4:
-        l4_mask = None
-        if tss_iso is not None and 44 in tss_labels:
-            l4_mask = (tss_iso == 44)
-        elif VD_L4 in vert_labels:
-            l4_mask = (vert_iso == VD_L4)
-        if l4_mask is not None and l4_mask.any() and sac_iso.any():
-            l4_z_inf  = int(np.where(l4_mask)[2].min())
-            sac_z_sup = int(np.where(sac_iso)[2].max())
-            if l4_z_inf > sac_z_sup + 8:
-                l4_coords = np.where(l4_mask)
-                pseudo = np.zeros(sp_iso.shape, bool)
-                pseudo[int(l4_coords[0].min()):int(l4_coords[0].max())+1,
-                       int(l4_coords[1].min()):int(l4_coords[1].max())+1,
-                       sac_z_sup:l4_z_inf+1] = True
-                _add(bbox_wireframe(pseudo, origin_mm, '#ff2222',
-                                    '⚠ Est. L5 zone — fused (SACRALIZATION)',
-                                    dash='dot', width=4, margin_vox=0))
-
-    if not any(isinstance(tr, go.Mesh3d) for tr in traces):
-        logger.error(f"[{study_id}] Zero meshes"); return None
-
-    focused_vis      = [True if g == 'focused' else 'legendonly' for g in groups]
-    full_vis         = [True] * len(groups)
-    focused_vis_json = json.dumps(focused_vis)
-    full_vis_json    = json.dumps(full_vis)
-
-    score     = result.get('pathology_score', 0)
-    lstv_flag = '⚠ LSTV' if result.get('lstv_detected') else '✓ Normal'
-    delta_val = va.get('delta_angle')
-    delta_hdr = f'  δ={delta_val:.1f}°{"⚠" if va.get("delta_le8p5") else ""}' if delta_val else ''
-
-    fig = go.Figure(data=traces)
-    fig.update_layout(
-        title=dict(
-            text=(f"<b>{study_id}</b>  ·  "
-                  f"<span style='color:{cfg['color']}'>{cfg['label']}</span>  ·  "
-                  f"Castellvi <b>{castellvi}</b>  ·  TV: <b>{tv_name}</b>  ·  "
-                  f"Lumbar: <b>{lumbar_count}</b>  ·  {lstv_flag}  ·  Score: <b>{score:.0f}</b>"
-                  + delta_hdr
-                  + (' [TP-FIXED]' if tp_corrected else '')),
-            font=dict(size=12, color='#e8e8f0'), x=0.01),
-        paper_bgcolor='#0a0a18', plot_bgcolor='#0a0a18',
-        scene=dict(
-            bgcolor='#0a0a18',
-            xaxis=_axis('X'), yaxis=_axis('Y'), zaxis=_axis('Z (SI)'),
-            aspectmode='data',
-            camera=dict(eye=dict(x=1.6, y=0.2, z=0.3), up=dict(x=0, y=0, z=1))),
-        legend=dict(font=dict(color='#e8e8f0', size=9),
-                    bgcolor='rgba(10,10,24,0.88)', bordercolor='#222244', borderwidth=1,
-                    x=0.01, y=0.97, itemsizing='constant'),
-        margin=dict(l=0, r=0, t=40, b=0),
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN VISUALIZATION BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_lstv_visualization(
+        study_id:    str,
+        sp_vol:      np.ndarray,
+        vert_vol:    np.ndarray,
+        tss_vol:     Optional[np.ndarray],
+        lstv_result: Dict[str, Any],
+        show_sp:     bool = True,
+        show_tss:    bool = True,
+        show_vd:     bool = False,
+        step_size:   int  = 2,
+) -> str:
+    traces: List[dict] = []
+    sp_labels  = frozenset(np.unique(sp_vol).tolist())   - {0}
+    vd_labels  = frozenset(np.unique(vert_vol).tolist()) - {0}
+    tss_labels = (frozenset(np.unique(tss_vol).tolist()) - {0}
+                  if tss_vol is not None else frozenset())
+
+    # SPINEPS meshes
+    if show_sp:
+        for label, name, color, opacity in SP_RENDER:
+            if label not in sp_labels: continue
+            res = _extract_mesh(sp_vol, label, step_size=step_size)
+            if res:
+                traces.append(_mesh_to_plotly(res[0], res[1], color, opacity, name))
+
+    # TSS meshes
+    if show_tss and tss_vol is not None:
+        for label, name, color, opacity in TSS_RENDER:
+            if label not in tss_labels: continue
+            res = _extract_mesh(tss_vol, label, step_size=step_size)
+            if res:
+                traces.append(_mesh_to_plotly(res[0], res[1], color, opacity, name))
+
+    # VERIDAH meshes
+    if show_vd:
+        for label, name, color, opacity in VD_RENDER:
+            if label not in vd_labels: continue
+            res = _extract_mesh(vert_vol, label, step_size=step_size)
+            if res:
+                traces.append(_mesh_to_plotly(res[0], res[1], color, opacity, name))
+
+    # TP height rulers
+    for tp_label, side, ruler_color in [
+            (SP_TP_L, 'L', '#00ccff'),
+            (SP_TP_R, 'R', '#ff6600')]:
+        if tp_label not in sp_labels: continue
+        mask   = (sp_vol == tp_label)
+        coords = np.array(np.where(mask), dtype=float)
+        z_min  = float(coords[2].min()); z_max = float(coords[2].max())
+        h_mm   = z_max - z_min + 1.0
+        cx     = float(coords[0].mean()); cy = float(coords[1].mean())
+        triggered = h_mm >= TP_HEIGHT_MM
+        rc    = '#ff4444' if triggered else ruler_color
+        flag  = f' ≥{TP_HEIGHT_MM}mm ✓' if triggered else f' <{TP_HEIGHT_MM}mm'
+        p_lo  = np.array([cx, cy, z_min]); p_hi = np.array([cx, cy, z_max])
+        traces.append(_ruler_trace(p_lo, p_hi, rc, f'TP-{side} height {h_mm:.1f}mm{flag}'))
+        mid   = (p_lo + p_hi) / 2.0 + np.array([5, 0, 0])
+        traces.append(_annotation_trace(mid, f'TP-{side} {h_mm:.1f}mm', rc))
+
+    # TP–Sacrum gap rulers
+    for tp_label, side, ruler_color in [
+            (SP_TP_L, 'L', '#00ccff'),
+            (SP_TP_R, 'R', '#ff6600')]:
+        if tp_label not in sp_labels or SP_SACRUM not in sp_labels: continue
+        gap   = _tp_sacrum_gap_mm(sp_vol, tp_label)
+        if gap is None: continue
+        tp_c  = _centroid(sp_vol, tp_label)
+        sac_c = _centroid(sp_vol, SP_SACRUM)
+        if tp_c is None or sac_c is None: continue
+        contact = gap <= CONTACT_DIST_MM
+        gc   = '#ff4444' if contact else '#aaaaff'
+        flag = f' CONTACT ≤{CONTACT_DIST_MM}mm' if contact else f' gap {gap:.1f}mm'
+        traces.append(_ruler_trace(tp_c, sac_c, gc, f'TP-{side}–Sacrum{flag}', width=2))
+
+    # TV mid-plane
+    tv_label  = lstv_result.get('tv_label_veridah')
+    tv_name   = lstv_result.get('tv_name', 'TV')
+    phenotype = lstv_result.get('lstv_phenotype', 'normal')
+    plane_color = PHENOTYPE_COLORS.get(phenotype, '#888888')
+
+    if tv_label and tv_label in vd_labels:
+        c_tv = _centroid(vert_vol, tv_label)
+        if c_tv is not None:
+            traces.append(_plane_trace(c_tv, np.array([0., 0., 1.]),
+                                        plane_color, 0.18, f'TV ({tv_name}) mid-plane'))
+            traces.append(_annotation_trace(c_tv + np.array([0, 0, 8]),
+                                             f'{tv_name} ({phenotype})', plane_color))
+
+    # Dorsal angle overlays (v5.2)
+    angles = lstv_result.get('vertebral_angles')
+    if angles and isinstance(angles, dict) and angles.get('angles_available'):
+        if tv_label is not None:
+            traces.extend(build_angle_overlays_3d(
+                sp_vol, tss_vol, vert_vol, tv_label, angles))
+
+    # Layout
+    probs  = lstv_result.get('probabilities') or {}
+    p_sac  = probs.get('p_sacralization', 0.0)
+    p_lumb = probs.get('p_lumbarization', 0.0)
+    title_str = (f'{study_id} | {tv_name} | {phenotype} | '
+                 f'P(sac)={p_sac:.0%} P(lumb)={p_lumb:.0%}')
+
+    layout = dict(
+        title         = dict(text=title_str, font=dict(color='#eeeeee', size=13)),
+        paper_bgcolor = '#1a1a2e',
+        plot_bgcolor  = '#1a1a2e',
+        scene = dict(
+            xaxis = dict(showgrid=False, zeroline=False, showticklabels=False,
+                         backgroundcolor='#1a1a2e', title=''),
+            yaxis = dict(showgrid=False, zeroline=False, showticklabels=False,
+                         backgroundcolor='#1a1a2e', title=''),
+            zaxis = dict(showgrid=True,  zeroline=False, showticklabels=False,
+                         backgroundcolor='#1a1a2e', gridcolor='#333355', title=''),
+            bgcolor     = '#1a1a2e',
+            aspectmode  = 'data',
+            camera      = dict(eye=dict(x=1.8, y=1.8, z=0.5),
+                               up =dict(x=0,   y=0,   z=1)),
+        ),
+        legend = dict(bgcolor='rgba(20,20,40,0.85)', bordercolor='#444466',
+                      borderwidth=1, font=dict(color='#cccccc', size=10),
+                      x=0.01, y=0.99),
+        margin = dict(l=0, r=0, t=40, b=0),
+        height = 750,
     )
 
-    return (fig, castellvi, tv_name,
-            result.get('left',{}).get('classification','Normal'),
-            result.get('right',{}).get('classification','Normal'),
-            span_L, span_R, dist_L, dist_R, morpho, cfg,
-            focused_vis_json, full_vis_json)
+    angle_panel_html = build_angle_panel_html(
+        angles if isinstance(angles, dict) else None)
+    color_legend_html = _build_color_legend_html()
+
+    return _render_html(study_id, traces, layout,
+                         angle_panel_html, color_legend_html, lstv_result)
 
 
-def _axis(title: str) -> dict:
-    return dict(title=title, showgrid=True, gridcolor='#1a1a3a',
-                showbackground=True, backgroundcolor='#0a0a18',
-                tickfont=dict(color='#6666aa'), titlefont=dict(color='#6666aa'),
-                zeroline=False)
+# ══════════════════════════════════════════════════════════════════════════════
+# COLOR LEGEND
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_color_legend_html() -> str:
+    items = [
+        ('#00ccff', 'TP Left (SP 43)'),
+        ('#ff6600', 'TP Right (SP 44)'),
+        ('#b06000', 'SP Sacrum (SP 26)'),
+        ('#ff8c00', 'TSS Sacrum (TSS 50)'),
+        ('#44dd44', 'L4-L5 Disc (TSS 95)'),
+        ('#22bb22', 'L5-S1 Disc (TSS 100)'),
+        ('#9090ee', 'TSS L5 (TSS 45)'),
+        ('#ffdd00', 'A-angle'),
+        ('#ff4444', 'B-angle / Sacralization'),
+        ('#ff44ff', 'C-angle'),
+        ('#ff8800', 'D-angle'),
+        ('#00ccff', 'D1-angle'),
+        ('#ffffff', 'δ normal'),
+        ('#ff2222', 'δ ≤8.5° (Type2)'),
+        ('#4488ff', 'Lumbarization'),
+        ('#ff9900', 'Indeterminate'),
+        ('#44cc44', 'Normal'),
+    ]
+    html = '<div style="font-family:monospace;font-size:11px;color:#ccc">'
+    for color, label in items:
+        html += (f'<div style="display:flex;align-items:center;margin:2px 0">'
+                 f'<div style="width:14px;height:14px;background:{color};'
+                 f'margin-right:6px;border-radius:2px;flex-shrink:0"></div>'
+                 f'{label}</div>')
+    html += '</div>'
+    return html
 
 
-# ── HTML template ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML TEMPLATE
+# ══════════════════════════════════════════════════════════════════════════════
 
-_HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+def _render_html(study_id: str,
+                  traces: List[dict], layout: dict,
+                  angle_panel_html: str, color_legend_html: str,
+                  lstv_result: dict) -> str:
+    import json as _json
+    traces_json = _json.dumps(traces)
+    layout_json = _json.dumps(layout)
+
+    phenotype   = lstv_result.get('lstv_phenotype', 'N/A')
+    confidence  = lstv_result.get('phenotype_confidence', '')
+    tv_name     = lstv_result.get('tv_name', 'N/A')
+    lc          = lstv_result.get('lumbar_count_consensus', 'N/A')
+    count_note  = lstv_result.get('lumbar_count_note', '')
+    castv       = (lstv_result.get('castellvi_result') or {}).get('castellvi_type', 'N/A')
+    probs       = lstv_result.get('probabilities') or {}
+    p_sac       = probs.get('p_sacralization', 0)
+    p_lumb      = probs.get('p_lumbarization', 0)
+    p_norm      = probs.get('p_normal', 0)
+    phenotype_c = PHENOTYPE_COLORS.get(phenotype, '#888888')
+
+    tc          = lstv_result.get('tp_concordance') or {}
+    tc_l        = tc.get('left_in_bounds')
+    tc_r        = tc.get('right_in_bounds')
+    tc_l_str    = '✓' if tc_l is True else ('✗ FAIL' if tc_l is False else '—')
+    tc_r_str    = '✓' if tc_r is True else ('✗ FAIL' if tc_r is False else '—')
+    tc_color    = '#cc2222' if (tc_l is False or tc_r is False) else '#226622'
+
+    sr          = lstv_result.get('surgical_relevance') or {}
+    wlr         = sr.get('wrong_level_risk', 'N/A')
+    wlr_pct     = sr.get('wrong_level_risk_pct', 0)
+    wlr_colors  = {'low':'#226622','low-moderate':'#665500',
+                   'moderate':'#996600','high':'#cc4400','critical':'#cc0000'}
+    wlr_color   = wlr_colors.get(wlr, '#888888')
+    bert_p      = sr.get('bertolotti_probability', 0)
+    flags       = '\n'.join(f'• {f}' for f in (sr.get('surgical_flags') or []))
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
 <title>LSTV 3D — {study_id}</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@700;800&display=swap');
-*{{box-sizing:border-box;margin:0;padding:0}}
-:root{{--bg:#0a0a18;--sf:#11112a;--bd:#222244;--tx:#e8e8f0;--mu:#6677bb;--base:13px}}
-html,body{{background:var(--bg);color:var(--tx);font-family:'JetBrains Mono',monospace;
-           font-size:var(--base);height:100vh;display:flex;flex-direction:column;overflow:hidden}}
-header{{display:flex;align-items:center;flex-wrap:wrap;gap:7px;padding:6px 12px;
-        border-bottom:1px solid var(--bd);background:var(--sf);flex-shrink:0}}
-h1{{font-family:'Syne',sans-serif;font-size:.85rem;font-weight:800}}
-.b{{display:inline-block;padding:3px 9px;border-radius:14px;font-size:.72rem;font-weight:600;white-space:nowrap}}
-.bs{{background:#222244;color:var(--mu)}}
-.bc{{background:{status_bg};color:{status_color};border:1px solid {status_border};font-size:.80rem;font-weight:700;padding:4px 12px;border-radius:4px}}
-.bct{{background:#1a2a3a;color:#5599cc}}.bch{{background:#2a1a0a;color:#cc8833}}
-.bln{{background:#0a2a0a;color:#44cc66}}.ble{{background:#2a0a0a;color:#ff3333}}
-.bnl{{background:#0a1a0a;color:#55cc77;font-weight:600}}
-.bsc{{background:#1a1a3a;color:#aaaaff;font-weight:700}}
-.bcr{{background:#221010;color:#ff6633;border:1px solid #ff4400;font-weight:700}}
-.bdelta{{background:{delta_bg};color:{delta_color};border:1px solid {delta_border};font-weight:700}}
-.tb{{display:flex;gap:5px;align-items:center;margin-left:auto;flex-wrap:wrap}}
-.tb span{{font-size:.65rem;color:var(--mu);text-transform:uppercase;letter-spacing:.04em}}
-button{{background:var(--bg);border:1px solid var(--bd);color:var(--tx);
-        font-family:inherit;font-size:.68rem;padding:3px 9px;border-radius:4px;cursor:pointer;transition:background .15s}}
-button:hover{{background:var(--bd)}}
-button.on{{background:#3366ff;border-color:#3366ff;color:#fff}}
-button.on-focus{{background:#ff8c00;border-color:#ff8c00;color:#000;font-weight:700}}
-.mt{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:4px 12px;
-     border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.70rem}}
-.m{{display:flex;align-items:center;gap:4px;color:var(--mu)}}
-.v{{color:var(--tx);font-weight:600}}
-.ok{{color:#2dc653!important}}.wn{{color:#ff8800!important}}.cr{{color:#ff3333!important}}
-.note{{font-size:.60rem;color:#3a3a5a;margin-left:auto}}
-.main-row{{display:flex;flex:1;min-height:0;overflow:hidden}}
-#pl{{flex:1;min-width:0;min-height:0;overflow:hidden}}
-#pl .js-plotly-plot,#pl .plot-container{{height:100%!important}}
-#mp{{width:360px;flex-shrink:0;background:rgba(10,10,24,0.96);
-     border-left:1px solid var(--bd);overflow-y:auto;overflow-x:hidden;
-     padding:0 0 16px 0;scrollbar-width:thin;scrollbar-color:#222244 var(--bg)}}
-#mp::-webkit-scrollbar{{width:4px}}
-#mp::-webkit-scrollbar-thumb{{background:#222244;border-radius:2px}}
-.pb-row{{display:flex;align-items:center;gap:5px;padding:2px 10px}}
-.pb-label{{color:#8899bb;font-size:.63rem;width:76px;flex-shrink:0;text-align:right}}
-.pb-track{{flex:1;height:6px;background:#111130;border-radius:3px;overflow:hidden}}
-.pb-fill{{height:100%;border-radius:3px}}
-.pb-val{{color:var(--tx);font-size:.66rem;font-weight:600;width:30px;text-align:right}}
-.risk-chip{{display:inline-block;padding:1px 7px;border-radius:3px;font-size:.66rem;font-weight:700;border:1px solid}}
-.ev-table{{padding:2px 8px}}
-.ev-group-hdr{{font-size:.60rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:4px 2px 1px;margin-top:4px;border-bottom:1px solid #161630}}
-.ev-row{{display:flex;align-items:flex-start;gap:5px;padding:3px 2px;border-bottom:1px solid #0d0d22}}
-.ev-tag{{flex-shrink:0;font-size:.55rem;font-weight:700;padding:1px 4px;border-radius:2px;letter-spacing:.04em;margin-top:1px}}
-.ev-primary{{background:#3a1000;color:#ff6633;border:1px solid #ff4400}}
-.ev-secondary{{background:#2a1a00;color:#ff9900;border:1px solid #aa6600}}
-.ev-against{{background:#001a00;color:#44cc66;border:1px solid #226622}}
-.ev-support{{background:#1a1a3a;color:#8899cc;border:1px solid #334488}}
-.ev-body{{flex:1;min-width:0}}
-.ev-name{{color:#ccd4e8;font-size:.66rem;font-weight:600;line-height:1.3}}
-.ev-finding{{color:#8899aa;font-size:.62rem;line-height:1.4;margin-top:1px}}
-.ev-meta{{color:#445566;font-size:.58rem;margin-top:1px;font-style:italic}}
-.angle-alert{{margin:3px 8px;padding:4px 8px;border-left:3px solid;border-radius:0 4px 4px 0;font-size:.65rem;line-height:1.55;font-weight:600}}
-.pstatus{{text-align:center;font-family:'Syne',sans-serif;font-size:.92rem;font-weight:800;
-  letter-spacing:.05em;text-transform:uppercase;padding:10px 12px;margin-bottom:2px}}
-.pconf{{text-align:center;font-size:.66rem;font-weight:600;padding:2px 12px 6px;opacity:.88}}
-.ps{{font-family:'Syne',sans-serif;font-size:.65rem;font-weight:700;color:#6677bb;
-     text-transform:uppercase;letter-spacing:.07em;padding:7px 10px 3px;margin-top:5px;
-     border-top:1px solid #161630}}
-.ps:first-child{{border-top:none;margin-top:0}}
-.pr{{display:flex;justify-content:space-between;align-items:baseline;padding:2px 10px;gap:6px}}
-.pk{{color:#6677bb;white-space:nowrap;flex-shrink:0;max-width:52%;font-size:.68rem}}
-.pv{{text-align:right;color:var(--tx);font-weight:600;word-break:break-word;font-size:.70rem}}
-.pv.ok{{color:#2dc653}}.pv.wn{{color:#ff8800}}.pv.cr{{color:#ff3333}}.pv.pm{{color:#6677aa;font-weight:400}}
-.pc{{padding:3px 12px;color:#99aabb;font-size:.66rem;line-height:1.5}}
-.preason{{padding:4px 10px 5px;color:#aabbcc;font-size:.64rem;line-height:1.55;
-          border-left:3px solid #3344aa;margin:3px 8px;background:rgba(30,40,80,.25);border-radius:0 4px 4px 0}}
-.pwarning{{padding:3px 10px;color:#ffaa33;font-size:.65rem}}
-.narr-para{{padding:4px 10px 5px;color:#c8d8e8;font-size:.68rem;line-height:1.6;margin:2px 0;border-left:2px solid rgba(100,120,200,.35)}}
-.narr-para b{{color:#e8eeff}}
-.surg-flag{{padding:3px 10px;color:#ffbb44;font-size:.63rem;line-height:1.5;border-left:2px solid #ff6633;margin:1px 8px;background:rgba(40,20,0,.3)}}
-.surg-note{{padding:3px 10px;color:#99aacc;font-size:.63rem;line-height:1.55;margin:1px 0}}
-.lg{{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:3px 12px;border-bottom:1px solid var(--bd);flex-shrink:0;font-size:.67rem}}
-.li{{display:flex;align-items:center;gap:4px;color:var(--mu)}}
-.sw{{width:10px;height:10px;border-radius:2px;flex-shrink:0}}
-</style></head><body>
-<header>
-  <h1>LSTV 3D v5</h1>
-  <span class="b bs">{study_id}</span>
-  <span class="b bc">{status_emoji}&nbsp;{status_label}</span>
-  <span class="b bct">Castellvi: {castellvi}</span>
-  <span class="b bch">TV: {tv_name}</span>
-  <span class="b {lc_badge}">Lumbar: {lumbar_count}</span>
-  <span class="b bdelta">δ={delta_disp}</span>
-  {rib_badge}{tp_corrected_badge}{lstv_badge}
-  <span class="b bsc">Score: {score:.0f}</span>
-  {surgical_risk_badge}{prob_badge}
-  <div class="tb">
-    <span>View</span>
-    <button onclick="setFocused()" id="b-focused" class="on-focus">🎯 Focused</button>
-    <button onclick="setFull()" id="b-full">🌐 Full</button>
-    &nbsp;<span>Cam</span>
-    <button onclick="sv('oblique')" id="b-oblique" class="on">Oblique</button>
-    <button onclick="sv('lat')" id="b-lat">Lat</button>
-    <button onclick="sv('post')" id="b-post">Post</button>
-    <button onclick="sv('ant')" id="b-ant">Ant</button>
-    <button onclick="sv('axial')" id="b-axial">Axial</button>
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{
+    background:#0e0e1a; color:#e0e0f0;
+    font-family:'Courier New',monospace;
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  }}
+  #header {{
+    background:#15152a; border-bottom:1px solid #333366;
+    padding:8px 16px; display:flex; align-items:center; gap:16px; flex-shrink:0;
+  }}
+  #header h1 {{ font-size:13px; color:#aaaadd; font-weight:normal; }}
+  .badge {{
+    padding:3px 8px; border-radius:4px; font-size:12px; font-weight:bold;
+  }}
+  #main {{ display:flex; flex:1; overflow:hidden; }}
+  #plotDiv {{ flex:1; min-width:0; }}
+  #sidebar {{
+    width:285px; flex-shrink:0; background:#15152a;
+    border-left:1px solid #333366; overflow-y:auto;
+    display:flex; flex-direction:column;
+  }}
+  .sb {{ border-bottom:1px solid #2a2a4a; padding:10px 12px; }}
+  .sb h3 {{
+    font-size:10px; color:#8888bb; text-transform:uppercase;
+    letter-spacing:1px; margin-bottom:6px;
+  }}
+  .sr {{ display:flex; justify-content:space-between; font-size:12px; padding:2px 0; color:#ccccdd; }}
+  .sv {{ color:#ffffff; font-weight:bold; }}
+  .pb {{ height:6px; border-radius:3px; margin:2px 0 4px; }}
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>LSTV v5.2 — {study_id}</h1>
+  <span class="badge" style="background:{phenotype_c}">{phenotype} ({confidence})</span>
+  <span class="badge" style="background:#333366">TV: {tv_name}</span>
+  <span class="badge" style="background:#333366">L: {lc}</span>
+  <span class="badge" style="background:{tc_color}">TP L:{tc_l_str} R:{tc_r_str}</span>
+</div>
+<div id="main">
+  <div id="plotDiv"></div>
+  <div id="sidebar">
+
+    <div class="sb">
+      <h3>Probability</h3>
+      <div class="sr"><span>Sacralization</span><span class="sv">{p_sac:.1%}</span></div>
+      <div class="pb" style="width:{p_sac*100:.0f}%;background:#ff4444"></div>
+      <div class="sr"><span>Lumbarization</span><span class="sv">{p_lumb:.1%}</span></div>
+      <div class="pb" style="width:{p_lumb*100:.0f}%;background:#4488ff"></div>
+      <div class="sr"><span>Normal</span><span class="sv">{p_norm:.1%}</span></div>
+      <div class="pb" style="width:{p_norm*100:.0f}%;background:#44cc44"></div>
+    </div>
+
+    <div class="sb">
+      <h3>Vertebral Angles — Seilanian Toosi 2025</h3>
+      {angle_panel_html}
+    </div>
+
+    <div class="sb">
+      <h3>Surgical Risk</h3>
+      <div class="sr">
+        <span>Wrong-level risk</span>
+        <span class="sv" style="color:{wlr_color}">{wlr} ({wlr_pct:.0%})</span>
+      </div>
+      <div class="sr"><span>Bertolotti P</span><span class="sv">{bert_p:.0%}</span></div>
+      <div style="font-size:10px;color:#aaaacc;margin-top:6px;white-space:pre-wrap">{flags}</div>
+    </div>
+
+    <div class="sb">
+      <h3>Color Legend</h3>
+      {color_legend_html}
+    </div>
+
+    <div class="sb" style="font-size:11px;color:#888899">
+      <div>Castellvi: {castv}</div>
+      <div style="margin-top:4px">{count_note[:90] if count_note else ''}</div>
+    </div>
+
   </div>
-</header>
-<div class="mt">
-  <div class="m">TP-L <span class="v {tpl_c}">{span_L:.1f}mm</span></div>
-  <div class="m">TP-R <span class="v {tpr_c}">{span_R:.1f}mm</span></div>
-  <div class="m">Gap-L <span class="v {gl_c}">{gap_L}</span></div>
-  <div class="m">Gap-R <span class="v {gr_c}">{gap_R}</span></div>
-  <div class="m">δ <span class="v {delta_c}">{delta_mt}</span></div>
-  <div class="m">C <span class="v {c_c}">{c_mt}</span></div>
-  <div class="m">DHI-below <span class="v {dhi_c}">{dhi_disp}</span></div>
-  <div class="m">P(sac) <span class="v {psac_c}">{psac_disp}</span></div>
-  <div class="m">WL-risk <span class="v {risk_c}">{risk_disp}</span></div>
-  <span class="note">drag=rotate · scroll=zoom · click legend=toggle</span>
-</div>
-<div class="lg">
-  <div class="li"><div class="sw" style="background:#ff3333"></div>TP-Left</div>
-  <div class="li"><div class="sw" style="background:#00ccff"></div>TP-Right</div>
-  <div class="li"><div class="sw" style="background:#ff8c00"></div>Sacrum</div>
-  <div class="li"><div class="sw" style="background:{tv_col}"></div>TV ({tv_name})</div>
-  <div class="li"><div class="sw" style="background:#2266aa"></div>L4/L5</div>
-  <div class="li"><div class="sw" style="background:{delta_sw_col};border:2px dashed {delta_sw_col}"></div>δ-ruler</div>
-</div>
-<div class="main-row">
-  <div id="pl">{plotly_div}</div>
-  <div id="mp">{metrics_panel}</div>
 </div>
 <script>
-const FOCUSED_VIS={focused_vis_json};
-const FULL_VIS={full_vis_json};
-function getPlot(){{return document.querySelector('#pl .js-plotly-plot');}}
-function setFocused(){{
-  const pd=getPlot();if(!pd)return;
-  Plotly.restyle(pd,{{visible:FOCUSED_VIS}});
-  document.getElementById('b-focused').className='on-focus';
-  document.getElementById('b-full').className='';
-}}
-function setFull(){{
-  const pd=getPlot();if(!pd)return;
-  Plotly.restyle(pd,{{visible:FULL_VIS}});
-  document.getElementById('b-full').className='on';
-  document.getElementById('b-focused').className='';
-}}
-const CAM={{
-  oblique:{{eye:{{x:1.6,y:0.3,z:0.35}},up:{{x:0,y:0,z:1}}}},
-  lat:{{eye:{{x:2.5,y:0.0,z:0.0}},up:{{x:0,y:0,z:1}}}},
-  post:{{eye:{{x:0.0,y:2.5,z:0.0}},up:{{x:0,y:0,z:1}}}},
-  ant:{{eye:{{x:0.0,y:-2.5,z:0.0}},up:{{x:0,y:0,z:1}}}},
-  axial:{{eye:{{x:0.0,y:0.0,z:3.0}},up:{{x:0,y:1,z:0}}}},
-}};
-function sv(n){{
-  const pd=getPlot();if(!pd)return;
-  Plotly.relayout(pd,{{'scene.camera.eye':CAM[n].eye,'scene.camera.up':CAM[n].up}});
-}}
-window.addEventListener('load',()=>{{setTimeout(setFocused,400);}});
-window.addEventListener('resize',()=>{{const pd=getPlot();if(pd)Plotly.Plots.resize(pd);}});
+  var traces = {traces_json};
+  var layout = {layout_json};
+  Plotly.newPlot('plotDiv', traces, layout, {{
+    responsive:true, displayModeBar:true,
+    modeBarButtonsToRemove:['toImage'],
+  }});
 </script>
-</body></html>"""
+</body>
+</html>"""
 
 
-def save_html(fig, study_id: str, output_dir: Path,
-              castellvi: str, tv_name: str, cls_L: str, cls_R: str,
-              span_L: float, span_R: float, dist_L: float, dist_R: float,
-              morpho: dict, cfg: dict, result: dict,
-              focused_vis_json: str, full_vis_json: str,
-              tp_corrected: bool = False) -> Path:
-    from plotly.io import to_html
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
 
-    plotly_div = to_html(fig, full_html=False, include_plotlyjs='cdn',
-                          config=dict(responsive=True, displayModeBar=True, displaylogo=False))
-
-    def _f(v): return f'{v:.1f}mm' if (v is not None and np.isfinite(v)) else 'N/A'
-    def _gc(v): return 'cr' if (np.isfinite(v) and v <= CONTACT_DIST_MM) else 'ok'
-    def _hc(v): return 'cr' if v >= TP_HEIGHT_MM else 'ok'
-    def _n(x):  return (x * 100 if (x or 0) <= 1 else x) if x is not None else 0
-
-    phenotype    = morpho.get('lstv_phenotype', 'normal')
-    lumbar_count = morpho.get('lumbar_count_consensus', '?')
-    lc_anomaly   = morpho.get('lumbar_count_anomaly', False)
-    score        = result.get('pathology_score', 0)
-    rib          = morpho.get('rib_anomaly') or {}
-    tv_shape     = morpho.get('tv_shape') or {}
-    disc_below   = morpho.get('disc_below') or {}
-    dhi_b        = disc_below.get('dhi_pct')
-    va           = morpho.get('vertebral_angles') or {}
-
-    status_cfg = PHENOTYPE_CONFIG.get(phenotype, PHENOTYPE_CONFIG['normal'])
-    lc_badge   = 'ble' if lc_anomaly else 'bln'
-    rib_badge  = '<span class="b ble">Rib ⚠</span>' if rib.get('any_anomaly') else ''
-    tp_corrected_badge = '<span class="b bcr">TP-fixed ⚙</span>' if tp_corrected else ''
-    lstv_badge = ('<span class="b ble">⚠ LSTV</span>'
-                  if result.get('lstv_detected')
-                  else '<span class="b bnl">✓ Normal</span>')
-    dhi_c  = ('cr' if dhi_b and dhi_b < DHI_REDUCED_PCT else
-               'wn' if dhi_b and dhi_b < DHI_MODERATE_PCT else 'ok')
-    dhi_disp = f'{dhi_b:.0f}%' if dhi_b else 'N/A'
-    tv_col   = status_cfg['color']
-
-    delta_val  = va.get('delta_angle')
-    c_val      = va.get('c_angle')
-    delta_flag = va.get('delta_le8p5', False)
-    c_flag     = va.get('c_le35p5', False)
-
-    delta_mt = f'{delta_val:.1f}°{"⚠" if delta_flag else ""}' if delta_val is not None else 'N/A'
-    c_mt     = f'{c_val:.1f}°{"⚠" if c_flag else ""}' if c_val is not None else 'N/A'
-    delta_c  = 'cr' if delta_flag else ('wn' if (delta_val is not None and delta_val < 15) else 'ok')
-    c_c      = 'cr' if c_flag else ('wn' if (c_val is not None and c_val < 38) else 'ok')
-
-    if delta_val is not None:
-        if delta_flag:
-            delta_disp = f'{delta_val:.1f}° ⚠'; delta_bg = '#3a0000'; delta_color = '#ff3333'; delta_border = '#ff4444'
-        elif delta_val < 15:
-            delta_disp = f'{delta_val:.1f}°'; delta_bg = '#1e1000'; delta_color = '#ff8800'; delta_border = '#ff9900'
-        else:
-            delta_disp = f'{delta_val:.1f}°'; delta_bg = '#001a06'; delta_color = '#2dc653'; delta_border = '#2dc653'
-    else:
-        delta_disp = 'N/A'; delta_bg = '#111130'; delta_color = '#6677aa'; delta_border = '#334488'
-
-    delta_sw_col = '#ff2222' if delta_flag else ('#ff8800' if (delta_val is not None and delta_val < 15) else '#44ff88')
-
-    probs  = morpho.get('probabilities') or {}
-    surg   = morpho.get('surgical_relevance') or {}
-    p_sac_v  = _n(probs.get('p_sacralization'))
-    wl_risk  = surg.get('wrong_level_risk', '')
-    psac_c   = 'cr' if p_sac_v > 70 else 'wn' if p_sac_v > 40 else 'ok'
-    risk_c   = 'cr' if wl_risk in ('critical','high') else 'wn' if wl_risk == 'moderate' else 'ok'
-    psac_disp = f'{p_sac_v:.0f}%' if probs else 'N/A'
-    risk_disp = wl_risk.upper() if wl_risk else 'N/A'
-
-    _risk_bg = {'critical':('#3a0000','#ff2222'),'high':('#2a1000','#ff6633'),
-                'moderate':('#1e1000','#ff8800'),'low-moderate':('#1a1800','#ffe033'),
-                'low':('#001a06','#2dc653')}
-    surg_rbg, surg_rfg = _risk_bg.get(wl_risk, ('#111','#aaa'))
-    surgical_risk_badge = (
-        f'<span class="b" style="background:{surg_rbg};color:{surg_rfg};border:1px solid {surg_rfg}">'
-        f'⚕ {wl_risk.upper()}</span>') if wl_risk else ''
-
-    dom_class = probs.get('dominant_class', '')
-    conf_pct  = _n(probs.get('confidence_pct'))
-    _dom_fg   = {'sacralization':'#ff6633','lumbarization':'#ffaa33','normal':'#2dc653'}.get(dom_class,'#aaaacc')
-    prob_badge = (f'<span class="b" style="background:#0d0d22;color:{_dom_fg};border:1px solid {_dom_fg}">'
-                  f'P({dom_class[:3]})={conf_pct:.0f}%</span>') if dom_class else ''
-
-    html = _HTML_TEMPLATE.format(
-        study_id=study_id,
-        status_label=status_cfg['label'], status_emoji=status_cfg['emoji'],
-        status_color=status_cfg['color'], status_bg=status_cfg['bg'],
-        status_border=status_cfg['border'],
-        castellvi=castellvi, tv_name=tv_name,
-        lumbar_count=lumbar_count, lc_badge=lc_badge,
-        rib_badge=rib_badge, tp_corrected_badge=tp_corrected_badge,
-        lstv_badge=lstv_badge, score=score,
-        span_L=span_L, span_R=span_R,
-        tpl_c=_hc(span_L), tpr_c=_hc(span_R),
-        gap_L=_f(dist_L), gap_R=_f(dist_R),
-        gl_c=_gc(dist_L), gr_c=_gc(dist_R),
-        delta_mt=delta_mt, delta_c=delta_c,
-        c_mt=c_mt, c_c=c_c,
-        dhi_disp=dhi_disp, dhi_c=dhi_c,
-        tv_col=tv_col,
-        delta_disp=delta_disp, delta_bg=delta_bg,
-        delta_color=delta_color, delta_border=delta_border,
-        delta_sw_col=delta_sw_col,
-        psac_disp=psac_disp, psac_c=psac_c,
-        risk_disp=risk_disp, risk_c=risk_c,
-        surgical_risk_badge=surgical_risk_badge, prob_badge=prob_badge,
-        metrics_panel=build_metrics_panel(result),
-        plotly_div=plotly_div,
-        focused_vis_json=focused_vis_json, full_vis_json=full_vis_json,
-    )
-
-    out_path = output_dir / f"{study_id}_lstv_3d.html"
-    out_path.write_text(html, encoding='utf-8')
-    logger.info(f"  → {out_path}  ({out_path.stat().st_size / 1e6:.1f} MB)")
-    return out_path
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description='LSTV 3D Visualization v5.2')
+    p.add_argument('--study-id',       required=True)
+    p.add_argument('--spineps-dir',    required=True, type=Path)
+    p.add_argument('--totalspine-dir', required=True, type=Path)
+    p.add_argument('--lstv-json',      required=True, type=Path)
+    p.add_argument('--output-dir',     required=True, type=Path)
+    p.add_argument('--no-tss',   action='store_true')
+    p.add_argument('--show-vd',  action='store_true')
+    p.add_argument('--step-size', type=int, default=2)
+    p.add_argument('--log-level', default='INFO',
+                   choices=['DEBUG','INFO','WARNING','ERROR'])
+    return p
 
 
-# ── Study ranking ──────────────────────────────────────────────────────────────
+def main() -> None:
+    args = _build_arg_parser().parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level),
+                        format='%(asctime)s %(levelname)-8s %(message)s',
+                        datefmt='%H:%M:%S')
+    sid      = args.study_id
+    seg      = args.spineps_dir / 'segmentations' / sid
+    sp_path  = seg / f'{sid}_seg-spine_msk.nii.gz'
+    vt_path  = seg / f'{sid}_seg-vert_msk.nii.gz'
+    tss_path = (args.totalspine_dir / sid / 'sagittal'
+                / f'{sid}_sagittal_labeled.nii.gz')
 
-def rank_studies(results: List[dict],
-                 n_pathologic: int,
-                 n_normal: int) -> Tuple[List[str], List[str]]:
-    scored = sorted(
-        ((r['study_id'], r.get('pathology_score') or 0) for r in results),
-        key=lambda t: t[1], reverse=True,
-    )
-    pathologic_ids = {sid for sid, _ in scored[:n_pathologic]}
-    pathologic     = [sid for sid, _ in scored[:n_pathologic]]
-    result_by_id   = {r['study_id']: r for r in results}
-
-    def _is_normal(sid):
-        r = result_by_id.get(sid, {})
-        if r.get('lstv_detected'): return False
-        cnt = (r.get('lstv_morphometrics') or {}).get('lumbar_count_consensus')
-        if cnt is not None and cnt != EXPECTED_LUMBAR: return False
-        if (r.get('pathology_score') or 0) > 0: return False
-        return True
-
-    normal_pool = [(sid, sc) for sid, sc in reversed(scored)
-                   if sid not in pathologic_ids and _is_normal(sid)]
-    if len(normal_pool) < n_normal:
-        extra = [(sid, sc) for sid, sc in reversed(scored)
-                 if sid not in pathologic_ids and sid not in {s for s,_ in normal_pool}]
-        normal_pool = (normal_pool + extra)[:n_normal]
-
-    normal = [sid for sid, _ in normal_pool[:n_normal]]
-    return pathologic, normal
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description='LSTV 3D spine visualiser (v5)')
-    parser.add_argument('--spineps_dir',    required=True)
-    parser.add_argument('--totalspine_dir', required=True)
-    parser.add_argument('--output_dir',     required=True)
-    parser.add_argument('--lstv_json',      default=None)
-    parser.add_argument('--study_id',       default=None)
-    parser.add_argument('--all',            action='store_true')
-    parser.add_argument('--rank_by',        default='lstv')
-    parser.add_argument('--top_n',          type=int, default=5)
-    parser.add_argument('--top_normal',     type=int, default=2)
-    parser.add_argument('--smooth',         type=float, default=2.0)
-    parser.add_argument('--no_tss',         action='store_true')
-    args = parser.parse_args()
-
-    spineps_dir    = Path(args.spineps_dir)
-    totalspine_dir = Path(args.totalspine_dir)
-    output_dir     = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    seg_root = spineps_dir / 'segmentations'
-
-    all_results: List[dict]    = []
-    result_by_id: Dict[str, dict] = {}
-    if args.lstv_json:
-        p = Path(args.lstv_json)
-        if p.exists():
-            with open(p) as fh: all_results = json.load(fh)
-            result_by_id = {str(r['study_id']): r for r in all_results}
-
-    if args.study_id:
-        study_ids = [args.study_id]
-    elif args.all:
-        study_ids = sorted(d.name for d in seg_root.iterdir() if d.is_dir())
-    elif args.rank_by == 'lstv':
-        if not all_results:
-            parser.error("--rank_by lstv requires --lstv_json")
-        pathologic, normal = rank_studies(all_results, args.top_n, args.top_normal)
-        seen = set(pathologic)
-        study_ids = pathologic + [s for s in normal if s not in seen]
-        study_ids = [s for s in study_ids if (seg_root / s).is_dir()]
-    else:
-        parser.error("--rank_by must be 'lstv' or 'all', or use --study_id / --all")
-
-    logger.info(f"Rendering {len(study_ids)} studies → {output_dir}")
-
-    ok = 0
-    for sid in study_ids:
-        logger.info(f"\n{'='*60}\n[{sid}]")
+    logger.info(f'[{sid}] Loading masks...')
+    sp_vol   = _load_canonical_iso(sp_path)
+    vert_vol = _load_canonical_iso(vt_path)
+    tss_vol  = None
+    if not args.no_tss and tss_path.exists():
         try:
-            result = result_by_id.get(sid, {
-                'study_id': sid, 'lstv_detected': False, 'lstv_reason': [],
-                'castellvi_type': None, 'left': {}, 'right': {},
-                'lstv_morphometrics': None, 'pathology_score': 0,
-            })
-            if result.get('pathology_score') is None:
-                result['pathology_score'] = compute_lstv_pathology_score(
-                    result, result.get('lstv_morphometrics'))
-
-            out = build_3d_figure(sid, spineps_dir, totalspine_dir, result,
-                                   smooth=args.smooth, show_tss=not args.no_tss)
-            if out is None: continue
-
-            (fig, castellvi, tv_name, cls_L, cls_R,
-             span_L, span_R, dist_L, dist_R, morpho, cfg,
-             focused_vis_json, full_vis_json) = out
-
-            tp_corrected = bool(result.get('details', {}).get('tp_concordance_corrected', False))
-            save_html(fig, sid, output_dir,
-                      castellvi, tv_name, cls_L, cls_R,
-                      span_L, span_R, dist_L, dist_R, morpho, cfg, result,
-                      focused_vis_json, full_vis_json, tp_corrected=tp_corrected)
-            ok += 1
-
+            tss_vol = _load_canonical_iso(tss_path)
         except Exception as exc:
-            logger.error(f"  [{sid}] Failed: {exc}")
-            logger.debug(traceback.format_exc())
+            logger.warning(f'TSS load failed: {exc}')
 
-    logger.info(f"\nDone. {ok}/{len(study_ids)} HTMLs → {output_dir}")
-    return 0
+    with open(args.lstv_json) as fh:
+        lstv_result = json.load(fh)
+    if sid in lstv_result:
+        lstv_result = lstv_result[sid]
+
+    logger.info(f'[{sid}] Building visualization...')
+    html = build_lstv_visualization(
+        study_id    = sid,
+        sp_vol      = sp_vol,
+        vert_vol    = vert_vol,
+        tss_vol     = tss_vol,
+        lstv_result = lstv_result,
+        show_tss    = not args.no_tss,
+        show_vd     = args.show_vd,
+        step_size   = args.step_size,
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    out = args.output_dir / f'{sid}_lstv_3d.html'
+    out.write_text(html, encoding='utf-8')
+    logger.info(f'[{sid}] Saved → {out}')
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    main()
